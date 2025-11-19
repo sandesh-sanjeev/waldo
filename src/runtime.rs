@@ -1,0 +1,373 @@
+//! A minimal Async I/O runtime backed by io-uring.
+
+mod buf;
+mod file;
+
+pub use buf::{IoBuf, IoFixedBuf};
+pub use file::{IoFile, IoFileFd, IoFixedFd};
+
+use io_uring::{IoUring, opcode, squeue, types};
+use std::{
+    collections::HashMap,
+    fs::File,
+    io,
+    os::{fd::AsRawFd, raw::c_void},
+};
+use thiserror::Error;
+
+/// Error result from an async I/O operation.
+#[derive(Debug, Error)]
+#[error("I/O error from the runtime: {error}")]
+pub struct IoError<A> {
+    pub error: io::Error,
+    pub attachment: A,
+    pub action: IoAction,
+}
+
+/// Successful result from an async I/O operation.
+pub struct IoResponse<A> {
+    pub result: i32,
+    pub attachment: A,
+    pub action: IoAction,
+}
+
+/// A [`IoUring`] based runtime to execute async file I/O.
+pub struct IoRuntime<A> {
+    // A monotonically increasing clock in the runtime.
+    io_clock: u64,
+
+    // Ring buffers to communicate with the kernel.
+    io_ring: IoUring,
+
+    // I/O requests that are currently in progress.
+    io_futures: HashMap<u64, (A, IoAction)>,
+}
+
+impl<A> IoRuntime<A> {
+    /// Create a new async I/O runtime.
+    pub fn new(queue_depth: u32) -> io::Result<Self> {
+        let io_ring = IoUring::new(queue_depth)?;
+        let cq_capacity = io_ring.params().cq_entries() as usize;
+
+        Ok(Self {
+            io_ring,
+            io_clock: 0,
+            io_futures: HashMap::with_capacity(cq_capacity),
+        })
+    }
+
+    /// Register files with the I/O runtime.
+    ///
+    /// Sometimes this results in more efficient file I/O because kernel can
+    /// hold reference to a file across multiple I/O requests.
+    ///
+    /// # Arguments
+    ///
+    /// * `files` - Files to register with the runtime.
+    pub fn register_files(&mut self, files: &[File]) -> io::Result<Vec<IoFixedFd>> {
+        let fds: Vec<_> = files.iter().map(File::as_raw_fd).collect();
+        self.io_ring.submitter().register_files(&fds)?;
+        Ok(files.iter().enumerate().map(|(i, _)| IoFixedFd(i as _)).collect())
+    }
+
+    /// Register buffers with the I/O runtime.
+    ///
+    /// Sometimes this results in more efficient file I/O because kernel can
+    /// map buffer address space once across multiple I/O requests.
+    ///
+    /// # Safety
+    ///
+    /// Registered buffers must remain stable and valid while I/O runtime is active.
+    ///
+    /// # Arguments
+    ///
+    /// * `bufs` - Buffers to register with the runtime.
+    pub unsafe fn register_bufs(&mut self, mut bufs: Vec<IoBuf>) -> io::Result<Vec<IoFixedBuf>> {
+        // The kind of sized buffers kernel understands.
+        let io_bufs: Vec<_> = bufs
+            .iter_mut()
+            .map(|buf| libc::iovec {
+                iov_base: buf.as_mut_ptr() as *mut c_void,
+                iov_len: buf.io_len().try_into().expect("Buf length should be <= usize::MAX"),
+            })
+            .collect();
+
+        // Safety is upheld by the caller.
+        unsafe { self.io_ring.submitter().register_buffers(&io_bufs)? };
+
+        // Return the registered buffers.
+        let registered_bufs = bufs
+            .into_iter()
+            .enumerate()
+            .map(|(i, buf)| IoFixedBuf::new(buf, i as u16))
+            .collect();
+
+        Ok(registered_bufs)
+    }
+
+    /// Push an I/O request into the runtime.
+    ///
+    /// Note that this does not submit the I/O request, just enqueues it. Use
+    /// [`IoRuntime::submit_and_wait`] to submit the I/O request to kernel.
+    /// But that is a syscall and it would be efficient to enqueues as many I/O
+    /// requests are possible before a submit.
+    ///
+    /// # Arguments
+    ///
+    /// * `action` - I/Oo action to enqueue.
+    /// * `attachment` - An opaque attachment to include with the request.
+    pub fn push(&mut self, mut action: IoAction, attachment: A) -> Result<(), (A, IoAction)> {
+        // First progress clock in the runtime.
+        let epoch = self.io_clock_tick();
+
+        // Take care to not overflow the completion queue.
+        let cqe_capacity = self.io_ring.params().cq_entries() as usize;
+        if self.io_futures.len() >= cqe_capacity {
+            return Err((attachment, action));
+        }
+
+        // An I/O request that io-uring understands.
+        let sqe = action.io_sqe().user_data(epoch);
+
+        // Attempt to enqueue the I/O request.
+        unsafe {
+            // Safety: We have exclusive ownership of the buffer.
+            // Buffer will remain at stable address and will not be mutated in user space.
+            if self.io_ring.submission().push(&sqe).is_err() {
+                // Action is rejected if the submission queue is full.
+                return Err((attachment, action));
+            }
+        };
+
+        // Keep track of the I/O request and return.
+        let prev = self.io_futures.insert(epoch, (attachment, action));
+        assert!(prev.is_none(), "Overwriting a pending I/O request");
+        Ok(())
+    }
+
+    /// Get the next completed event from the runtime.
+    pub fn pop(&mut self) -> Option<Result<IoResponse<A>, IoError<A>>> {
+        // Fetch the next completion event from the queue.
+        let cqe = self.io_ring.completion().next()?;
+
+        // Get the associated I/O request.
+        let epoch = cqe.user_data();
+        let (attachment, action) = self
+            .io_futures
+            .remove(&epoch)
+            .expect("Received completion for an unknown request");
+
+        // Return early if there was an error.
+        if cqe.result() < 0 {
+            return Some(Err(IoError {
+                action,
+                attachment,
+                error: io::Error::from_raw_os_error(cqe.result()),
+            }));
+        }
+
+        // Unpack and return the result.
+        Some(Ok(IoResponse {
+            action,
+            attachment,
+            result: cqe.result(),
+        }))
+    }
+
+    /// Submit all the pending I/O requests.
+    ///
+    /// In addition to submission of the pending requests, also waits for 0
+    /// or more requests in flight to complete. Completed requests must be
+    /// consumed via [`IoRuntime::pop`].
+    ///
+    /// To get the best out of IoUring, batch together as many submissions as
+    /// possible before issuing a submit and wait (which is a syscall).
+    pub fn submit_and_wait(&self, want: usize) -> io::Result<usize> {
+        self.io_ring.submit_and_wait(want)
+    }
+
+    /// Progress I/O runtime clock by 1 tick.
+    fn io_clock_tick(&mut self) -> u64 {
+        self.io_clock += 1;
+        self.io_clock
+    }
+}
+
+/// Type of I/O action against a file (as of now).
+#[derive(Debug)]
+pub enum IoAction {
+    /// Flush contents of a file to disk.
+    Fsync { file: IoFile },
+
+    /// Resize a file to new length.
+    Resize { file: IoFile, len: u64 },
+
+    /// Action to read from file starting at a specific offset.
+    Read { file: IoFile, offset: u64, buf: IoBuf },
+
+    /// Action to write into file starting at a specific offset.
+    Write { file: IoFile, offset: u64, buf: IoBuf },
+
+    /// Action to read from file starting at a specific offset using registered buffer.
+    ReadFixed { file: IoFile, offset: u64, buf: IoFixedBuf },
+
+    /// Action to write into file starting at a specific offset using registered buffer.
+    WriteFixed { file: IoFile, offset: u64, buf: IoFixedBuf },
+}
+
+impl IoAction {
+    /// Sync file data and metadata to disk.
+    ///
+    /// This flushes any intermediate buffers between the application and
+    /// disk. If this call completes successfully, any changes made to file
+    /// are guaranteed to be stored durably.
+    ///
+    /// # Arguments
+    ///
+    /// * `file` - File to read from.
+    pub fn fsync<F: Into<IoFile>>(file: F) -> Self {
+        Self::Fsync { file: file.into() }
+    }
+
+    /// Resize file to a new length.
+    ///
+    /// If the current size of file is less than length, extra null bytes
+    /// are padded to the file to get it to new length. If the current size
+    /// is greater, excess bytes are discarded.
+    ///
+    /// # Arguments
+    ///
+    /// * `file` - File to read from.
+    /// * `len` - New length of the file.
+    pub fn resize<F: Into<IoFile>>(file: F, len: u64) -> Self {
+        Self::Resize { file: file.into(), len }
+    }
+
+    /// Read from file at a specific offset.
+    ///
+    /// # Arguments
+    ///
+    /// * `file` - File to read from.
+    /// * `offset` - Offset on file to begin reads.
+    /// * `buf` - Buffer of bytes to copy bytes into.
+    pub fn read_at<F: Into<IoFile>>(file: F, offset: u64, buf: IoBuf) -> Self {
+        Self::Read {
+            buf,
+            offset,
+            file: file.into(),
+        }
+    }
+
+    /// Write to file at a specific offset.
+    ///
+    /// # Arguments
+    ///
+    /// * `file` - File to write into.
+    /// * `offset` - Offset on file to begin writes.
+    /// * `buf` - Buffer of bytes to copy bytes from.
+    pub fn write_at<F: Into<IoFile>>(file: F, offset: u64, buf: IoBuf) -> Self {
+        Self::Write {
+            buf,
+            offset,
+            file: file.into(),
+        }
+    }
+
+    /// Read from file at a specific offset.
+    ///
+    /// # Arguments
+    ///
+    /// * `file` - File to read from.
+    /// * `offset` - Offset on file to begin reads.
+    /// * `buf` - Buffer of bytes to copy bytes into.
+    pub fn read_at_fixed<F: Into<IoFile>>(file: F, offset: u64, buf: IoFixedBuf) -> Self {
+        Self::ReadFixed {
+            buf,
+            offset,
+            file: file.into(),
+        }
+    }
+
+    /// Write to file at a specific offset.
+    ///
+    /// # Arguments
+    ///
+    /// * `file` - File to write into.
+    /// * `offset` - Offset on file to begin writes.
+    /// * `buf` - Buffer of bytes to copy bytes from.
+    pub fn write_at_fixed<F: Into<IoFile>>(file: F, offset: u64, buf: IoFixedBuf) -> Self {
+        Self::WriteFixed {
+            buf,
+            offset,
+            file: file.into(),
+        }
+    }
+
+    /// Generate the submission queue entry for the I/O action.
+    ///
+    /// # Safety
+    ///
+    /// A mutable alias is potentially shared with the kernel. It should remain valid
+    /// until the I/O request is cancelled or completed.
+    fn io_sqe(&mut self) -> squeue::Entry {
+        match self {
+            Self::Fsync { file } => match file {
+                IoFile::Fd(fd) => opcode::Fsync::new(types::Fd(fd.0)).build(),
+                IoFile::Fixed(fd) => opcode::Fsync::new(types::Fixed(fd.0)).build(),
+            },
+
+            Self::Resize { file, len } => match file {
+                IoFile::Fd(fd) => opcode::Ftruncate::new(types::Fd(fd.0), *len).build(),
+                IoFile::Fixed(fd) => opcode::Ftruncate::new(types::Fixed(fd.0), *len).build(),
+            },
+
+            Self::Read { file, offset, buf } => match file {
+                IoFile::Fd(fd) => opcode::Read::new(types::Fd(fd.0), buf.as_mut_ptr(), buf.io_len())
+                    .offset(*offset)
+                    .build(),
+
+                IoFile::Fixed(fd) => opcode::Read::new(types::Fixed(fd.0), buf.as_mut_ptr(), buf.io_len())
+                    .offset(*offset)
+                    .build(),
+            },
+
+            Self::Write { file, offset, buf } => match file {
+                IoFile::Fd(fd) => opcode::Write::new(types::Fd(fd.0), buf.as_ptr(), buf.io_len())
+                    .offset(*offset)
+                    .build(),
+
+                IoFile::Fixed(fd) => opcode::Write::new(types::Fixed(fd.0), buf.as_ptr(), buf.io_len())
+                    .offset(*offset)
+                    .build(),
+            },
+
+            Self::ReadFixed { file, offset, buf } => match file {
+                IoFile::Fd(fd) => {
+                    opcode::ReadFixed::new(types::Fd(fd.0), buf.as_mut_ptr(), buf.io_len(), buf.buf_index())
+                        .offset(*offset)
+                        .build()
+                }
+
+                IoFile::Fixed(fd) => {
+                    opcode::ReadFixed::new(types::Fixed(fd.0), buf.as_mut_ptr(), buf.io_len(), buf.buf_index())
+                        .offset(*offset)
+                        .build()
+                }
+            },
+
+            Self::WriteFixed { file, offset, buf } => match file {
+                IoFile::Fd(fd) => {
+                    opcode::WriteFixed::new(types::Fd(fd.0), buf.as_mut_ptr(), buf.io_len(), buf.buf_index())
+                        .offset(*offset)
+                        .build()
+                }
+
+                IoFile::Fixed(fd) => {
+                    opcode::WriteFixed::new(types::Fixed(fd.0), buf.as_mut_ptr(), buf.io_len(), buf.buf_index())
+                        .offset(*offset)
+                        .build()
+                }
+            },
+        }
+    }
+}
