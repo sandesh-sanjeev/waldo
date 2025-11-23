@@ -9,7 +9,7 @@ const QUEUE_DEPTH: u32 = 8;
 
 const PATH: &str = "/home/darkstar/waldo/tst.uring";
 
-const BUFFER_SIZE: usize = 1024 * 1024; // 1 MB
+const BUFFER_SIZE: u32 = 1024 * 1024; // 1 MB
 
 const MAX_FILE_SIZE: u64 = 16 * 1024 * 1024 * 1024; // 16 GB
 
@@ -26,7 +26,10 @@ struct Bencher {
 }
 
 impl Bencher {
-    fn new(writer: bool, buf: IoFixedBuf) -> Self {
+    fn new(writer: bool, mut buf: IoFixedBuf) -> Self {
+        // Fill the buffer with some bytes.
+        buf.resize(0, BUFFER_SIZE as usize);
+
         Self {
             writer,
             offset: 0,
@@ -77,7 +80,7 @@ impl Bencher {
         match result.action {
             IoAction::ReadFixed { buf, .. } => {
                 self.buf.replace(buf);
-                if result.result as usize == BUFFER_SIZE {
+                if result.result as u32 == BUFFER_SIZE {
                     self.completed += 1;
                     self.offset += BUFFER_SIZE as u64;
                 }
@@ -85,7 +88,7 @@ impl Bencher {
 
             IoAction::WriteFixed { buf, .. } => {
                 self.buf.replace(buf);
-                if result.result as usize == BUFFER_SIZE {
+                if result.result as u32 == BUFFER_SIZE {
                     self.completed += 1;
                     self.offset += BUFFER_SIZE as u64;
                 }

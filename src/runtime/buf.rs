@@ -2,6 +2,7 @@
 
 use memmap2::{MmapMut, MmapOptions};
 use std::{
+    ffi::c_void,
     io::Result,
     ops::{Deref, DerefMut},
 };
@@ -35,21 +36,21 @@ impl IoFixedBuf {
     }
 
     ///  Number of bytes in the byte slice.
-    pub(super) fn io_len(&self) -> u32 {
-        self.buf.io_len()
+    pub(super) fn len(&self) -> u32 {
+        self.buf.length()
     }
 }
 
 impl Deref for IoFixedBuf {
-    type Target = [u8];
+    type Target = IoBuf;
     fn deref(&self) -> &Self::Target {
-        self.buf.as_ref()
+        &self.buf
     }
 }
 
 impl DerefMut for IoFixedBuf {
     fn deref_mut(&mut self) -> &mut Self::Target {
-        self.buf.as_mut()
+        &mut self.buf
     }
 }
 
@@ -59,12 +60,14 @@ impl DerefMut for IoFixedBuf {
 /// It is also (strongly) recommended to allocate memory in multiples of page
 /// size, potentially a power of 2 as well. This piece of memory cannot grow
 /// or shrink, so, choosing a reason amount of memory to allocate is important.
-///
-/// With that out of the way, there is really only one advantage to using this,
-/// buffers can be used to perform DMA against disk (via O_DIRECT). Might also
-/// help with heap fragmentation depending on how buffers are allocated.
 #[derive(Debug)]
-pub struct IoBuf(MmapMut);
+pub struct IoBuf {
+    // Page aligned memory that backs this buffer.
+    mmap: MmapMut,
+
+    // Number of bytes written into buffer.
+    len: u32,
+}
 
 impl IoBuf {
     /// Allocate some amount of memory.
@@ -72,7 +75,8 @@ impl IoBuf {
     /// # Arguments
     ///
     /// * `capacity` - Number of bytes to allocate.
-    pub fn allocate(capacity: usize) -> Result<Self> {
+    pub fn allocate(capacity: u32) -> Result<Self> {
+        let capacity = usize::try_from(capacity).expect("Capacity exceeds allocatable memory");
         let mmap = MmapOptions::new()
             // TODO: Support huge pages, maybe?
             .populate()
@@ -80,46 +84,143 @@ impl IoBuf {
             .map_anon()?;
 
         // Return newly allocated memory.
-        Ok(Self(mmap))
+        Ok(Self { mmap, len: 0 })
     }
 
-    /// Raw pointer to the byte slice.
-    pub(super) fn as_ptr(&self) -> *const u8 {
-        self.0.as_ptr()
-    }
-
-    /// Raw mutable pointer to the byte slice.
-    pub(super) fn as_mut_ptr(&mut self) -> *mut u8 {
-        self.0.as_mut_ptr()
+    /// Maximum number of bytes that can be held in buffer.
+    pub fn capacity(&self) -> u32 {
+        self.mmap.len() as u32
     }
 
     ///  Number of bytes in the byte slice.
-    pub(super) fn io_len(&self) -> u32 {
-        u32::try_from(self.0.len()).expect("I/O buf should be <= u32::MAX")
+    pub fn length(&self) -> u32 {
+        self.len
+    }
+
+    /// More bytes that the buffer can hold without overflow.
+    pub fn remaining(&self) -> u32 {
+        self.capacity().saturating_sub(self.len)
+    }
+
+    /// Extend buffer with contents of a byte slice.
+    ///
+    /// If buffer has enough remaining capacity, copies the slice into
+    /// buffer and returns number of bytes consumed. Otherwise returns
+    /// None.
+    ///
+    /// # Arguments
+    ///
+    /// * `src` - Source byte slice to copy bytes from.
+    pub fn extend_from_slice(&mut self, src: &[u8]) -> Option<usize> {
+        let src_len = u32::try_from(src.len()).ok()?;
+        let new_len = self.len.checked_add(src_len)?;
+        if new_len > self.capacity() {
+            return None;
+        }
+
+        // Range of bytes to initialize.
+        let start = self.len as usize;
+        let end = new_len as usize;
+        let dst = &mut self.mmap[start..end];
+
+        // Update state and return.
+        dst.copy_from_slice(src);
+        self.len = new_len;
+        Some(new_len as usize)
+    }
+
+    /// Resize buffer to new length.
+    ///
+    /// If new length if <= current length, this is a no-op. Otherwise
+    /// extends the buffer with the provided till it gets to new length.
+    /// Does not exceed allocated capacity.
+    ///
+    /// # Arguments
+    ///
+    /// * `value` - Value to fill for excess bytes.
+    /// * `src` - new length of the buffer.
+    pub fn resize(&mut self, value: u8, len: usize) {
+        let new_len = u32::try_from(len).unwrap_or(u32::MAX);
+        let new_len = std::cmp::min(new_len, self.capacity());
+
+        // Range of bytes to initialize.
+        let start = self.len as usize;
+        let end = new_len as usize;
+        let dst = &mut self.mmap[start..end];
+
+        // Update state and return.
+        dst.fill(value);
+        self.len = new_len;
+    }
+
+    /// Truncate buffer to new size.
+    ///
+    /// If the new length is >= current length, it is a no-op operation.
+    /// However if new length is lesser, the difference is discarded and
+    /// lost forever and ever.
+    ///
+    /// # Arguments
+    ///
+    /// * `len` - New length of the buffer.
+    pub fn truncate(&mut self, len: u32) {
+        // Return early if no-op.
+        if len >= self.len {
+            return;
+        }
+
+        // Set new length of the buffer.
+        self.len = len;
+    }
+
+    /// Set range of bytes visible in the buffer.
+    pub fn clear(&mut self) {
+        self.len = 0;
+    }
+
+    /// Create an I/O vec based on this memory.
+    ///
+    /// Note that this always gives the true range of allocated memory,
+    /// regardless of visibility set on the buffer. That this because
+    /// the only use-case for this is to register buffers with the runtime.
+    pub(super) fn io_vec(&mut self) -> libc::iovec {
+        libc::iovec {
+            iov_base: self.mmap.as_mut_ptr() as *mut c_void,
+            iov_len: self.mmap.len(),
+        }
+    }
+
+    /// Raw pointer to the current start of the byte slice.
+    pub(super) fn as_ptr(&self) -> *const u8 {
+        self.mmap.as_ptr()
+    }
+
+    /// Raw mutable pointer to the current start of the byte slice.
+    pub(super) fn as_mut_ptr(&mut self) -> *mut u8 {
+        self.mmap.as_mut_ptr()
     }
 }
 
 impl Deref for IoBuf {
     type Target = [u8];
     fn deref(&self) -> &Self::Target {
-        &self.0
+        &self.mmap[..self.len as usize]
     }
 }
 
 impl DerefMut for IoBuf {
     fn deref_mut(&mut self) -> &mut Self::Target {
-        &mut self.0
+        &mut self.mmap[..self.len as usize]
     }
 }
 
 impl AsRef<[u8]> for IoBuf {
     fn as_ref(&self) -> &[u8] {
-        &self.0
+        self.deref()
     }
 }
 
 impl AsMut<[u8]> for IoBuf {
     fn as_mut(&mut self) -> &mut [u8] {
-        &mut self.0
+        self.deref_mut()
     }
 }
