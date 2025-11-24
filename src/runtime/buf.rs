@@ -112,6 +112,7 @@ impl IoBuf {
     ///
     /// * `src` - Source byte slice to copy bytes from.
     pub fn extend_from_slice(&mut self, src: &[u8]) -> Option<usize> {
+        // Make sure the buffer has enough space for the slice.
         let src_len = u32::try_from(src.len()).ok()?;
         let new_len = self.len.checked_add(src_len)?;
         if new_len > self.capacity() {

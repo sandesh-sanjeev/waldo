@@ -7,7 +7,7 @@ use waldo::runtime::{IoAction, IoBuf, IoError, IoFile, IoFixedBuf, IoResponse, I
 
 const QUEUE_DEPTH: u32 = 8;
 
-const PATH: &str = "/home/darkstar/waldo/tst.uring";
+const PATH: &str = "tst.uring";
 
 const BUFFER_SIZE: u32 = 1024 * 1024; // 1 MB
 
@@ -109,7 +109,7 @@ fn main() -> Result<()> {
         .truncate(true)
         .read(true)
         .write(true)
-        //.custom_flags(libc::O_DIRECT | libc::O_DSYNC)
+        //.custom_flags(libc::O_DIRECT)
         .open(PATH)?;
 
     // Register file with the runtime.

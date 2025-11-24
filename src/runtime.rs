@@ -6,7 +6,11 @@ mod file;
 pub use buf::{IoBuf, IoFixedBuf};
 pub use file::{IoFile, IoFileFd, IoFixedFd};
 
-use io_uring::{IoUring, opcode, squeue, types};
+use io_uring::{
+    IoUring, opcode,
+    squeue::{self, Flags},
+    types,
+};
 use std::{collections::HashMap, fs::File, io, os::fd::AsRawFd};
 use thiserror::Error;
 
@@ -34,6 +38,9 @@ pub struct IoRuntime<A> {
     // Ring buffers to communicate with the kernel.
     io_ring: IoUring,
 
+    // Flags to add to all sqe.
+    flags: Option<Flags>,
+
     // I/O requests that are currently in progress.
     io_futures: HashMap<u64, (A, IoAction)>,
 }
@@ -41,12 +48,21 @@ pub struct IoRuntime<A> {
 impl<A> IoRuntime<A> {
     /// Create a new async I/O runtime.
     pub fn new(queue_depth: u32) -> io::Result<Self> {
-        let io_ring = IoUring::new(queue_depth)?;
+        let io_ring = IoUring::builder()
+            .setup_single_issuer()
+            .setup_coop_taskrun()
+            .build(queue_depth)?;
+
+        // Our limit on maximum pending I/O.
+        // To protect against completion queue overflow.
         let cq_capacity = io_ring.params().cq_entries() as usize;
 
         Ok(Self {
             io_ring,
             io_clock: 0,
+            // TODO: Make this configurable.
+            // Perhaps this is a per I/O flag instead?
+            flags: Some(Flags::ASYNC),
             io_futures: HashMap::with_capacity(cq_capacity),
         })
     }
@@ -117,6 +133,10 @@ impl<A> IoRuntime<A> {
 
         // An I/O request that io-uring understands.
         let sqe = action.io_sqe().user_data(epoch);
+        let sqe = match self.flags {
+            None => sqe,
+            Some(flags) => sqe.flags(flags),
+        };
 
         // Attempt to enqueue the I/O request.
         unsafe {
