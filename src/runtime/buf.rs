@@ -72,13 +72,18 @@ pub struct IoBuf {
 impl IoBuf {
     /// Allocate some amount of memory.
     ///
+    /// Memory is allocated with huge pages, capacity must be multiples
+    /// of the system default page size. Maybe we'll allow for this to
+    /// be configurable in the future.
+    ///
     /// # Arguments
     ///
     /// * `capacity` - Number of bytes to allocate.
     pub fn allocate(capacity: u32) -> Result<Self> {
         let capacity = usize::try_from(capacity).expect("Capacity exceeds allocatable memory");
         let mmap = MmapOptions::new()
-            // TODO: Support huge pages, maybe?
+            // TODO: Allow configuration for huge pages.
+            .huge(None)
             .populate()
             .len(capacity)
             .map_anon()?;
@@ -211,17 +216,5 @@ impl Deref for IoBuf {
 impl DerefMut for IoBuf {
     fn deref_mut(&mut self) -> &mut Self::Target {
         &mut self.mmap[..self.len as usize]
-    }
-}
-
-impl AsRef<[u8]> for IoBuf {
-    fn as_ref(&self) -> &[u8] {
-        self.deref()
-    }
-}
-
-impl AsMut<[u8]> for IoBuf {
-    fn as_mut(&mut self) -> &mut [u8] {
-        self.deref_mut()
     }
 }

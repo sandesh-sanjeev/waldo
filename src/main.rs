@@ -1,107 +1,94 @@
-use std::{
-    fs::OpenOptions,
-    io::{Error, ErrorKind, Result},
-    time::{Duration, Instant},
-};
-use waldo::runtime::{IoAction, IoBuf, IoError, IoFile, IoFixedBuf, IoResponse, IoRuntime};
-
-const QUEUE_DEPTH: u32 = 8;
+use std::{fs::OpenOptions, io::Result, marker::PhantomData, time::Instant};
+use waldo::runtime::{IoAction, IoBuf, IoFixedBuf, IoFixedFd, IoResponse, IoRuntime};
 
 const PATH: &str = "tst.uring";
 
-const BUFFER_SIZE: u32 = 1024 * 1024; // 1 MB
+const READERS: u32 = 16;
 
-const MAX_FILE_SIZE: u64 = 16 * 1024 * 1024 * 1024; // 16 GB
+const QUEUE_DEPTH: u32 = READERS + 1;
+
+const BUFFER_SIZE: u32 = 2 * 1024 * 1024;
+
+const MAX_FILE_SIZE: u64 = 32 * 1024 * 1024 * 1024;
 
 const MAX_APPENDS: u64 = MAX_FILE_SIZE / BUFFER_SIZE as u64;
 
-struct Bencher {
-    writer: bool,
+/// A worker who is working as a file writer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Writer;
+
+/// A worker who is working as a file reader.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Reader;
+
+/// A worker driving I/O for the benchmark.
+struct Worker<R> {
     offset: u64,
-    pending: bool,
-    completed: u64,
-    elapsed: Duration,
-    io_start: Instant,
+    file: IoFixedFd,
+    role: PhantomData<R>,
     buf: Option<IoFixedBuf>,
 }
 
-impl Bencher {
-    fn new(writer: bool, mut buf: IoFixedBuf) -> Self {
-        // Fill the buffer with some bytes.
-        buf.resize(0, BUFFER_SIZE as usize);
+impl<R> Worker<R> {
+    fn new(file: IoFixedFd, mut buf: IoFixedBuf) -> Self {
+        buf.resize(13, BUFFER_SIZE as usize);
 
         Self {
-            writer,
+            file,
             offset: 0,
-            completed: 0,
-            pending: false,
             buf: Some(buf),
-            io_start: Instant::now(),
-            elapsed: Duration::from_secs(0),
+            role: PhantomData,
         }
     }
 
-    fn next_io(&mut self, file: IoFile) -> Option<IoAction> {
-        if self.pending || self.completed >= MAX_APPENDS {
-            return None;
-        }
-
-        // Use my buffer for the duration of the I/O.
-        self.pending = true;
-        let buf = self.buf.take().expect("Should have buffer");
-
-        // Perform different actions depending on the type of worker.
-        self.io_start = Instant::now();
-        if self.writer {
-            Some(IoAction::write_at_fixed(file, self.offset, buf))
-        } else {
-            Some(IoAction::read_at_fixed(file, self.offset, buf))
-        }
+    fn has_completed(&self) -> bool {
+        self.offset == MAX_FILE_SIZE
     }
 
-    fn discard_io(&mut self, error: IoError<usize>) {
-        self.pending = false;
-        match error.action {
-            IoAction::ReadFixed { buf, .. } => {
-                self.buf.replace(buf);
-            }
+    fn has_pending_io(&self) -> bool {
+        self.buf.is_none()
+    }
+}
 
-            IoAction::WriteFixed { buf, .. } => {
-                self.buf.replace(buf);
-            }
-
-            _ => panic!("Unsupported io action"),
-        }
+impl Worker<Reader> {
+    fn next_io(&mut self) -> Option<IoAction> {
+        let buf = self.buf.take()?;
+        Some(IoAction::read_at_fixed(self.file, self.offset, buf))
     }
 
     fn complete_io(&mut self, result: IoResponse<usize>) {
-        self.pending = false;
-        self.elapsed += self.io_start.elapsed();
-        match result.action {
-            IoAction::ReadFixed { buf, .. } => {
-                self.buf.replace(buf);
-                if result.result as u32 == BUFFER_SIZE {
-                    self.completed += 1;
-                    self.offset += BUFFER_SIZE as u64;
-                }
-            }
+        let IoAction::ReadFixed { buf, .. } = result.action else {
+            panic!("Unsupported io action: {:?}", result.action);
+        };
 
-            IoAction::WriteFixed { buf, .. } => {
-                self.buf.replace(buf);
-                if result.result as u32 == BUFFER_SIZE {
-                    self.completed += 1;
-                    self.offset += BUFFER_SIZE as u64;
-                }
-            }
+        self.buf.replace(buf);
+        if result.result as u32 == BUFFER_SIZE {
+            self.offset += BUFFER_SIZE as u64;
+        }
+    }
+}
 
-            _ => panic!("Unsupported io action"),
+impl Worker<Writer> {
+    fn next_io(&mut self) -> Option<IoAction> {
+        let buf = self.buf.take()?;
+        Some(IoAction::write_at_fixed(self.file, self.offset, buf))
+    }
+
+    fn complete_io(&mut self, result: IoResponse<usize>) {
+        let IoAction::WriteFixed { buf, .. } = result.action else {
+            panic!("Unsupported io action: {:?}", result.action);
+        };
+
+        self.buf.replace(buf);
+        if result.result as u32 == BUFFER_SIZE {
+            self.offset += BUFFER_SIZE as u64;
         }
     }
 }
 
 fn main() -> Result<()> {
     // I/O uring based async runtime.
-    let mut storage = IoRuntime::new(QUEUE_DEPTH)?;
+    let mut runtime = IoRuntime::new(QUEUE_DEPTH)?;
 
     // File that we are going to be testing with.
     let file = OpenOptions::new()
@@ -114,7 +101,7 @@ fn main() -> Result<()> {
 
     // Register file with the runtime.
     let files = vec![file];
-    let f_files = storage.register_files(&files)?;
+    let f_files = runtime.register_files(&files)?;
 
     // Allocate all memory upfront.
     let buf: Vec<_> = (0..QUEUE_DEPTH)
@@ -123,71 +110,68 @@ fn main() -> Result<()> {
 
     // Safety: Buffers exist for the life of this process.
     // Register all the memory we are going to be using with the runtime.
-    let bufs = unsafe { storage.register_bufs(buf)? };
+    let mut bufs = unsafe { runtime.register_bufs(buf)? };
 
     // Define all the benchmark workers.
-    let mut workers: Vec<_> = bufs
-        .into_iter()
-        .enumerate()
-        .map(|(i, buf)| {
-            if i == 0 {
-                Bencher::new(true, buf)
-            } else {
-                Bencher::new(false, buf)
-            }
-        })
-        .collect();
+    let buf = bufs.pop().expect("Should have allocated buffer");
+    let mut writer = Worker::<Writer>::new(f_files[0], buf);
+    let mut readers = Vec::with_capacity(READERS as usize);
+    for _ in 0..READERS {
+        let buf = bufs.pop().expect("Should have allocated buffer");
+        readers.push(Worker::<Reader>::new(f_files[0], buf));
+    }
 
     // Run repeatedly till all I/O is completed.
-    while workers.iter().any(|worker| worker.completed < MAX_APPENDS) {
-        // Attempt to fully saturate the io_uring.
-        for (i, worker) in workers.iter_mut().enumerate() {
-            // Fetch the next io request from the worker.
-            if let Some(action) = worker.next_io(f_files[0].into()) {
-                // Push the new io request into the runtime.
-                // If push results in an error, it means that the runtime is busy.
-                // When that happens, the only thing we can do is wait for completions.
-                if let Err((attachment, action)) = storage.push(action, i) {
-                    let result = IoError {
-                        action,
-                        attachment,
-                        error: Error::new(ErrorKind::ResourceBusy, "Busy"),
-                    };
+    let start = Instant::now();
+    while !writer.has_completed() || readers.iter().any(|worker| !worker.has_completed()) {
+        // First the writer.
+        if !writer.has_completed() && !writer.has_pending_io() {
+            let action = writer.next_io().expect("No pending I/O");
+            runtime.push(action, usize::MAX).expect("Should have space for all I/O");
+        }
 
-                    worker.discard_io(result);
-                    break;
-                };
+        // Then any readers.
+        // To save on wasted I/O, readers only read after writer has made enough progress.
+        // This is how it would be in our library as well.
+        for (i, reader) in readers.iter_mut().enumerate() {
+            if !reader.has_completed() && !reader.has_pending_io() && reader.offset < writer.offset {
+                let action = reader.next_io().expect("No pending I/O");
+                runtime.push(action, i).expect("Should have space for all I/O");
             }
         }
 
         // Wait for at least one I/O request to complete.
-        storage.submit_and_wait(1)?;
+        runtime.submit_and_wait(1)?;
 
         // Process all the completions.
-        while let Some(event) = storage.pop() {
+        while let Some(event) = runtime.pop() {
             match event {
                 Err(error) => return Err(error.error),
                 Ok(result) => {
-                    // Find the worker this result is for.
                     let i = result.attachment;
-                    let worker = &mut workers[i];
-
-                    // Mark the I/O as complete.
-                    worker.complete_io(result);
+                    if i == usize::MAX {
+                        writer.complete_io(result);
+                    } else {
+                        readers[i].complete_io(result);
+                    }
                 }
             }
         }
     }
 
-    for worker in workers {
-        let writer = worker.writer;
-        let seconds = worker.elapsed.as_secs_f64();
-        let seconds = if seconds == 0.0 { 1.0 } else { seconds };
-        let mbps = 1024.0 * 1024.0 * seconds;
+    // For calculating rates.
+    let seconds = start.elapsed().as_secs_f64();
+    let seconds = if seconds == 0.0 { 1.0 } else { seconds };
+    let mbps = 1024.0 * 1024.0 * seconds;
 
-        let total_io = MAX_FILE_SIZE as f64;
-        let rate = total_io / mbps;
-        println!("({writer}) Worker completed in {seconds:.2}s with rate {rate:.2} MB/s");
-    }
+    // Print stats for writer.
+    let tps = MAX_APPENDS as f64 / seconds;
+    let rate = MAX_FILE_SIZE as f64 / mbps;
+    println!("Writer: {tps:.2} TPS, {rate:.2} MB/s");
+
+    // Print stats for readers.
+    let tps = (MAX_APPENDS as f64 * READERS as f64) / seconds;
+    let rate = (MAX_FILE_SIZE as f64 * READERS as f64) / mbps;
+    println!("{READERS} Readers: {tps:.2} TPS, {rate:.2} MB/s");
     Ok(())
 }
