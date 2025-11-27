@@ -22,9 +22,6 @@ jobs:
           toolchain: stable
           components: clippy, rustfmt
 
-      - name: Install cargo-nextest
-        uses: taiki-e/install-action@nextest
-
       - name: Check Rust version
         run: cargo --version
 
@@ -41,7 +38,7 @@ jobs:
         run: cargo build
       
       - name: Test crate
-        run: cargo nextest run
+        run: cargo test
 
   docs:
     name: Docs
