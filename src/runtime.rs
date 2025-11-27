@@ -3,7 +3,7 @@
 mod buf;
 mod file;
 
-pub use buf::{IoBuf, IoFixedBuf};
+pub use buf::{IoBuf, IoFixedBuf, Memory};
 pub use file::{IoFile, IoFileFd, IoFixedFd};
 
 use io_uring::{
@@ -25,7 +25,7 @@ pub struct IoError<A> {
 
 /// Successful result from an async I/O operation.
 pub struct IoResponse<A> {
-    pub result: i32,
+    pub result: u32,
     pub attachment: A,
     pub action: IoAction,
 }
@@ -110,6 +110,12 @@ impl<A> IoRuntime<A> {
         Ok(registered_bufs)
     }
 
+    /// Number of I/O actions runtime can accept without overflow.
+    pub fn sq_remaining(&mut self) -> usize {
+        let sq = self.io_ring.submission();
+        sq.capacity() - sq.len()
+    }
+
     /// Push an I/O request into the runtime.
     ///
     /// Note that this does not submit the I/O request, just enqueues it. Use
@@ -119,7 +125,7 @@ impl<A> IoRuntime<A> {
     ///
     /// # Arguments
     ///
-    /// * `action` - I/Oo action to enqueue.
+    /// * `action` - I/O action to enqueue.
     /// * `attachment` - An opaque attachment to include with the request.
     pub fn push(&mut self, mut action: IoAction, attachment: A) -> Result<(), (A, IoAction)> {
         // First progress clock in the runtime.
@@ -179,7 +185,7 @@ impl<A> IoRuntime<A> {
         Some(Ok(IoResponse {
             action,
             attachment,
-            result: cqe.result(),
+            result: cqe.result() as u32,
         }))
     }
 
@@ -216,6 +222,12 @@ pub enum IoAction {
 
     /// Action to write into file starting at a specific offset.
     Write { file: IoFile, offset: u64, buf: IoBuf },
+
+    /// Action to read from file starting at a specific offset using a vector backed buffer.
+    ReadVec { file: IoFile, offset: u64, buf: Vec<u8> },
+
+    /// Action to write into file starting at a specific offset using a vector backed buffer.
+    WriteVec { file: IoFile, offset: u64, buf: Vec<u8> },
 
     /// Action to read from file starting at a specific offset using registered buffer.
     ReadFixed { file: IoFile, offset: u64, buf: IoFixedBuf },
@@ -276,6 +288,36 @@ impl IoAction {
     /// * `buf` - Buffer of bytes to copy bytes from.
     pub fn write_at<F: Into<IoFile>>(file: F, offset: u64, buf: IoBuf) -> Self {
         Self::Write {
+            buf,
+            offset,
+            file: file.into(),
+        }
+    }
+
+    /// Read from file at a specific offset with a vector as buffer.
+    ///
+    /// # Arguments
+    ///
+    /// * `file` - File to read from.
+    /// * `offset` - Offset on file to begin reads.
+    /// * `buf` - Buffer of bytes to copy bytes into.
+    pub fn read_at_vec<F: Into<IoFile>>(file: F, offset: u64, buf: Vec<u8>) -> Self {
+        Self::ReadVec {
+            buf,
+            offset,
+            file: file.into(),
+        }
+    }
+
+    /// Write to file at a specific offset with a vector as buffer.
+    ///
+    /// # Arguments
+    ///
+    /// * `file` - File to write into.
+    /// * `offset` - Offset on file to begin writes.
+    /// * `buf` - Buffer of bytes to copy bytes from.
+    pub fn write_at_vec<F: Into<IoFile>>(file: F, offset: u64, buf: Vec<u8>) -> Self {
+        Self::WriteVec {
             buf,
             offset,
             file: file.into(),
@@ -350,13 +392,35 @@ impl IoAction {
                     .build(),
             },
 
-            Self::ReadFixed { file, offset, buf } => match file {
-                IoFile::Fd(fd) => opcode::ReadFixed::new(types::Fd(fd.0), buf.as_mut_ptr(), buf.len(), buf.buf_index())
+            Self::ReadVec { file, offset, buf } => match file {
+                IoFile::Fd(fd) => opcode::Read::new(types::Fd(fd.0), buf.as_mut_ptr(), buf.length())
                     .offset(*offset)
                     .build(),
 
+                IoFile::Fixed(fd) => opcode::Read::new(types::Fixed(fd.0), buf.as_mut_ptr(), buf.length())
+                    .offset(*offset)
+                    .build(),
+            },
+
+            Self::WriteVec { file, offset, buf } => match file {
+                IoFile::Fd(fd) => opcode::Write::new(types::Fd(fd.0), buf.as_ptr(), buf.length())
+                    .offset(*offset)
+                    .build(),
+
+                IoFile::Fixed(fd) => opcode::Write::new(types::Fixed(fd.0), buf.as_ptr(), buf.length())
+                    .offset(*offset)
+                    .build(),
+            },
+
+            Self::ReadFixed { file, offset, buf } => match file {
+                IoFile::Fd(fd) => {
+                    opcode::ReadFixed::new(types::Fd(fd.0), buf.as_mut_ptr(), buf.length(), buf.buf_index())
+                        .offset(*offset)
+                        .build()
+                }
+
                 IoFile::Fixed(fd) => {
-                    opcode::ReadFixed::new(types::Fixed(fd.0), buf.as_mut_ptr(), buf.len(), buf.buf_index())
+                    opcode::ReadFixed::new(types::Fixed(fd.0), buf.as_mut_ptr(), buf.length(), buf.buf_index())
                         .offset(*offset)
                         .build()
                 }
@@ -364,13 +428,13 @@ impl IoAction {
 
             Self::WriteFixed { file, offset, buf } => match file {
                 IoFile::Fd(fd) => {
-                    opcode::WriteFixed::new(types::Fd(fd.0), buf.as_mut_ptr(), buf.len(), buf.buf_index())
+                    opcode::WriteFixed::new(types::Fd(fd.0), buf.as_mut_ptr(), buf.length(), buf.buf_index())
                         .offset(*offset)
                         .build()
                 }
 
                 IoFile::Fixed(fd) => {
-                    opcode::WriteFixed::new(types::Fixed(fd.0), buf.as_mut_ptr(), buf.len(), buf.buf_index())
+                    opcode::WriteFixed::new(types::Fixed(fd.0), buf.as_mut_ptr(), buf.length(), buf.buf_index())
                         .offset(*offset)
                         .build()
                 }

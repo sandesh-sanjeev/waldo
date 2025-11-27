@@ -1,0 +1,104 @@
+name: CI
+
+on:
+  push:
+    branches: ["master"]
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    name: Build
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+      
+      - name: Setup rust (Stable)
+        uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          toolchain: stable
+          components: clippy, rustfmt
+
+      - name: Install cargo-nextest
+        uses: taiki-e/install-action@nextest
+
+      - name: Check Rust version
+        run: cargo --version
+
+      - name: Deny cargo fmt warnings
+        run: cargo fmt --check
+
+      - name: Deny cargo clippy warnings
+        run: cargo clippy -- --deny warnings --no-deps
+
+      - name: Clean build artifacts
+        run: cargo clean
+
+      - name: Build crate
+        run: cargo build
+      
+      - name: Test crate
+        run: cargo nextest run
+
+  docs:
+    name: Docs
+    needs: build
+    runs-on: ubuntu-latest
+
+    permissions:
+      contents: write
+      
+    concurrency:
+      group: deploy
+      cancel-in-progress: false
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup rust (stable)
+        uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          toolchain: stable
+
+      - name: Setup pages
+        id: pages
+        uses: actions/configure-pages@v5
+        
+      - name: Clean docs directory
+        run: cargo clean --doc
+
+      - name: Build docs
+        run: cargo doc --no-deps
+
+      - name: Add redirect
+        run: echo '<meta http-equiv="refresh" content="0;url=aoc/index.html">' > target/doc/index.html
+      
+      - name: Remove lock file
+        run: rm target/doc/.lock
+
+      - name: Upload artifact
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: target/doc
+  
+  deploy:
+    name: Deploy
+    needs: docs
+    runs-on: ubuntu-latest
+
+    permissions:
+      pages: write
+      id-token: write
+
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    
+    steps:
+      - name: Deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v4

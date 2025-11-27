@@ -7,6 +7,32 @@ use std::{
     ops::{Deref, DerefMut},
 };
 
+/// A slice of bytes that can be shared with kernel.
+pub trait Memory {
+    /// Raw pointer to the byte slice.
+    fn as_ptr(&self) -> *const u8;
+
+    /// Raw mutable pointer to the byte slice.
+    fn as_mut_ptr(&mut self) -> *mut u8;
+
+    ///  Number of bytes in the byte slice.
+    fn length(&self) -> u32;
+}
+
+impl Memory for Vec<u8> {
+    fn as_ptr(&self) -> *const u8 {
+        self.as_ptr()
+    }
+
+    fn as_mut_ptr(&mut self) -> *mut u8 {
+        self.as_mut_ptr()
+    }
+
+    fn length(&self) -> u32 {
+        u32::try_from(self.len()).unwrap_or(u32::MAX)
+    }
+}
+
 /// An IoBuf that is registered with the I/O runtime.
 #[derive(Debug)]
 pub struct IoFixedBuf {
@@ -24,19 +50,18 @@ impl IoFixedBuf {
     pub(super) fn buf_index(&self) -> u16 {
         self.buf_index
     }
+}
 
-    /// Raw pointer to the byte slice.
-    pub(super) fn as_ptr(&self) -> *const u8 {
+impl Memory for IoFixedBuf {
+    fn as_ptr(&self) -> *const u8 {
         self.buf.as_ptr()
     }
 
-    /// Raw mutable pointer to the byte slice.
-    pub(super) fn as_mut_ptr(&mut self) -> *mut u8 {
+    fn as_mut_ptr(&mut self) -> *mut u8 {
         self.buf.as_mut_ptr()
     }
 
-    ///  Number of bytes in the byte slice.
-    pub(super) fn len(&self) -> u32 {
+    fn length(&self) -> u32 {
         self.buf.length()
     }
 }
@@ -79,27 +104,32 @@ impl IoBuf {
     /// # Arguments
     ///
     /// * `capacity` - Number of bytes to allocate.
-    pub fn allocate(capacity: u32) -> Result<Self> {
+    /// * `huge_pages` - true if memory should be allocated with huge pages.
+    pub fn allocate(capacity: u32, huge_pages: bool) -> Result<Self> {
         let capacity = usize::try_from(capacity).expect("Capacity exceeds allocatable memory");
-        let mmap = MmapOptions::new()
-            // TODO: Allow configuration for huge pages.
-            .huge(None)
-            .populate()
-            .len(capacity)
-            .map_anon()?;
+
+        // Start building options for allocation.
+        let mut mmap = MmapOptions::new();
+        mmap.populate();
+        mmap.len(capacity);
+
+        // If huge pages is enabled, then request memory to be allocated
+        // with system default huge page size. Perhaps we should allow this
+        // to be configurable?
+        if huge_pages {
+            mmap.huge(None);
+        }
 
         // Return newly allocated memory.
-        Ok(Self { mmap, len: 0 })
+        Ok(Self {
+            len: 0,
+            mmap: mmap.map_anon()?,
+        })
     }
 
     /// Maximum number of bytes that can be held in buffer.
     pub fn capacity(&self) -> u32 {
         self.mmap.len() as u32
-    }
-
-    ///  Number of bytes in the byte slice.
-    pub fn length(&self) -> u32 {
-        self.len
     }
 
     /// More bytes that the buffer can hold without overflow.
@@ -143,9 +173,9 @@ impl IoBuf {
     ///
     /// # Arguments
     ///
+    /// * `len` - New length of the buffer.
     /// * `value` - Value to fill for excess bytes.
-    /// * `src` - new length of the buffer.
-    pub fn resize(&mut self, value: u8, len: usize) {
+    pub fn resize(&mut self, len: usize, value: u8) {
         let new_len = u32::try_from(len).unwrap_or(u32::MAX);
         let new_len = std::cmp::min(new_len, self.capacity());
 
@@ -203,6 +233,20 @@ impl IoBuf {
     /// Raw mutable pointer to the current start of the byte slice.
     pub(super) fn as_mut_ptr(&mut self) -> *mut u8 {
         self.mmap.as_mut_ptr()
+    }
+}
+
+impl Memory for IoBuf {
+    fn as_ptr(&self) -> *const u8 {
+        self.mmap.as_ptr()
+    }
+
+    fn as_mut_ptr(&mut self) -> *mut u8 {
+        self.mmap.as_mut_ptr()
+    }
+
+    fn length(&self) -> u32 {
+        self.len
     }
 }
 
