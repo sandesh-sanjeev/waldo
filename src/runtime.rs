@@ -113,7 +113,7 @@ impl<A> IoRuntime<A> {
     /// Number of I/O actions runtime can accept without overflow.
     pub fn sq_remaining(&mut self) -> usize {
         let sq = self.io_ring.submission();
-        sq.capacity() - sq.len()
+        sq.capacity().saturating_sub(sq.len())
     }
 
     /// Push an I/O request into the runtime.

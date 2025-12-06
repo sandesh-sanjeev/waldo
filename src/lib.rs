@@ -8,4 +8,5 @@
 //! and reap I/O requests. It's a fairly low level abstraction that is expected
 //! to be used internally within the crate.
 
+pub mod log;
 pub mod runtime;
