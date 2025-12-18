@@ -3,7 +3,7 @@
 mod buf;
 mod file;
 
-pub use buf::{IoBuf, IoFixedBuf, Memory};
+pub use buf::{Buf, IoBuf, IoFixedBuf, Memory};
 pub use file::{IoFile, IoFileFd, IoFixedFd};
 
 use io_uring::{
@@ -218,22 +218,10 @@ pub enum IoAction {
     Resize { file: IoFile, len: u64 },
 
     /// Action to read from file starting at a specific offset.
-    Read { file: IoFile, offset: u64, buf: IoBuf },
+    Read { file: IoFile, offset: u64, buf: Buf },
 
     /// Action to write into file starting at a specific offset.
-    Write { file: IoFile, offset: u64, buf: IoBuf },
-
-    /// Action to read from file starting at a specific offset using a vector backed buffer.
-    ReadVec { file: IoFile, offset: u64, buf: Vec<u8> },
-
-    /// Action to write into file starting at a specific offset using a vector backed buffer.
-    WriteVec { file: IoFile, offset: u64, buf: Vec<u8> },
-
-    /// Action to read from file starting at a specific offset using registered buffer.
-    ReadFixed { file: IoFile, offset: u64, buf: IoFixedBuf },
-
-    /// Action to write into file starting at a specific offset using registered buffer.
-    WriteFixed { file: IoFile, offset: u64, buf: IoFixedBuf },
+    Write { file: IoFile, offset: u64, buf: Buf },
 }
 
 impl IoAction {
@@ -271,10 +259,10 @@ impl IoAction {
     /// * `file` - File to read from.
     /// * `offset` - Offset on file to begin reads.
     /// * `buf` - Buffer of bytes to copy bytes into.
-    pub fn read_at<F: Into<IoFile>>(file: F, offset: u64, buf: IoBuf) -> Self {
+    pub fn read_at<F: Into<IoFile>, B: Into<Buf>>(file: F, offset: u64, buf: B) -> Self {
         Self::Read {
-            buf,
             offset,
+            buf: buf.into(),
             file: file.into(),
         }
     }
@@ -286,70 +274,10 @@ impl IoAction {
     /// * `file` - File to write into.
     /// * `offset` - Offset on file to begin writes.
     /// * `buf` - Buffer of bytes to copy bytes from.
-    pub fn write_at<F: Into<IoFile>>(file: F, offset: u64, buf: IoBuf) -> Self {
+    pub fn write_at<F: Into<IoFile>, B: Into<Buf>>(file: F, offset: u64, buf: B) -> Self {
         Self::Write {
-            buf,
             offset,
-            file: file.into(),
-        }
-    }
-
-    /// Read from file at a specific offset with a vector as buffer.
-    ///
-    /// # Arguments
-    ///
-    /// * `file` - File to read from.
-    /// * `offset` - Offset on file to begin reads.
-    /// * `buf` - Buffer of bytes to copy bytes into.
-    pub fn read_at_vec<F: Into<IoFile>>(file: F, offset: u64, buf: Vec<u8>) -> Self {
-        Self::ReadVec {
-            buf,
-            offset,
-            file: file.into(),
-        }
-    }
-
-    /// Write to file at a specific offset with a vector as buffer.
-    ///
-    /// # Arguments
-    ///
-    /// * `file` - File to write into.
-    /// * `offset` - Offset on file to begin writes.
-    /// * `buf` - Buffer of bytes to copy bytes from.
-    pub fn write_at_vec<F: Into<IoFile>>(file: F, offset: u64, buf: Vec<u8>) -> Self {
-        Self::WriteVec {
-            buf,
-            offset,
-            file: file.into(),
-        }
-    }
-
-    /// Read from file at a specific offset.
-    ///
-    /// # Arguments
-    ///
-    /// * `file` - File to read from.
-    /// * `offset` - Offset on file to begin reads.
-    /// * `buf` - Buffer of bytes to copy bytes into.
-    pub fn read_at_fixed<F: Into<IoFile>>(file: F, offset: u64, buf: IoFixedBuf) -> Self {
-        Self::ReadFixed {
-            buf,
-            offset,
-            file: file.into(),
-        }
-    }
-
-    /// Write to file at a specific offset.
-    ///
-    /// # Arguments
-    ///
-    /// * `file` - File to write into.
-    /// * `offset` - Offset on file to begin writes.
-    /// * `buf` - Buffer of bytes to copy bytes from.
-    pub fn write_at_fixed<F: Into<IoFile>>(file: F, offset: u64, buf: IoFixedBuf) -> Self {
-        Self::WriteFixed {
-            buf,
-            offset,
+            buf: buf.into(),
             file: file.into(),
         }
     }
@@ -372,72 +300,48 @@ impl IoAction {
                 IoFile::Fixed(fd) => opcode::Ftruncate::new(types::Fixed(fd.0), *len).build(),
             },
 
-            Self::Read { file, offset, buf } => match file {
-                IoFile::Fd(fd) => opcode::Read::new(types::Fd(fd.0), buf.as_mut_ptr(), buf.length())
-                    .offset(*offset)
-                    .build(),
-
-                IoFile::Fixed(fd) => opcode::Read::new(types::Fixed(fd.0), buf.as_mut_ptr(), buf.length())
-                    .offset(*offset)
-                    .build(),
-            },
-
-            Self::Write { file, offset, buf } => match file {
-                IoFile::Fd(fd) => opcode::Write::new(types::Fd(fd.0), buf.as_ptr(), buf.length())
-                    .offset(*offset)
-                    .build(),
-
-                IoFile::Fixed(fd) => opcode::Write::new(types::Fixed(fd.0), buf.as_ptr(), buf.length())
-                    .offset(*offset)
-                    .build(),
-            },
-
-            Self::ReadVec { file, offset, buf } => match file {
-                IoFile::Fd(fd) => opcode::Read::new(types::Fd(fd.0), buf.as_mut_ptr(), buf.length())
-                    .offset(*offset)
-                    .build(),
-
-                IoFile::Fixed(fd) => opcode::Read::new(types::Fixed(fd.0), buf.as_mut_ptr(), buf.length())
-                    .offset(*offset)
-                    .build(),
-            },
-
-            Self::WriteVec { file, offset, buf } => match file {
-                IoFile::Fd(fd) => opcode::Write::new(types::Fd(fd.0), buf.as_ptr(), buf.length())
-                    .offset(*offset)
-                    .build(),
-
-                IoFile::Fixed(fd) => opcode::Write::new(types::Fixed(fd.0), buf.as_ptr(), buf.length())
-                    .offset(*offset)
-                    .build(),
-            },
-
-            Self::ReadFixed { file, offset, buf } => match file {
-                IoFile::Fd(fd) => {
+            Self::Read { file, offset, buf } => match (file, buf) {
+                (IoFile::Fd(fd), Buf::Fixed(buf)) => {
                     opcode::ReadFixed::new(types::Fd(fd.0), buf.as_mut_ptr(), buf.length(), buf.buf_index())
                         .offset(*offset)
                         .build()
                 }
 
-                IoFile::Fixed(fd) => {
+                (IoFile::Fixed(fd), Buf::Fixed(buf)) => {
                     opcode::ReadFixed::new(types::Fixed(fd.0), buf.as_mut_ptr(), buf.length(), buf.buf_index())
                         .offset(*offset)
                         .build()
                 }
+
+                (IoFile::Fd(fd), buf) => opcode::Read::new(types::Fd(fd.0), buf.as_mut_ptr(), buf.length())
+                    .offset(*offset)
+                    .build(),
+
+                (IoFile::Fixed(fd), buf) => opcode::Read::new(types::Fixed(fd.0), buf.as_mut_ptr(), buf.length())
+                    .offset(*offset)
+                    .build(),
             },
 
-            Self::WriteFixed { file, offset, buf } => match file {
-                IoFile::Fd(fd) => {
+            Self::Write { file, offset, buf } => match (file, buf) {
+                (IoFile::Fd(fd), Buf::Fixed(buf)) => {
                     opcode::WriteFixed::new(types::Fd(fd.0), buf.as_mut_ptr(), buf.length(), buf.buf_index())
                         .offset(*offset)
                         .build()
                 }
 
-                IoFile::Fixed(fd) => {
+                (IoFile::Fixed(fd), Buf::Fixed(buf)) => {
                     opcode::WriteFixed::new(types::Fixed(fd.0), buf.as_mut_ptr(), buf.length(), buf.buf_index())
                         .offset(*offset)
                         .build()
                 }
+
+                (IoFile::Fd(fd), buf) => opcode::Write::new(types::Fd(fd.0), buf.as_ptr(), buf.length())
+                    .offset(*offset)
+                    .build(),
+
+                (IoFile::Fixed(fd), buf) => opcode::Write::new(types::Fixed(fd.0), buf.as_ptr(), buf.length())
+                    .offset(*offset)
+                    .build(),
             },
         }
     }

@@ -8,7 +8,7 @@ use std::{
     os::unix::fs::OpenOptionsExt,
     time::Instant,
 };
-use waldo::runtime::{IoAction, IoBuf, IoFile, IoFixedBuf, IoResponse, IoRuntime};
+use waldo::runtime::{Buf, IoAction, IoBuf, IoFile, IoResponse, IoRuntime};
 
 /// Arguments for the I/O runtime benchmark.
 #[derive(Parser, Clone)]
@@ -22,12 +22,12 @@ struct Arguments {
     #[arg(long, default_value = "4")]
     readers: u32,
 
-    /// Size of buffers used for reads and writes in bytes.
-    #[arg(long, default_value = "2097152")]
+    /// Size of buffers used for reads and writes in MB.
+    #[arg(long, default_value = "2")]
     buffer_size: u32,
 
-    /// Maximum size of a file in bytes.
-    #[arg(long, default_value = "8589934592")]
+    /// Maximum size of a file in GB.
+    #[arg(long, default_value = "8")]
     file_size: u64,
 
     /// Run benchmark without a writer.
@@ -53,7 +53,9 @@ struct Arguments {
 
 fn main() -> Result<()> {
     // Parse command line arguments.
-    let args = Arguments::parse();
+    let mut args = Arguments::parse();
+    args.buffer_size = args.buffer_size * (1024 * 1024); // From MB
+    args.file_size = args.file_size * (1024 * 1024 * 1024); // From GB
 
     // I/O uring based async runtime.
     let queue_depth = if args.no_writer { args.readers } else { args.readers + 1 };
@@ -77,14 +79,14 @@ fn main() -> Result<()> {
     let mut bufs: Vec<_> = if !args.register_buf {
         (0..queue_depth)
             .map(|_| Vec::with_capacity(args.buffer_size as _))
-            .map(BenchBuf::Vec)
+            .map(Buf::from)
             .collect()
     } else if args.huge_pages && !args.register_buf {
         let bufs: Vec<_> = (0..queue_depth)
             .map(|_| IoBuf::allocate(args.buffer_size, true))
             .collect::<Result<Vec<_>>>()?;
 
-        bufs.into_iter().map(BenchBuf::Buf).collect()
+        bufs.into_iter().map(Buf::from).collect()
     } else {
         let bufs: Vec<_> = (0..queue_depth)
             .map(|_| IoBuf::allocate(args.buffer_size, args.huge_pages))
@@ -93,7 +95,7 @@ fn main() -> Result<()> {
         // Safety: Buffers exist for the life of this process.
         // Register all the memory we are going to be using with the runtime.
         let bufs = unsafe { runtime.register_bufs(bufs)? };
-        bufs.into_iter().map(BenchBuf::Fixed).collect()
+        bufs.into_iter().map(Buf::from).collect()
     };
 
     // Define the writer, if required.
@@ -215,13 +217,6 @@ fn bench_file(args: &Arguments) -> Result<File> {
     builder.open(&args.path)
 }
 
-/// Different types of buffers used for benchmarks.
-enum BenchBuf {
-    Buf(IoBuf),
-    Vec(Vec<u8>),
-    Fixed(IoFixedBuf),
-}
-
 /// A worker who is working as a file writer.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct Writer;
@@ -234,19 +229,19 @@ struct Reader;
 struct Worker<'a, R> {
     offset: u64,
     file: IoFile,
-    buf: Option<BenchBuf>,
+    buf: Option<Buf>,
     args: &'a Arguments,
     role: PhantomData<R>,
 }
 
 impl<'a, R> Worker<'a, R> {
-    fn new(file: IoFile, mut buf: BenchBuf, args: &'a Arguments) -> Self {
+    fn new(file: IoFile, mut buf: Buf, args: &'a Arguments) -> Self {
         // Make sure all bytes in the buffer are visible.
         // To make that happen, we fill buffer with arbitrary values.
         match &mut buf {
-            BenchBuf::Buf(buf) => buf.resize(args.buffer_size as _, 13),
-            BenchBuf::Vec(buf) => buf.resize(args.buffer_size as _, 13),
-            BenchBuf::Fixed(buf) => buf.resize(args.buffer_size as _, 13),
+            Buf::Io(buf) => buf.resize(args.buffer_size as _, 13),
+            Buf::Vec(buf) => buf.resize(args.buffer_size as _, 13),
+            Buf::Fixed(buf) => buf.resize(args.buffer_size as _, 13),
         }
 
         Self {
@@ -270,9 +265,9 @@ impl<'a, R> Worker<'a, R> {
 impl Worker<'_, Reader> {
     fn next_io(&mut self) -> Option<IoAction> {
         let action = match self.buf.take()? {
-            BenchBuf::Buf(buf) => IoAction::read_at(self.file, self.offset, buf),
-            BenchBuf::Vec(buf) => IoAction::read_at_vec(self.file, self.offset, buf),
-            BenchBuf::Fixed(buf) => IoAction::read_at_fixed(self.file, self.offset, buf),
+            Buf::Io(buf) => IoAction::read_at(self.file, self.offset, buf),
+            Buf::Vec(buf) => IoAction::read_at(self.file, self.offset, buf),
+            Buf::Fixed(buf) => IoAction::read_at(self.file, self.offset, buf),
         };
 
         Some(action)
@@ -280,9 +275,7 @@ impl Worker<'_, Reader> {
 
     fn complete_io<T>(&mut self, result: IoResponse<T>) {
         let buf = match result.action {
-            IoAction::Read { buf, .. } => BenchBuf::Buf(buf),
-            IoAction::ReadVec { buf, .. } => BenchBuf::Vec(buf),
-            IoAction::ReadFixed { buf, .. } => BenchBuf::Fixed(buf),
+            IoAction::Read { buf, .. } => buf,
             other => panic!("Unsupported worker action: {other:?}"),
         };
 
@@ -296,9 +289,9 @@ impl Worker<'_, Reader> {
 impl Worker<'_, Writer> {
     fn next_io(&mut self) -> Option<IoAction> {
         let action = match self.buf.take()? {
-            BenchBuf::Buf(buf) => IoAction::write_at(self.file, self.offset, buf),
-            BenchBuf::Vec(buf) => IoAction::write_at_vec(self.file, self.offset, buf),
-            BenchBuf::Fixed(buf) => IoAction::write_at_fixed(self.file, self.offset, buf),
+            Buf::Io(buf) => IoAction::write_at(self.file, self.offset, buf),
+            Buf::Vec(buf) => IoAction::write_at(self.file, self.offset, buf),
+            Buf::Fixed(buf) => IoAction::write_at(self.file, self.offset, buf),
         };
 
         Some(action)
@@ -306,9 +299,7 @@ impl Worker<'_, Writer> {
 
     fn complete_io<T>(&mut self, result: IoResponse<T>) {
         let buf = match result.action {
-            IoAction::Write { buf, .. } => BenchBuf::Buf(buf),
-            IoAction::WriteVec { buf, .. } => BenchBuf::Vec(buf),
-            IoAction::WriteFixed { buf, .. } => BenchBuf::Fixed(buf),
+            IoAction::Write { buf, .. } => buf,
             other => panic!("Unsupported worker action: {other:?}"),
         };
 

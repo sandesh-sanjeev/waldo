@@ -7,6 +7,63 @@ use std::{
     ops::{Deref, DerefMut},
 };
 
+/// Different types of supported buffers.
+#[derive(Debug)]
+pub enum Buf {
+    /// A fixed size buffer, not registered with io-uring.
+    Io(IoBuf),
+
+    /// A growable buffer, not registered with io_uring.
+    Vec(Vec<u8>),
+
+    /// A fixed size buffer, registered with io-uring.
+    Fixed(IoFixedBuf),
+}
+
+impl From<IoBuf> for Buf {
+    fn from(value: IoBuf) -> Self {
+        Self::Io(value)
+    }
+}
+
+impl From<Vec<u8>> for Buf {
+    fn from(value: Vec<u8>) -> Self {
+        Self::Vec(value)
+    }
+}
+
+impl From<IoFixedBuf> for Buf {
+    fn from(value: IoFixedBuf) -> Self {
+        Self::Fixed(value)
+    }
+}
+
+impl Memory for Buf {
+    fn as_ptr(&self) -> *const u8 {
+        match self {
+            Self::Io(buf) => buf.as_ptr(),
+            Self::Vec(buf) => buf.as_ptr(),
+            Self::Fixed(buf) => buf.as_ptr(),
+        }
+    }
+
+    fn as_mut_ptr(&mut self) -> *mut u8 {
+        match self {
+            Self::Io(buf) => buf.as_mut_ptr(),
+            Self::Vec(buf) => buf.as_mut_ptr(),
+            Self::Fixed(buf) => buf.as_mut_ptr(),
+        }
+    }
+
+    fn length(&self) -> u32 {
+        match self {
+            Self::Io(buf) => buf.length(),
+            Self::Vec(buf) => buf.length(),
+            Self::Fixed(buf) => buf.length(),
+        }
+    }
+}
+
 /// A slice of bytes that can be shared with kernel.
 pub trait Memory {
     /// Raw pointer to the byte slice.
