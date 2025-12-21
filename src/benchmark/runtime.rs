@@ -8,7 +8,7 @@ use std::{
     os::unix::fs::OpenOptionsExt,
     time::Instant,
 };
-use waldo::runtime::{Buf, IoAction, IoBuf, IoFile, IoResponse, IoRuntime};
+use waldo::runtime::{BufPool, IoAction, IoBuf, IoFile, IoResponse, IoRuntime, RawBytes};
 
 /// Arguments for the I/O runtime benchmark.
 #[derive(Parser, Clone)]
@@ -75,41 +75,27 @@ fn main() -> Result<()> {
         (file, io_file)
     };
 
-    // Allocate all memory for benchmark upfront.
-    let mut bufs: Vec<_> = if !args.register_buf {
-        (0..queue_depth)
-            .map(|_| Vec::with_capacity(args.buffer_size as _))
-            .map(Buf::from)
-            .collect()
-    } else if args.huge_pages && !args.register_buf {
-        let bufs: Vec<_> = (0..queue_depth)
-            .map(|_| IoBuf::allocate(args.buffer_size, true))
-            .collect::<Result<Vec<_>>>()?;
+    // Allocate memory required.
+    let mut bufs = Vec::with_capacity(queue_depth as _);
+    for _ in 0..queue_depth {
+        bufs.push(RawBytes::allocate(args.buffer_size as _, args.huge_pages)?);
+    }
 
-        bufs.into_iter().map(Buf::from).collect()
-    } else {
-        let bufs: Vec<_> = (0..queue_depth)
-            .map(|_| IoBuf::allocate(args.buffer_size, args.huge_pages))
-            .collect::<Result<Vec<_>>>()?;
-
-        // Safety: Buffers exist for the life of this process.
-        // Register all the memory we are going to be using with the runtime.
-        let bufs = unsafe { runtime.register_bufs(bufs)? };
-        bufs.into_iter().map(Buf::from).collect()
-    };
+    // Register allocated buffers with the I/O runtime.
+    // Safety: Registered pointers, length and index are immutable.
+    unsafe { runtime.register_bufs(&mut bufs)? };
+    let buffer_pool = BufPool::new(bufs);
 
     // Define the writer, if required.
     let mut writer = None;
     if !args.no_writer {
-        let buf = bufs.pop().expect("Should have allocated buffer");
-        writer = Some(Worker::<Writer>::new(io_file, buf, &args));
+        writer = Some(Worker::<Writer>::new(io_file, &args));
     }
 
     // Define all the readers.
     let mut readers = Vec::with_capacity(args.readers as usize);
     for _ in 0..args.readers {
-        let buf = bufs.pop().expect("Should have allocated buffer");
-        readers.push(Worker::<Reader>::new(io_file, buf, &args));
+        readers.push(Worker::<Reader>::new(io_file, &args));
     }
 
     // Run repeatedly till all I/O is completed.
@@ -127,7 +113,8 @@ fn main() -> Result<()> {
             && !worker.has_completed()
             && !worker.has_pending_io()
         {
-            let action = worker.next_io().expect("No pending I/O");
+            let bytes = buffer_pool.take();
+            let action = worker.next_io(bytes);
             runtime.push(action, usize::MAX).expect("Should have space for all I/O");
         }
 
@@ -138,7 +125,8 @@ fn main() -> Result<()> {
         // Create I/O requests for readers.
         for (i, worker) in readers.iter_mut().enumerate() {
             if !worker.has_completed() && !worker.has_pending_io() && worker.offset < file_size {
-                let action = worker.next_io().expect("No pending I/O");
+                let bytes = buffer_pool.take();
+                let action = worker.next_io(bytes);
                 runtime.push(action, i).expect("Should have space for all I/O");
             }
         }
@@ -229,27 +217,19 @@ struct Reader;
 struct Worker<'a, R> {
     offset: u64,
     file: IoFile,
-    buf: Option<Buf>,
     args: &'a Arguments,
     role: PhantomData<R>,
+    pending_io: bool,
 }
 
 impl<'a, R> Worker<'a, R> {
-    fn new(file: IoFile, mut buf: Buf, args: &'a Arguments) -> Self {
-        // Make sure all bytes in the buffer are visible.
-        // To make that happen, we fill buffer with arbitrary values.
-        match &mut buf {
-            Buf::Io(buf) => buf.resize(args.buffer_size as _, 13),
-            Buf::Vec(buf) => buf.resize(args.buffer_size as _, 13),
-            Buf::Fixed(buf) => buf.resize(args.buffer_size as _, 13),
-        }
-
+    fn new(file: IoFile, args: &'a Arguments) -> Self {
         Self {
             file,
             args,
             offset: 0,
-            buf: Some(buf),
             role: PhantomData,
+            pending_io: false,
         }
     }
 
@@ -258,28 +238,19 @@ impl<'a, R> Worker<'a, R> {
     }
 
     fn has_pending_io(&self) -> bool {
-        self.buf.is_none()
+        self.pending_io
     }
 }
 
 impl Worker<'_, Reader> {
-    fn next_io(&mut self) -> Option<IoAction> {
-        let action = match self.buf.take()? {
-            Buf::Io(buf) => IoAction::read_at(self.file, self.offset, buf),
-            Buf::Vec(buf) => IoAction::read_at(self.file, self.offset, buf),
-            Buf::Fixed(buf) => IoAction::read_at(self.file, self.offset, buf),
-        };
-
-        Some(action)
+    fn next_io(&mut self, mut buf: IoBuf) -> IoAction {
+        buf.set_len(self.args.buffer_size as _);
+        self.pending_io = true;
+        IoAction::read_at(self.file, self.offset, buf)
     }
 
     fn complete_io<T>(&mut self, result: IoResponse<T>) {
-        let buf = match result.action {
-            IoAction::Read { buf, .. } => buf,
-            other => panic!("Unsupported worker action: {other:?}"),
-        };
-
-        self.buf.replace(buf);
+        self.pending_io = false;
         if result.result == self.args.buffer_size {
             self.offset += self.args.buffer_size as u64;
         }
@@ -287,23 +258,14 @@ impl Worker<'_, Reader> {
 }
 
 impl Worker<'_, Writer> {
-    fn next_io(&mut self) -> Option<IoAction> {
-        let action = match self.buf.take()? {
-            Buf::Io(buf) => IoAction::write_at(self.file, self.offset, buf),
-            Buf::Vec(buf) => IoAction::write_at(self.file, self.offset, buf),
-            Buf::Fixed(buf) => IoAction::write_at(self.file, self.offset, buf),
-        };
-
-        Some(action)
+    fn next_io(&mut self, mut buf: IoBuf) -> IoAction {
+        buf.set_len(self.args.buffer_size as _);
+        self.pending_io = true;
+        IoAction::write_at(self.file, self.offset, buf)
     }
 
     fn complete_io<T>(&mut self, result: IoResponse<T>) {
-        let buf = match result.action {
-            IoAction::Write { buf, .. } => buf,
-            other => panic!("Unsupported worker action: {other:?}"),
-        };
-
-        self.buf.replace(buf);
+        self.pending_io = false;
         if result.result == self.args.buffer_size {
             self.offset += self.args.buffer_size as u64;
         }

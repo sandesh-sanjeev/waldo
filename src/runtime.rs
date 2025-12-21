@@ -1,9 +1,9 @@
 //! A minimal Async I/O runtime backed by io-uring.
 
-mod buf;
+mod alloc;
 mod file;
 
-pub use buf::{Buf, IoBuf, IoFixedBuf, Memory};
+pub use alloc::{BufPool, Bytes, IoBuf, RawBytes};
 pub use file::{IoFile, IoFileFd, IoFixedFd};
 
 use io_uring::{
@@ -49,8 +49,8 @@ impl<A> IoRuntime<A> {
     /// Create a new async I/O runtime.
     pub fn new(queue_depth: u32) -> io::Result<Self> {
         let io_ring = IoUring::builder()
-            .setup_single_issuer()
-            .setup_coop_taskrun()
+            //.setup_single_issuer()
+            //.setup_coop_taskrun()
             .build(queue_depth)?;
 
         // Our limit on maximum pending I/O.
@@ -93,27 +93,30 @@ impl<A> IoRuntime<A> {
     /// # Arguments
     ///
     /// * `bufs` - Buffers to register with the runtime.
-    pub unsafe fn register_bufs(&mut self, mut bufs: Vec<IoBuf>) -> io::Result<Vec<IoFixedBuf>> {
+    pub unsafe fn register_bufs(&mut self, bufs: &mut [RawBytes]) -> io::Result<()> {
         // The kind of sized buffers kernel understands.
-        let io_bufs: Vec<_> = bufs.iter_mut().map(IoBuf::io_vec).collect();
+        let io_bufs: Vec<_> = bufs.iter_mut().map(libc::iovec::from).collect();
 
         // Safety is upheld by the caller.
         unsafe { self.io_ring.submitter().register_buffers(&io_bufs)? };
 
-        // Return the registered buffers.
-        let registered_bufs = bufs
-            .into_iter()
+        // Assign I/O index for the registered buffer.
+        bufs.iter_mut()
             .enumerate()
-            .map(|(i, buf)| IoFixedBuf::new(buf, i as u16))
-            .collect();
+            .for_each(|(i, buf)| buf.set_io_index(i as _));
 
-        Ok(registered_bufs)
+        Ok(())
     }
 
-    /// Number of I/O actions runtime can accept without overflow.
+    /// Number of I/O actions runtime can submitted without sq overflow.
     pub fn sq_remaining(&mut self) -> usize {
         let sq = self.io_ring.submission();
         sq.capacity().saturating_sub(sq.len())
+    }
+
+    /// Number of I/O actions more that can be completed without cq overflow.
+    pub fn pending_io(&self) -> usize {
+        self.io_futures.len()
     }
 
     /// Push an I/O request into the runtime.
@@ -218,10 +221,10 @@ pub enum IoAction {
     Resize { file: IoFile, len: u64 },
 
     /// Action to read from file starting at a specific offset.
-    Read { file: IoFile, offset: u64, buf: Buf },
+    Read { file: IoFile, offset: u64, buf: IoBuf },
 
     /// Action to write into file starting at a specific offset.
-    Write { file: IoFile, offset: u64, buf: Buf },
+    Write { file: IoFile, offset: u64, buf: IoBuf },
 }
 
 impl IoAction {
@@ -259,10 +262,10 @@ impl IoAction {
     /// * `file` - File to read from.
     /// * `offset` - Offset on file to begin reads.
     /// * `buf` - Buffer of bytes to copy bytes into.
-    pub fn read_at<F: Into<IoFile>, B: Into<Buf>>(file: F, offset: u64, buf: B) -> Self {
+    pub fn read_at<F: Into<IoFile>>(file: F, offset: u64, buf: IoBuf) -> Self {
         Self::Read {
+            buf,
             offset,
-            buf: buf.into(),
             file: file.into(),
         }
     }
@@ -274,11 +277,20 @@ impl IoAction {
     /// * `file` - File to write into.
     /// * `offset` - Offset on file to begin writes.
     /// * `buf` - Buffer of bytes to copy bytes from.
-    pub fn write_at<F: Into<IoFile>, B: Into<Buf>>(file: F, offset: u64, buf: B) -> Self {
+    pub fn write_at<F: Into<IoFile>>(file: F, offset: u64, buf: IoBuf) -> Self {
         Self::Write {
+            buf,
             offset,
-            buf: buf.into(),
             file: file.into(),
+        }
+    }
+
+    /// Take ownership of the buffer held in the action, if any.
+    pub fn take_buf(self) -> Option<IoBuf> {
+        match self {
+            Self::Read { buf, .. } => Some(buf),
+            Self::Write { buf, .. } => Some(buf),
+            _ => None,
         }
     }
 
@@ -300,49 +312,45 @@ impl IoAction {
                 IoFile::Fixed(fd) => opcode::Ftruncate::new(types::Fixed(fd.0), *len).build(),
             },
 
-            Self::Read { file, offset, buf } => match (file, buf) {
-                (IoFile::Fd(fd), Buf::Fixed(buf)) => {
-                    opcode::ReadFixed::new(types::Fd(fd.0), buf.as_mut_ptr(), buf.length(), buf.buf_index())
+            Self::Read { file, offset, buf } => {
+                let ptr = buf.as_mut_ptr();
+                let len = buf.len() as u32;
+                match (file, buf.io_index()) {
+                    (IoFile::Fd(fd), None) => opcode::Read::new(types::Fd(fd.0), ptr, len).offset(*offset).build(),
+
+                    (IoFile::Fixed(fd), None) => {
+                        opcode::Read::new(types::Fixed(fd.0), ptr, len).offset(*offset).build()
+                    }
+
+                    (IoFile::Fd(fd), Some(index)) => opcode::ReadFixed::new(types::Fd(fd.0), ptr, len, index)
                         .offset(*offset)
-                        .build()
-                }
+                        .build(),
 
-                (IoFile::Fixed(fd), Buf::Fixed(buf)) => {
-                    opcode::ReadFixed::new(types::Fixed(fd.0), buf.as_mut_ptr(), buf.length(), buf.buf_index())
+                    (IoFile::Fixed(fd), Some(index)) => opcode::ReadFixed::new(types::Fixed(fd.0), ptr, len, index)
                         .offset(*offset)
-                        .build()
+                        .build(),
                 }
+            }
 
-                (IoFile::Fd(fd), buf) => opcode::Read::new(types::Fd(fd.0), buf.as_mut_ptr(), buf.length())
-                    .offset(*offset)
-                    .build(),
+            Self::Write { file, offset, buf } => {
+                let ptr = buf.as_mut_ptr();
+                let len = buf.len() as u32;
+                match (file, buf.io_index()) {
+                    (IoFile::Fd(fd), None) => opcode::Write::new(types::Fd(fd.0), ptr, len).offset(*offset).build(),
 
-                (IoFile::Fixed(fd), buf) => opcode::Read::new(types::Fixed(fd.0), buf.as_mut_ptr(), buf.length())
-                    .offset(*offset)
-                    .build(),
-            },
+                    (IoFile::Fixed(fd), None) => {
+                        opcode::Write::new(types::Fixed(fd.0), ptr, len).offset(*offset).build()
+                    }
 
-            Self::Write { file, offset, buf } => match (file, buf) {
-                (IoFile::Fd(fd), Buf::Fixed(buf)) => {
-                    opcode::WriteFixed::new(types::Fd(fd.0), buf.as_mut_ptr(), buf.length(), buf.buf_index())
+                    (IoFile::Fd(fd), Some(index)) => opcode::WriteFixed::new(types::Fd(fd.0), ptr, len, index)
                         .offset(*offset)
-                        .build()
-                }
+                        .build(),
 
-                (IoFile::Fixed(fd), Buf::Fixed(buf)) => {
-                    opcode::WriteFixed::new(types::Fixed(fd.0), buf.as_mut_ptr(), buf.length(), buf.buf_index())
+                    (IoFile::Fixed(fd), Some(index)) => opcode::WriteFixed::new(types::Fixed(fd.0), ptr, len, index)
                         .offset(*offset)
-                        .build()
+                        .build(),
                 }
-
-                (IoFile::Fd(fd), buf) => opcode::Write::new(types::Fd(fd.0), buf.as_ptr(), buf.length())
-                    .offset(*offset)
-                    .build(),
-
-                (IoFile::Fixed(fd), buf) => opcode::Write::new(types::Fixed(fd.0), buf.as_ptr(), buf.length())
-                    .offset(*offset)
-                    .build(),
-            },
+            }
         }
     }
 }

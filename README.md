@@ -20,6 +20,19 @@ On ArchLinux, default was set at 8 MB. After much struggle, I figured out that I
 limits for my user (`/etc/systemd/user.conf`). But Ubuntu VM on my Mac needed `/etc/security/limits.conf` update.
 You mileage may vary. 
 
+## Huge Pages
+
+For best performance enable huge pages when allocating I/O buffers. 
+
+You'll need to make sure the OS has enough huge pages enabled and available. Also note that to lock huge pages in
+memory, you also need to raise the memlock limits!
+
+For example, to temporarily set the number of available huge pages:
+
+```bash
+$ sudo sysctl -w vm.nr_hugepages=256
+```
+
 ## Benchmarks
 
 Generate the benchmark binary.
@@ -28,24 +41,17 @@ Generate the benchmark binary.
 $ cargo build --release --features benchmark
 ```
 
-### io-uring runtime
+Run benchmark with profiler.
+
+<https://crates.io/crates/flamegraph>
 
 ```bash
-$ ./target/release/bench_runtime --help
-Arguments for the I/O runtime benchmark
+$ cargo flamegraph --bin bench_runtime --features benchmark --profile bench -- --register-file --register-buf --huge-pages --readers 31
+```
 
-Usage: runtime [OPTIONS]
+To capture kernel events without using sudo, something like this is required:
 
-Options:
-      --path <PATH>                Path to the test file on disk [default: uring.tst]
-      --readers <READERS>          Numbers of readers in benchmark [default: 4]
-      --buffer-size <BUFFER_SIZE>  Size of buffers used for reads and writes in bytes [default: 2097152]
-      --file-size <FILE_SIZE>      Maximum size of a file in bytes [default: 8589934592]
-      --no-writer                  Run benchmark without a writer
-      --register-file              Register files with the I/O uring runtime
-      --register-buf               Register buffers with the I/O uring runtime
-      --direct-io                  Enable direct file I/O, as opposed to Buffered I/O
-      --huge-pages                 Allocate memory using huge pages
-  -h, --help                       Print help
-  -V, --version                    Print version
+```bash
+$ echo 0 | sudo tee /proc/sys/kernel/kptr_restrict
+$ echo -1 | sudo tee /proc/sys/kernel/perf_event_paranoid
 ```
