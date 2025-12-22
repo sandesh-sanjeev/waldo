@@ -3,7 +3,10 @@
 use clap::Parser;
 use std::time::{Duration, Instant};
 use tokio::fs::create_dir_all;
-use waldo::storage::{Options, Storage};
+use waldo::{
+    log::Log,
+    storage::{IndexOptions, Options, Storage},
+};
 
 /// Arguments for the I/O runtime benchmark.
 #[derive(Parser, Clone)]
@@ -16,26 +19,29 @@ struct Arguments {
     #[arg(long, default_value = "128")]
     queue_depth: u16,
 
-    #[arg(long, default_value = "256")]
+    #[arg(long, default_value = "128")]
     pool_size: u16,
 
     /// Numbers of readers in benchmark.
-    #[arg(long, default_value = "127")]
+    #[arg(long, default_value = "64")]
     readers: u32,
 
     /// Size of buffers used for reads and writes in MB.
     #[arg(long, default_value = "2")]
     buf_capacity: usize,
 
-    /// Maximum size of a file in GB.
-    #[arg(long, default_value = "1")]
-    file_size: u64,
+    /// Maximum number of logs to append in benchmark.
+    #[arg(long, default_value = "1000000")]
+    count: u64,
+
+    #[arg(long, default_value = "10000")]
+    batch_size: usize,
 
     #[arg(long, default_value = "20")]
-    append_interval: u64,
+    delay: u64,
 
-    #[arg(long, default_value = "20")]
-    query_interval: u64,
+    #[arg(long, default_value = "250")]
+    log_data_size: usize,
 }
 
 impl From<&Arguments> for Options {
@@ -46,6 +52,11 @@ impl From<&Arguments> for Options {
             pool_size: value.pool_size,
             queue_depth: value.queue_depth,
             buf_capacity: value.buf_capacity * 1024 * 1024, // From MB
+            index_opts: IndexOptions {
+                sparse_count: 100,
+                sparse_bytes: u16::MAX as usize,
+                capacity: (value.count as usize / 100) + 1,
+            },
         }
     }
 }
@@ -54,14 +65,18 @@ impl From<&Arguments> for Options {
 async fn main() -> anyhow::Result<()> {
     // Parse command line arguments.
     let args = Arguments::parse();
-    let buf_capacity = args.buf_capacity * (1024 * 1024); // From MB
-    let file_size = args.file_size * (1024 * 1024 * 1024); // From GB
+    let delay = Duration::from_millis(args.delay);
+
+    // Random log data to use with log records.
+    let count = args.count;
+    let batch_size = args.batch_size;
+    let log_data = vec![5; args.log_data_size];
 
     // Create directory to store benchmark files.
     create_dir_all(&args.path).await?;
 
     // Open storage at the given path.
-    let (storage, _worker) = Storage::open(&args.path, Options::from(&args))?;
+    let storage = Storage::open(&args.path, 0, Options::from(&args))?;
 
     // Number of workers participating in the benchmark.
     let mut workers = Vec::new();
@@ -69,18 +84,24 @@ async fn main() -> anyhow::Result<()> {
     // Define writer.
     {
         let storage = storage.clone();
-        let append_delay = Duration::from_millis(args.append_interval);
-
         workers.push(tokio::spawn(async move {
-            let mut offset = 0;
-            let mut interval = tokio::time::interval(append_delay);
-            while offset < file_size {
+            let mut prev_seq_no = 0;
+            let mut interval = tokio::time::interval(delay);
+            let mut logs = Vec::with_capacity(batch_size);
+            while prev_seq_no < count {
                 // To run with a specific cadence.
                 interval.tick().await;
 
+                // Logs to write to page.
+                logs.clear();
+                for _ in 0..batch_size {
+                    logs.push(Log::new_borrowed(prev_seq_no + 1, prev_seq_no, &log_data));
+                    prev_seq_no += 1;
+                }
+
                 // Append the next set of bytes.
                 let mut session = storage.session().await;
-                offset += session.append().await? as u64;
+                session.append(&logs).await?;
             }
 
             Ok::<_, anyhow::Error>(())
@@ -90,17 +111,19 @@ async fn main() -> anyhow::Result<()> {
     // Define all the readers.
     for _ in 0..args.readers {
         let storage = storage.clone();
-        let query_delay = Duration::from_millis(args.query_interval);
         workers.push(tokio::spawn(async move {
-            let mut offset = 0;
-            let mut interval = tokio::time::interval(query_delay);
-            while offset < file_size {
+            let mut prev_seq_no = 0;
+            let mut interval = tokio::time::interval(delay);
+            while prev_seq_no < count {
                 // To run with a specific cadence.
                 interval.tick().await;
 
                 // Append the next set of bytes.
                 let mut session = storage.session().await;
-                offset += session.query(offset).await? as u64;
+                for log in session.query(prev_seq_no).await? {
+                    assert_eq!(prev_seq_no, log.prev_seq_no());
+                    prev_seq_no = log.seq_no();
+                }
             }
 
             Ok(())
@@ -114,21 +137,22 @@ async fn main() -> anyhow::Result<()> {
     }
 
     // For calculating rates.
-    let operations = file_size / buf_capacity as u64;
     let seconds = start.elapsed().as_secs_f64();
     let seconds = if seconds == 0.0 { 1.0 } else { seconds };
-    let mbps = 1024.0 * 1024.0 * seconds;
+
+    // Total number of bytes in logs.
+    let mbps = seconds * (1024.0 * 1024.0);
+    let bytes_size = (count * (args.log_data_size as u64 + 20)) as f64;
 
     // Print stats for writer.
-    let tps = operations as f64 / seconds;
-    let rate = file_size as f64 / mbps;
-    println!("Writer: {tps:.2} TPS, {rate:.2} MB/s");
+    let rate = count as f64 / seconds;
+    let byte_rate = bytes_size / mbps;
+    println!("Writer: {rate:.2} Logs/s and {byte_rate:.2} MBps");
 
     // Print stats for readers.
     if args.readers > 0 {
-        let tps = (operations as f64 * args.readers as f64) / seconds;
-        let rate = (file_size as f64 * args.readers as f64) / mbps;
-        println!("{} Readers: {tps:.2} TPS, {rate:.2} MB/s", args.readers);
+        let rate = (count as f64 * args.readers as f64) / seconds;
+        println!("{} Readers: {rate:.2} Logs/s", args.readers);
     }
     Ok(())
 }

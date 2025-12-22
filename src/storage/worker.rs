@@ -4,7 +4,6 @@ use crate::{
 };
 use std::{
     collections::VecDeque,
-    fs::File,
     io,
     sync::{
         Arc,
@@ -15,28 +14,9 @@ use std::{
 };
 
 #[derive(Debug)]
-pub struct Worker {
+pub(super) struct Worker {
     closing: Arc<AtomicBool>,
     handle: Option<JoinHandle<io::Result<()>>>,
-}
-
-impl Worker {
-    pub(super) fn spawn(state: WorkerState) -> Self {
-        // Flag to communicate intent to shutdown.
-        let closing = Arc::new(AtomicBool::new(false));
-
-        // Spawn the worker thread.
-        let handle = {
-            let closing = closing.clone();
-            std::thread::spawn(|| state.process(closing))
-        };
-
-        // Return guard for the worker.
-        Self {
-            closing,
-            handle: Some(handle),
-        }
-    }
 }
 
 impl Drop for Worker {
@@ -54,7 +34,6 @@ impl Drop for Worker {
 /// State tracked by a storage worker.
 pub(super) struct WorkerState {
     pub(super) pages: Vec<Page>,
-    pub(super) files: Vec<File>,
     pub(super) io_queue: VecDeque<PageIo>,
     pub(super) rx: flume::Receiver<Action>,
     pub(super) runtime: IoRuntime<(u32, ActionCtx)>,
@@ -62,6 +41,23 @@ pub(super) struct WorkerState {
 
 impl WorkerState {
     const ACTION_AWAIT_TIMEOUT: Duration = Duration::from_secs(1);
+
+    pub(super) fn spawn(self) -> Worker {
+        // Flag to communicate intent to shutdown.
+        let closing = Arc::new(AtomicBool::new(false));
+
+        // Spawn the worker thread.
+        let handle = {
+            let closing = closing.clone();
+            std::thread::spawn(|| self.process(closing))
+        };
+
+        // Return guard for the worker.
+        Worker {
+            closing,
+            handle: Some(handle),
+        }
+    }
 
     fn process(mut self, closing: Arc<AtomicBool>) -> io::Result<()> {
         loop {
@@ -71,11 +67,11 @@ impl WorkerState {
             // If not closing, await for an action.
             // If closing, we just want to flush all the pending work and shutdown.
             if !is_closing {
-                self.await_action();
+                self.await_queue_action();
             }
 
             // Drain the io_queue and process all actions.
-            self.try_actions();
+            self.try_queue_actions();
 
             // If there is nothing to do, it can only mean one thing,
             // graceful shutdown as begun and we have flushed all pending work.
@@ -128,29 +124,7 @@ impl WorkerState {
                 }
             }
         }
-
-        // Flush all file changes to disk when closing.
-        // We can use io-uring to do this asynchronously, meh (for now).
-        let mut error = None;
-        for file in self.files {
-            if let Err(e) = file.sync_all() {
-                // TODO: Tracing / logging of errors.
-                eprintln!("Error fsync of file: {file:?}, error: {e}");
-                error = Some(Err(e));
-            }
-        }
-
-        // Return the result from the worker.
-        error.unwrap_or(Ok(()))
-    }
-
-    fn queue_action(&mut self, action: Action) {
-        // Fetch the right page to perform the action on.
-        let Some(page) = self.pages.last() else {
-            unreachable!("Every ring buffer must have one open page");
-        };
-
-        page.action(action, &mut self.io_queue);
+        Ok(())
     }
 
     fn submit_actions(&mut self) {
@@ -167,7 +141,7 @@ impl WorkerState {
         }
     }
 
-    fn await_action(&mut self) {
+    fn await_queue_action(&mut self) {
         // If there are pending I/O action, we will never wait for more work.
         // We will always prioritize completing work that was already started.
         if self.runtime.pending_io() > 0 {
@@ -180,6 +154,7 @@ impl WorkerState {
         }
 
         // Return early when all senders have disconnected.
+        // TODO: If we were to drop all the senders during drop, that would speed this up.
         let Ok(action) = self.rx.recv_timeout(Self::ACTION_AWAIT_TIMEOUT) else {
             return;
         };
@@ -188,7 +163,7 @@ impl WorkerState {
         self.queue_action(action);
     }
 
-    fn try_actions(&mut self) {
+    fn try_queue_actions(&mut self) {
         let remaining = self.runtime.sq_remaining();
         let mut remaining = remaining.saturating_sub(self.io_queue.len());
         while remaining > 0 {
@@ -203,5 +178,14 @@ impl WorkerState {
             self.queue_action(action);
             remaining -= 1;
         }
+    }
+
+    fn queue_action(&mut self, action: Action) {
+        // Fetch the right page to perform the action on.
+        let Some(page) = self.pages.last() else {
+            unreachable!("Every ring buffer must have one open page");
+        };
+
+        page.action(action, &mut self.io_queue);
     }
 }

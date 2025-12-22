@@ -21,8 +21,8 @@ flume = "0.12"
 io-uring = "0.7"
 libc = "0.2"
 memmap2 = "0.9"
-oneshot = { version = "0.1", features = ["async"] }
 thiserror = "2.0"
+oneshot = { version = "0.1", features = ["async"] }
 
 # For benchmark binaries.
 anyhow = { version = "1.0", optional = true }
