@@ -9,9 +9,9 @@ pub struct Log<'a>
 where
     [u8]: ToOwned<Owned = Vec<u8>>,
 {
-    pub seq_no: u64,
-    pub prev_seq_no: u64,
-    pub data: Cow<'a, [u8]>,
+    seq_no: u64,
+    prev_seq_no: u64,
+    data: Cow<'a, [u8]>,
 }
 
 impl Log<'_> {
@@ -108,28 +108,16 @@ impl Log<'_> {
     }
 }
 
+/// An iterator to iterate through a buffer of log records.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct LogIter<'a> {
-    bytes: &'a [u8],
-    after: Option<u64>,
-}
-
-impl LogIter<'_> {
-    pub fn iter(bytes: &[u8]) -> LogIter<'_> {
-        LogIter { after: None, bytes }
-    }
-
-    pub fn iter_after(after: Option<u64>, bytes: &[u8]) -> LogIter<'_> {
-        LogIter { after, bytes }
-    }
-}
+pub struct LogIter<'a>(&'a [u8]);
 
 impl<'a> IntoIterator for &'a IoBuf {
     type Item = Log<'a>;
     type IntoIter = LogIter<'a>;
 
     fn into_iter(self) -> Self::IntoIter {
-        LogIter::iter(self)
+        LogIter(self)
     }
 }
 
@@ -137,21 +125,8 @@ impl<'a> Iterator for LogIter<'a> {
     type Item = Log<'a>;
 
     fn next(&mut self) -> Option<Self::Item> {
-        loop {
-            // Deserialize the next log record.
-            let log = Log::read(self.bytes)?;
-            self.bytes = self.bytes.split_at(log.size()).1;
-
-            // Skip the log record if it is lesser than starting seq_no.
-            // Listing will have an unbounded start if starting seq_no is not provided.
-            if let Some(after) = self.after
-                && log.seq_no() <= after
-            {
-                continue;
-            }
-
-            // Return the deserialized log record.
-            return Some(log);
-        }
+        let log = Log::read(self.0)?;
+        self.0 = self.0.split_at(log.size()).1;
+        Some(log)
     }
 }

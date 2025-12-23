@@ -288,10 +288,16 @@ impl RawBytes {
         })
     }
 
+    /// Get index in io runtime where this buffer is registered.
     pub(super) fn io_index(&self) -> Option<u16> {
         self.io_index
     }
 
+    /// Set index in io runtime where this buffer is registered.
+    ///
+    /// # Arguments
+    ///
+    /// * `index` - Index of the registered buffer in I/O runtime.
     pub(super) fn set_io_index(&mut self, index: u16) {
         self.io_index = Some(index);
     }

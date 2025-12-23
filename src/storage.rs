@@ -1,21 +1,17 @@
 mod action;
-mod fate;
 mod page;
 mod worker;
 
-use self::page::Page;
 use crate::{
-    log::{Log, LogIter},
+    log::Log,
     runtime::{BufPool, IoBuf, IoRuntime, RawBytes},
     storage::{
-        action::{Action, Append, Query},
-        fate::{AsyncFate, FateError},
-        page::PageIo,
+        action::{Action, Append, AsyncFate, FateError, IoQueue, Query},
+        page::Page,
         worker::{Worker, WorkerState},
     },
 };
 use std::{
-    collections::VecDeque,
     fs::{File, OpenOptions},
     io,
     path::Path,
@@ -23,6 +19,30 @@ use std::{
 };
 
 pub type BufResult<T, E> = (IoBuf, Result<T, E>);
+
+#[derive(Debug, thiserror::Error)]
+pub enum QueryError {
+    #[error(transparent)]
+    Storage(#[from] Error),
+
+    #[error("Attempted to read {0} bytes, but only {1} was read")]
+    IncompleteRead(usize, u32),
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum AppendError {
+    #[error(transparent)]
+    Storage(#[from] Error),
+
+    #[error("Log record: {0} has prev: {1}, but expected prev: {2}")]
+    Sequence(u64, u64, u64),
+
+    #[error("Log record: {0} has size: {1} that exceeds limit: {2}")]
+    ExceedsLimit(u64, usize, usize),
+
+    #[error("Attempted to write {0} bytes, but only {1} was written")]
+    IncompleteWrite(usize, u32),
+}
 
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
@@ -40,24 +60,6 @@ impl From<FateError> for Error {
     fn from(_value: FateError) -> Self {
         Error::ActionLost
     }
-}
-
-#[derive(Debug, thiserror::Error)]
-pub enum QueryError {
-    #[error(transparent)]
-    Storage(#[from] Error),
-}
-
-#[derive(Debug, thiserror::Error)]
-pub enum AppendError {
-    #[error(transparent)]
-    Storage(#[from] Error),
-
-    #[error("Log record: {0} has prev: {1}, but expected prev: {2}")]
-    Sequence(u64, u64, u64),
-
-    #[error("Log record: {0} has size: {1} that exceeds limit: {2}")]
-    ExceedsLimit(u64, usize, usize),
 }
 
 #[derive(Debug, Clone)]
@@ -94,7 +96,7 @@ impl Storage {
         let mut pages: Vec<_> = io_files
             .into_iter()
             .enumerate()
-            .map(|(index, file)| Page::new(index as _, file, opts.index_opts))
+            .map(|(index, file)| Page::new_empty(index as _, file, opts.page_options))
             .collect();
 
         // Initialize the first page with starting seq_no.
@@ -104,13 +106,14 @@ impl Storage {
         }
 
         // Create starting state for the background storage worker.
-        let io_queue = VecDeque::with_capacity(pool_size);
+        let io_queue = IoQueue::with_capacity(pool_size);
         let (tx, rx) = flume::bounded(pool_size);
         let worker = WorkerState {
             rx,
             pages,
             runtime,
             io_queue,
+            next: 0,
         };
 
         // Return newly opened storage.
@@ -170,16 +173,10 @@ impl Session<'_> {
             // Append buffer bytes to storage.
             // Submit action to append bytes into storage.
             let (tx, rx) = AsyncFate::channel();
-            if let Err(error) = self.action_tx.send_async(Action::Append(Append { buf, tx })).await {
-                // Reclaim shared memory.
-                let Action::Append(append) = error.0 else {
-                    unreachable!("Should not get different variant of the same enum");
-                };
-
-                // Replace the borrowed buffer and return.
-                self.buf.replace(append.buf);
-                return Err(Error::UnexpectedClose.into());
-            }
+            self.action_tx
+                .send_async(Action::Append(Append { buf, tx }))
+                .await
+                .map_err(|_| Error::UnexpectedClose)?;
 
             // Await and return result from storage.
             let (buf, result) = rx.recv_async().await.map_err(Error::from)?;
@@ -194,27 +191,17 @@ impl Session<'_> {
         Ok(())
     }
 
-    pub async fn query(&mut self, after_seq_no: u64) -> Result<LogIter<'_>, QueryError> {
+    pub async fn query(&mut self, after_seq_no: u64) -> Result<impl Iterator<Item = Log<'_>>, QueryError> {
         // Fetch buffer to bytes to submit to storage.
         let mut buf = self.buf.take().ok_or(Error::UnexpectedClose)?;
         buf.clear(); // Clear any state from previous action.
 
         // Submit action to append bytes into storage.
         let (tx, rx) = AsyncFate::channel();
-        if let Err(error) = self
-            .action_tx
+        self.action_tx
             .send_async(Action::Query(Query { buf, tx, after_seq_no }))
             .await
-        {
-            // Reclaim shared memory.
-            let Action::Query(query) = error.0 else {
-                unreachable!("Should not different variant of the same enum");
-            };
-
-            // Replace the borrowed buffer and return.
-            self.buf.replace(query.buf);
-            return Err(Error::UnexpectedClose.into());
-        }
+            .map_err(|_| Error::UnexpectedClose)?;
 
         // Await and return result from storage.
         let (buf, result) = rx.recv_async().await.map_err(Error::from)?;
@@ -222,8 +209,10 @@ impl Session<'_> {
         result?; // First return error, if any, from storage.
 
         // Return reference to all the log records read from query.
+        // A filter is necessary here because storage can read slightly more logs are
+        // the beginning. It's more efficient to filter it out here
         let buf = self.buf.as_ref().expect("Associated buffer must exist");
-        Ok(LogIter::iter_after(Some(after_seq_no), buf))
+        Ok(buf.into_iter().filter(move |log| log.seq_no() > after_seq_no))
     }
 }
 
@@ -245,12 +234,15 @@ pub struct Options {
     pub ring_size: u32,
 
     /// Options for the sparse index.
-    pub index_opts: IndexOptions,
+    pub page_options: PageOptions,
 }
 
+/// Options to customize the behavior of a page.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct IndexOptions {
-    pub capacity: usize,
-    pub sparse_count: usize,
-    pub sparse_bytes: usize,
+pub struct PageOptions {
+    pub page_capacity: u64,
+    pub file_capacity: u64,
+    pub index_capacity: usize,
+    pub index_sparse_count: usize,
+    pub index_sparse_bytes: usize,
 }

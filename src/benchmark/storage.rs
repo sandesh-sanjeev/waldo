@@ -5,7 +5,7 @@ use std::time::{Duration, Instant};
 use tokio::fs::create_dir_all;
 use waldo::{
     log::Log,
-    storage::{IndexOptions, Options, Storage},
+    storage::{Options, PageOptions, Storage},
 };
 
 /// Arguments for the I/O runtime benchmark.
@@ -16,33 +16,61 @@ struct Arguments {
     #[arg(long, default_value = "bench")]
     path: String,
 
+    /// Maximum number of pages in storage.
+    #[arg(long, default_value = "1")]
+    ring_size: u16,
+
     /// Maximum concurrency supported by storage.
     #[arg(long, default_value = "256")]
     queue_depth: u16,
+
+    /// Size of buffers used for reads and writes in MB.
+    #[arg(long, default_value = "2")]
+    buf_capacity_mb: usize,
 
     /// Number of pre-allocated I/O buffers.
     #[arg(long, default_value = "256")]
     pool_size: u16,
 
-    /// Numbers of readers in benchmark.
-    #[arg(long, default_value = "512")]
-    readers: u32,
+    /// Maximum number of logs in a page.
+    #[arg(long, default_value = "10000000")]
+    page_capacity: u64,
 
-    /// Size of buffers used for reads and writes in MB.
-    #[arg(long, default_value = "2")]
-    buf_capacity: usize,
+    /// Maximum size of file backing a page in GB.
+    #[arg(long, default_value = "4")]
+    page_file_capacity_gb: u64,
+
+    /// Maximum size of index backing a page.
+    #[arg(long, default_value = "100000")]
+    page_index_capacity: usize,
+
+    /// Maximum gap between indexed log records.
+    #[arg(long, default_value = "100")]
+    index_sparse_count: usize,
+
+    /// Maximum gap in bytes between indexed log records.
+    #[arg(long, default_value = "65535")]
+    index_sparse_bytes: usize,
 
     /// Maximum number of logs to append in benchmark.
     #[arg(long, default_value = "5000000")]
     count: u64,
 
-    /// Milliseconds between append/query operations.
-    #[arg(long, default_value = "100")]
-    delay: u64,
-
     /// Size of payload of a log record.
     #[arg(long, default_value = "250")]
     log_size: usize,
+
+    /// Numbers of readers in benchmark.
+    #[arg(long, default_value = "255")]
+    readers: u32,
+
+    /// Milliseconds between append operations.
+    #[arg(long, default_value = "100")]
+    append_delay: u64,
+
+    /// Milliseconds between query operations.
+    #[arg(long, default_value = "100")]
+    query_delay: u64,
 }
 
 impl From<&Arguments> for Options {
@@ -52,11 +80,13 @@ impl From<&Arguments> for Options {
             huge_buf: true,
             pool_size: value.pool_size,
             queue_depth: value.queue_depth,
-            buf_capacity: value.buf_capacity * 1024 * 1024, // From MB
-            index_opts: IndexOptions {
-                sparse_count: 100,
-                sparse_bytes: u16::MAX as usize,
-                capacity: (value.count as usize / 100) + 1,
+            buf_capacity: value.buf_capacity_mb * 1024 * 1024,
+            page_options: PageOptions {
+                page_capacity: value.page_capacity,
+                index_capacity: value.page_index_capacity,
+                index_sparse_count: value.index_sparse_count,
+                index_sparse_bytes: value.index_sparse_bytes,
+                file_capacity: value.page_file_capacity_gb * 1024 * 1024 * 1024,
             },
         }
     }
@@ -66,7 +96,6 @@ impl From<&Arguments> for Options {
 async fn main() -> anyhow::Result<()> {
     // Parse command line arguments.
     let args = Arguments::parse();
-    let delay = Duration::from_millis(args.delay);
 
     // Random log data to use with log records.
     let count = args.count;
@@ -75,9 +104,8 @@ async fn main() -> anyhow::Result<()> {
     let log_size = 20 + args.log_size;
     let log_data = vec![5; args.log_size];
 
-    // Size of log to append in one batch.
-    // In theory we can make this arbitrary, this is just easier and efficient.
-    let batch_size = (args.buf_capacity * 1024 * 1024) / log_size;
+    // Maximum number of log records that can be stored in allocated buffers.
+    let batch_size = (args.buf_capacity_mb * 1024 * 1024) / log_size;
 
     // Create directory to store benchmark files.
     create_dir_all(&args.path).await?;
@@ -91,10 +119,12 @@ async fn main() -> anyhow::Result<()> {
     // Define writer.
     {
         let storage = storage.clone();
+        let delay = Duration::from_millis(args.append_delay);
         workers.push(tokio::spawn(async move {
             let mut prev_seq_no = 0;
             let mut interval = tokio::time::interval(delay);
             let mut logs = Vec::with_capacity(batch_size);
+            let mut session = storage.session().await;
             while prev_seq_no < count {
                 // To run with a specific cadence.
                 interval.tick().await;
@@ -107,7 +137,6 @@ async fn main() -> anyhow::Result<()> {
                 }
 
                 // Append the next set of bytes.
-                let mut session = storage.session().await;
                 session.append(&logs).await?;
             }
 
@@ -118,15 +147,16 @@ async fn main() -> anyhow::Result<()> {
     // Define all the readers.
     for _ in 0..args.readers {
         let storage = storage.clone();
+        let delay = Duration::from_millis(args.query_delay);
         workers.push(tokio::spawn(async move {
             let mut prev_seq_no = 0;
             let mut interval = tokio::time::interval(delay);
+            let mut session = storage.session().await;
             while prev_seq_no < count {
                 // To run with a specific cadence.
                 interval.tick().await;
 
                 // Append the next set of bytes.
-                let mut session = storage.session().await;
                 for log in session.query(prev_seq_no).await? {
                     assert_eq!(prev_seq_no, log.prev_seq_no());
                     prev_seq_no = log.seq_no();

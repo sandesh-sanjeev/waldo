@@ -49,6 +49,7 @@ impl<A> IoRuntime<A> {
     /// Create a new async I/O runtime.
     pub fn new(queue_depth: u32) -> io::Result<Self> {
         let io_ring = IoUring::builder()
+            // FIXME: Runtime must be created in the worker.
             //.setup_single_issuer()
             //.setup_coop_taskrun()
             .build(queue_depth)?;

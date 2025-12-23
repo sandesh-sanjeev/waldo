@@ -1,9 +1,13 @@
+//! Worker executing all storage actions.
+
 use crate::{
     runtime::IoRuntime,
-    storage::{Action, Page, PageIo, action::ActionCtx},
+    storage::{
+        Action, Page,
+        action::{ActionCtx, IoQueue, PageIo},
+    },
 };
 use std::{
-    collections::VecDeque,
     io,
     sync::{
         Arc,
@@ -13,6 +17,7 @@ use std::{
     time::Duration,
 };
 
+/// A single threaded worker coordinating all storage actions.
 #[derive(Debug)]
 pub(super) struct Worker {
     closing: Arc<AtomicBool>,
@@ -33,15 +38,20 @@ impl Drop for Worker {
 
 /// State tracked by a storage worker.
 pub(super) struct WorkerState {
+    pub(super) next: usize,
     pub(super) pages: Vec<Page>,
-    pub(super) io_queue: VecDeque<PageIo>,
+    pub(super) io_queue: IoQueue,
     pub(super) rx: flume::Receiver<Action>,
     pub(super) runtime: IoRuntime<(u32, ActionCtx)>,
 }
 
 impl WorkerState {
+    /// Amount of time waiting for an action to be available in shared channel.
+    /// This is required because we do not want to assume that all the senders
+    /// will be dropped during graceful shutdown.
     const ACTION_AWAIT_TIMEOUT: Duration = Duration::from_secs(1);
 
+    /// Spawn a single threaded worker with this state.
     pub(super) fn spawn(self) -> Worker {
         // Flag to communicate intent to shutdown.
         let closing = Arc::new(AtomicBool::new(false));
@@ -70,10 +80,13 @@ impl WorkerState {
                 self.await_queue_action();
             }
 
-            // Drain the io_queue and process all actions.
+            // Drain the channel and queue up as many actions as possible.
             self.try_queue_actions();
 
-            // If there is nothing to do, it can only mean one thing,
+            // Process any of the pending I/O actions.
+            self.process_actions();
+
+            // If there is nothing to do, it can only mean one of two things,
             // graceful shutdown as begun and we have flushed all pending work.
             // Or all the senders of actions have dropped, either case, shutdown.
             if self.runtime.pending_io() == 0 && self.io_queue.is_empty() {
@@ -116,7 +129,7 @@ impl WorkerState {
                         let index = error.attachment.0;
                         let page = self
                             .pages
-                            .get(index as usize)
+                            .get_mut(index as usize)
                             .expect("Got I/O response for a page that does not exist");
 
                         page.abort(error.error, error.action, error.attachment.1);
@@ -127,15 +140,29 @@ impl WorkerState {
         Ok(())
     }
 
+    fn process_actions(&mut self) {
+        // Process any pending action, if possible.
+        while let Some(action) = self.io_queue.dequeue_pending() {
+            // Fetch the right page to perform the action on.
+            // TODO: Support more than one page.
+            let Some(page) = self.pages.get_mut(self.next) else {
+                unreachable!("Every ring buffer must have one open page");
+            };
+
+            // Execute action on the page.
+            page.action(action, &mut self.io_queue);
+        }
+    }
+
     fn submit_actions(&mut self) {
         // Submit the I/O request into the runtime.
         // Attempt to fully saturate the io-uring.
-        while let Some(action) = self.io_queue.pop_front() {
+        while let Some(action) = self.io_queue.dequeue_issued() {
             let attachment = (action.id, action.ctx);
             if let Err(((id, ctx), action)) = self.runtime.push(action.action, attachment) {
                 // I/O runtime doesn't have enough space for more entries.
                 // Add the action back to the front of the queue.
-                self.io_queue.push_front(PageIo { id, ctx, action });
+                self.io_queue.reissue(PageIo { id, ctx, action });
                 break;
             }
         }
@@ -160,7 +187,7 @@ impl WorkerState {
         };
 
         // Queue up the awaited action.
-        self.queue_action(action);
+        self.io_queue.pending(action);
     }
 
     fn try_queue_actions(&mut self) {
@@ -175,17 +202,8 @@ impl WorkerState {
             };
 
             // Queue up the newly discovered action.
-            self.queue_action(action);
             remaining -= 1;
+            self.io_queue.pending(action);
         }
-    }
-
-    fn queue_action(&mut self, action: Action) {
-        // Fetch the right page to perform the action on.
-        let Some(page) = self.pages.last() else {
-            unreachable!("Every ring buffer must have one open page");
-        };
-
-        page.action(action, &mut self.io_queue);
     }
 }

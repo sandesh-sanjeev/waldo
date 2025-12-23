@@ -2,12 +2,13 @@ use crate::{
     log::Log,
     runtime::{IoAction, IoFixedFd},
     storage::{
-        AppendError, Error, IndexOptions,
-        action::{Action, ActionCtx, Append, Query},
+        AppendError, Error, PageOptions, QueryError,
+        action::{Action, ActionCtx, Append, IoQueue, PageIo, Query},
     },
 };
-use std::{collections::VecDeque, io};
+use std::io;
 
+/// A chunk of contiguous sequence of logs within storage.
 #[derive(Debug)]
 pub(super) struct Page {
     // Index of the page in the ring buffer.
@@ -22,47 +23,172 @@ pub(super) struct Page {
     // A sparse index to log records stored in page.
     index: Vec<IndexEntry>,
 
-    // Configuration for sparse index.
-    index_opts: IndexOptions,
+    // Configuration for the page.
+    opts: PageOptions,
 }
 
 impl Page {
-    const LOG_SIZE_LIMIT: usize = 1024 * 1024; // 1 MB.
-
-    pub(super) fn new(id: u32, file: IoFixedFd, index_opts: IndexOptions) -> Self {
+    /// Create a new empty page.
+    ///
+    /// # Arguments
+    ///
+    /// * `id` - Unique identity of the page.
+    /// * `file` - Handle to the file backing this page.
+    /// * `opts` - Options for the page.
+    pub(super) fn new_empty(id: u32, file: IoFixedFd, opts: PageOptions) -> Self {
         Self {
             id,
             file,
-            index_opts,
+            opts,
             state: None,
-            index: Vec::with_capacity(index_opts.capacity),
+            index: Vec::with_capacity(opts.index_capacity),
         }
     }
 
-    pub(super) fn initialize(&mut self, after_seq_no: u64) {
-        let state = PageState::new(after_seq_no, self.index_opts);
-        self.state.replace(state); // TODO: Make sure not already initialized.
+    /// Returns true if the page is already initialized, false otherwise.
+    #[allow(dead_code)]
+    pub(super) fn is_initialized(&self) -> bool {
+        self.state.is_some()
+    }
+
+    /// (Re)Initialize a page.
+    ///
+    /// # Arguments
+    ///
+    /// * `after_seq_no` - Sequence number of the immediately previous log.
+    pub(super) fn initialize(&mut self, after_seq_no: u64) -> bool {
+        // Make sure page is not already initialized.
+        if self.state.is_some() {
+            return false;
+        }
+
+        // Initialize the page with the new starting state.
+        self.state.replace(PageState::new(after_seq_no));
+        true
     }
 
     /// Process an action.
-    pub(super) fn action(&self, action: Action, queue: &mut VecDeque<PageIo>) {
+    ///
+    /// # Arguments
+    ///
+    /// * `action` - Action to process against the page.
+    /// * `queue` - I/O queue to issue/retry actions.
+    pub(super) fn action(&mut self, action: Action, queue: &mut IoQueue) -> ActionIo {
         match action {
             Action::Query(query) => self.query(query, queue),
             Action::Append(append) => self.append(append, queue),
-        };
+        }
     }
 
-    /// Load current state of the page.
-    pub(super) fn load_state(&self) -> PageState {
-        *self
-            .state
-            .as_ref()
-            .expect("State should not be loaded in uninitialized page")
+    /// Process successfully completed async actions.
+    ///
+    /// # Arguments
+    ///
+    /// * `result` - Result of the I/O operation.
+    /// * `action` - I/O action completed.
+    /// * `ctx` - Context associated with the action.
+    pub(super) fn commit(&mut self, result: u32, action: IoAction, ctx: ActionCtx) {
+        let mut state = self.load_state();
+
+        match ctx {
+            ActionCtx::Reset => {
+                // Underlying file is already truncated.
+                // We just need to reset all internal state.
+                self.index.clear();
+                self.state = None;
+            }
+
+            ActionCtx::Query { tx, .. } => {
+                // Get ownership of the shared buffer.
+                let buf = action.take_buf().expect("Page action should have shared buffer");
+                if result != buf.len() as u32 {
+                    let error = QueryError::IncompleteRead(buf.len(), result);
+                    tx.send(buf, Err(error));
+                    return;
+                }
+
+                // Stop tracking the completed query.
+                state.pending.complete_query();
+                self.state = Some(state);
+
+                // Return result of the action.
+                tx.send(buf, Ok(()));
+            }
+
+            ActionCtx::Append { tx } => {
+                // Get ownership of the shared buffer.
+                let buf = action.take_buf().expect("Page action should have shared buffer");
+                if result != buf.len() as u32 {
+                    let error = AppendError::IncompleteWrite(buf.len(), result);
+                    tx.send(buf, Err(error));
+                    return;
+                }
+
+                // Update in-memory state with things we wrote into file.
+                for log in &buf {
+                    if let Some(entry) = state.apply(&log, self.opts) {
+                        self.index.push(entry);
+                        state.index.reset();
+                    }
+                }
+
+                // Stop tracking the completed action.
+                state.pending.complete_append();
+                self.state = Some(state);
+
+                // Return result of the action.
+                tx.send(buf, Ok(()));
+            }
+        }
     }
 
-    /// Initialize a query action against the page.
-    pub(super) fn query(&self, query: Query, queue: &mut VecDeque<PageIo>) {
-        let state = self.load_state();
+    /// Process async actions that ended with an error.
+    ///
+    /// # Arguments
+    ///
+    /// * `error` - I/O error performing the operation.
+    /// * `action` - I/O action that errored out.
+    /// * `ctx` - Context associated with the action.
+    pub(super) fn abort(&mut self, error: io::Error, action: IoAction, ctx: ActionCtx) {
+        let mut state = self.load_state();
+
+        match ctx {
+            ActionCtx::Reset => {
+                state.pending.complete_reset();
+                self.state = Some(state);
+
+                // TODO: Tracing/log/etc.
+                eprintln!("Page reset aborted with error: {error:?}");
+            }
+
+            ActionCtx::Query { tx, .. } => {
+                // Get ownership of the shared buffer.
+                let buf = action.take_buf().expect("Page action should have shared buffer");
+
+                // Stop tracking the aborted query.
+                state.pending.complete_query();
+                self.state = Some(state);
+
+                // Return error from the action.
+                tx.send(buf, Err(Error::from(error).into()));
+            }
+
+            ActionCtx::Append { tx, .. } => {
+                // Get ownership of the shared buffer.
+                let buf = action.take_buf().expect("Page action should have shared buffer");
+
+                // Stop tracking the aborted append.
+                state.pending.complete_append();
+                self.state = Some(state);
+
+                // Return error from the action.
+                tx.send(buf, Err(Error::from(error).into()));
+            }
+        }
+    }
+
+    fn query(&mut self, query: Query, queue: &mut IoQueue) -> ActionIo {
+        let mut state = self.load_state();
         let Query {
             after_seq_no: after,
             mut buf,
@@ -73,11 +199,11 @@ impl Page {
         if after >= state.prev_seq_no || after < state.after_seq_no {
             buf.clear(); // Make sure to reflect no read.
             tx.send(buf, Ok(()));
-            return;
+            return ActionIo::Completed;
         }
 
         // Find index to the closet log record that has seq_no <= after.
-        let offset = match self.index.binary_search_by_key(&after, IndexEntry::seq_no) {
+        let offset = match self.index.binary_search_by_key(&after, IndexEntry::after_seq_no) {
             // Query from beginning of the page.
             Err(0) => 0,
 
@@ -98,37 +224,41 @@ impl Page {
         if remaining == 0 || buf.capacity() == 0 {
             buf.clear(); // Make sure to reflect no read.
             tx.send(buf, Ok(()));
-            return;
+            return ActionIo::Completed;
         }
 
         // Make enough space in buffer for new bytes.
         let len = std::cmp::min(remaining, buf.capacity());
         buf.set_len(len);
 
+        // Track the in-progress query.
+        state.pending.pending_query();
+        self.state = Some(state);
+
         // Enqueue I/O action for execution asynchronously.
-        queue.push_back(PageIo {
+        queue.issue(PageIo {
             id: self.id,
             ctx: ActionCtx::query(tx),
             action: IoAction::read_at(self.file, offset, buf),
         });
+        ActionIo::Issued
     }
 
-    /// Initialize an append action against the page.
-    pub(super) fn append(&self, append: Append, queue: &mut VecDeque<PageIo>) {
-        let state = self.load_state();
+    fn append(&mut self, append: Append, queue: &mut IoQueue) -> ActionIo {
+        let mut state = self.load_state();
         let Append { buf, tx } = append;
-
-        // TODO: Handle the case where a page is full.
 
         // Return early if there is nothing to append.
         if buf.is_empty() {
             tx.send(buf, Ok(()));
-            return;
+            return ActionIo::Completed;
         }
 
         // Perform validations on log records being appended.
         let mut error = None;
         let mut prev_seq_no = state.prev_seq_no;
+        let mut index_count = self.index.len();
+        let mut scratch = state;
         for log in &buf {
             // Make sure sequence of appended logs is not broken.
             if log.prev_seq_no() != prev_seq_no {
@@ -136,171 +266,147 @@ impl Page {
                 break;
             }
 
-            // Make sure log record does not exceed limits.
-            if log.size() > Self::LOG_SIZE_LIMIT {
-                error = Some(AppendError::ExceedsLimit(
-                    log.seq_no(),
-                    log.size(),
-                    Self::LOG_SIZE_LIMIT,
-                ));
-                break;
-            }
-
             // Update for next iteration.
             prev_seq_no = log.seq_no();
+
+            // For capacity calculations.
+            if scratch.apply(&log, self.opts).is_some() {
+                index_count += 1;
+                scratch.index.reset();
+            }
         }
 
         // Return early if sequence validation failed.
         if let Some(error) = error {
             tx.send(buf, Err(error));
-            return;
+            return ActionIo::Completed;
         }
 
         // Return early if there is no complete log in the buffer.
         if prev_seq_no == state.prev_seq_no {
             tx.send(buf, Ok(()));
-            return;
+            return ActionIo::Completed;
         }
 
+        // Re-queue the action and indicate that page does not have enough capacity.
+        if scratch.offset > self.opts.file_capacity || index_count > self.opts.index_capacity {
+            queue.pending(Action::Append(Append { buf, tx }));
+            return ActionIo::Overflow;
+        }
+
+        // Track the in-progress query.
+        state.pending.pending_append();
+        self.state = Some(state);
+
         // Enqueue I/O action for execution asynchronously.
-        queue.push_back(PageIo {
+        queue.issue(PageIo {
             id: self.id,
             ctx: ActionCtx::append(tx),
             action: IoAction::write_at(self.file, state.offset, buf),
         });
+        ActionIo::Issued
     }
 
-    pub(super) fn commit(&mut self, result: u32, action: IoAction, ctx: ActionCtx) {
-        match ctx {
-            ActionCtx::Query { tx, .. } => {
-                // Get ownership of the shared buffer.
-                let buf = action.take_buf().expect("Page action should have shared buffer");
+    #[allow(dead_code)]
+    pub(super) fn reset(&mut self, queue: &mut IoQueue) -> ActionIo {
+        let mut state = self.load_state();
 
-                // Make sure all the bytes were read.
-                if result != buf.len() as u32 {
-                    let error = io::Error::new(io::ErrorKind::UnexpectedEof, "Incomplete read");
-                    tx.send(buf, Err(Error::from(error).into()));
-                    return;
-                }
+        // FIXME: Make sure there is no pending I/O.
 
-                // Return the buffer back.
-                tx.send(buf, Ok(()));
-            }
+        // Track the in-progress reset.
+        state.pending.pending_reset();
+        self.state = Some(state);
 
-            ActionCtx::Append { tx } => {
-                // Get ownership of the shared buffer.
-                let buf = action.take_buf().expect("Page action should have shared buffer");
-
-                // Make sure all bytes written.
-                if result != buf.len() as u32 {
-                    let error = io::Error::new(io::ErrorKind::UnexpectedEof, "Incomplete write");
-                    tx.send(buf, Err(Error::from(error).into()));
-                    return;
-                }
-
-                // Update in-memory state with things we wrote into file.
-                let mut state = self.load_state();
-                for log in &buf {
-                    // Update local state with contents of the log record.
-                    state.apply(&log);
-
-                    // Check if this log record must be indexed.
-                    if state.index.index_prev(self.index_opts) {
-                        self.index.push(IndexEntry::new(state.offset, log.seq_no()));
-                        state.index.reset();
-                    }
-                }
-
-                // Update state and return success.
-                self.state = Some(state);
-                tx.send(buf, Ok(()));
-            }
-        }
+        // Enqueue I/O action for execution asynchronously.
+        queue.issue(PageIo {
+            id: self.id,
+            ctx: ActionCtx::Reset,
+            action: IoAction::fsync(self.file),
+        });
+        ActionIo::Issued
     }
 
-    pub(super) fn abort(&self, error: io::Error, action: IoAction, ctx: ActionCtx) {
-        match ctx {
-            ActionCtx::Query { tx, .. } => {
-                // Get ownership of the shared buffer.
-                let buf = action.take_buf().expect("Page action should have shared buffer");
-
-                // Return error from the action.
-                tx.send(buf, Err(Error::from(error).into()));
-            }
-
-            ActionCtx::Append { tx, .. } => {
-                // Get ownership of the shared buffer.
-                let buf = action.take_buf().expect("Page action should have shared buffer");
-
-                // Return error from the action.
-                tx.send(buf, Err(Error::from(error).into()));
-            }
-        }
+    fn load_state(&self) -> PageState {
+        *self
+            .state
+            .as_ref()
+            .expect("State should not be loaded in uninitialized page")
     }
 }
 
-#[derive(Debug)]
-pub(super) struct PageIo {
-    pub(super) id: u32,
-    pub(super) ctx: ActionCtx,
-    pub(super) action: IoAction,
-}
-
+/// Result from processing an action.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) struct PageState {
-    pub(super) count: u64,
-    pub(super) offset: u64,
-    pub(super) prev_seq_no: u64,
-    pub(super) after_seq_no: u64,
-    pub(super) index: IndexState,
+pub(super) enum ActionIo {
+    Issued,
+    Overflow,
+    Completed,
+}
+
+/// State of a storage page.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct PageState {
+    count: u64,
+    offset: u64,
+    prev_seq_no: u64,
+    after_seq_no: u64,
+    index: IndexState,
+    pending: PendingIo,
 }
 
 impl PageState {
-    fn new(after_seq_no: u64, opts: IndexOptions) -> Self {
+    fn new(after_seq_no: u64) -> Self {
         Self {
             count: 0,
             offset: 0,
             after_seq_no,
             prev_seq_no: after_seq_no,
-            index: IndexState::new(opts),
+            index: IndexState::new(),
+            pending: PendingIo::default(),
         }
     }
 
-    fn apply(&mut self, log: &Log<'_>) {
+    fn apply(&mut self, log: &Log<'_>, opts: PageOptions) -> Option<IndexEntry> {
         // Another sanity check to be super extra sure.
         assert_eq!(log.prev_seq_no(), self.prev_seq_no);
-
-        // Update state of the index.
-        self.index.apply(log);
 
         // Update state of the page.
         self.count += 1;
         self.prev_seq_no = log.seq_no();
         self.offset += log.size() as u64;
+
+        // Next check if an index must be created.
+        // This is because we index offset of log after indexed seq_no.
+        let index = IndexEntry::new(self.offset, self.prev_seq_no);
+        if self.index.apply(log, opts) { Some(index) } else { None }
     }
 }
 
+/// State of a page index.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) struct IndexState {
-    pub(super) count_since: usize,
-    pub(super) bytes_since: usize,
+struct IndexState {
+    count_since: usize,
+    bytes_since: usize,
 }
 
 impl IndexState {
-    fn new(opts: IndexOptions) -> Self {
+    fn new() -> Self {
         Self {
-            count_since: opts.sparse_count,
-            bytes_since: opts.sparse_bytes,
+            count_since: 0,
+            bytes_since: 0,
         }
     }
 
-    fn apply(&mut self, log: &Log<'_>) {
+    fn apply(&mut self, log: &Log<'_>, opts: PageOptions) -> bool {
         self.count_since += 1;
         self.bytes_since += log.size();
+        self.index_prev(opts)
     }
 
-    fn index_prev(&self, opts: IndexOptions) -> bool {
-        self.count_since > opts.sparse_count || self.bytes_since > opts.sparse_bytes
+    fn index_prev(&self, opts: PageOptions) -> bool {
+        // Check if enough logs have accumulated.
+        self.count_since > opts.index_sparse_count
+        // Or if enough bytes have accumulated.
+        || self.bytes_since > opts.index_sparse_bytes
     }
 
     fn reset(&mut self) {
@@ -309,22 +415,57 @@ impl IndexState {
     }
 }
 
+/// Offset of an indexed sequence number.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct IndexEntry {
     offset: u64,
-    seq_no: u64,
+    after_seq_no: u64,
 }
 
 impl IndexEntry {
-    fn new(offset: u64, seq_no: u64) -> Self {
-        Self { offset, seq_no }
+    fn new(offset: u64, after_seq_no: u64) -> Self {
+        Self { offset, after_seq_no }
     }
 
     fn offset(&self) -> u64 {
         self.offset
     }
 
-    fn seq_no(&self) -> u64 {
-        self.seq_no
+    fn after_seq_no(&self) -> u64 {
+        self.after_seq_no
+    }
+}
+
+/// Status around pending I/O actions.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+struct PendingIo {
+    reset: bool,
+    query: u32,
+    append: bool,
+}
+
+impl PendingIo {
+    fn pending_reset(&mut self) {
+        self.reset = true;
+    }
+
+    fn pending_append(&mut self) {
+        self.append = true;
+    }
+
+    fn pending_query(&mut self) {
+        self.query += 1;
+    }
+
+    fn complete_reset(&mut self) {
+        self.reset = false;
+    }
+
+    fn complete_append(&mut self) {
+        self.append = false;
+    }
+
+    fn complete_query(&mut self) {
+        self.query -= 1;
     }
 }

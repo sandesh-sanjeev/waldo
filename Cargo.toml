@@ -17,9 +17,9 @@ path = "src/benchmark/storage.rs"
 required-features = ["benchmark"]
 
 [dependencies]
+libc = "0.2"
 flume = "0.12"
 io-uring = "0.7"
-libc = "0.2"
 memmap2 = "0.9"
 thiserror = "2.0"
 oneshot = { version = "0.1", features = ["async"] }
