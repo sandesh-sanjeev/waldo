@@ -31,3 +31,4 @@ tokio = { version = "1.48", optional = true, features = ["full"] }
 
 [profile.bench]
 debug = true
+inherits = "release"

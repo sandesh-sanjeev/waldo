@@ -16,14 +16,16 @@ struct Arguments {
     #[arg(long, default_value = "bench")]
     path: String,
 
-    #[arg(long, default_value = "128")]
+    /// Maximum concurrency supported by storage.
+    #[arg(long, default_value = "256")]
     queue_depth: u16,
 
-    #[arg(long, default_value = "128")]
+    /// Number of pre-allocated I/O buffers.
+    #[arg(long, default_value = "256")]
     pool_size: u16,
 
     /// Numbers of readers in benchmark.
-    #[arg(long, default_value = "64")]
+    #[arg(long, default_value = "512")]
     readers: u32,
 
     /// Size of buffers used for reads and writes in MB.
@@ -31,17 +33,16 @@ struct Arguments {
     buf_capacity: usize,
 
     /// Maximum number of logs to append in benchmark.
-    #[arg(long, default_value = "1000000")]
+    #[arg(long, default_value = "5000000")]
     count: u64,
 
-    #[arg(long, default_value = "10000")]
-    batch_size: usize,
-
-    #[arg(long, default_value = "20")]
+    /// Milliseconds between append/query operations.
+    #[arg(long, default_value = "100")]
     delay: u64,
 
+    /// Size of payload of a log record.
     #[arg(long, default_value = "250")]
-    log_data_size: usize,
+    log_size: usize,
 }
 
 impl From<&Arguments> for Options {
@@ -69,8 +70,14 @@ async fn main() -> anyhow::Result<()> {
 
     // Random log data to use with log records.
     let count = args.count;
-    let batch_size = args.batch_size;
-    let log_data = vec![5; args.log_data_size];
+
+    // Size of a log record.
+    let log_size = 20 + args.log_size;
+    let log_data = vec![5; args.log_size];
+
+    // Size of log to append in one batch.
+    // In theory we can make this arbitrary, this is just easier and efficient.
+    let batch_size = (args.buf_capacity * 1024 * 1024) / log_size;
 
     // Create directory to store benchmark files.
     create_dir_all(&args.path).await?;
@@ -139,10 +146,10 @@ async fn main() -> anyhow::Result<()> {
     // For calculating rates.
     let seconds = start.elapsed().as_secs_f64();
     let seconds = if seconds == 0.0 { 1.0 } else { seconds };
+    let mbps = seconds * (1024.0 * 1024.0);
 
     // Total number of bytes in logs.
-    let mbps = seconds * (1024.0 * 1024.0);
-    let bytes_size = (count * (args.log_data_size as u64 + 20)) as f64;
+    let bytes_size = (count * (args.log_size as u64 + 20)) as f64;
 
     // Print stats for writer.
     let rate = count as f64 / seconds;
@@ -152,7 +159,8 @@ async fn main() -> anyhow::Result<()> {
     // Print stats for readers.
     if args.readers > 0 {
         let rate = (count as f64 * args.readers as f64) / seconds;
-        println!("{} Readers: {rate:.2} Logs/s", args.readers);
+        let byte_rate = (bytes_size * args.readers as f64) / mbps;
+        println!("{} Readers: {rate:.2} Logs/s and {byte_rate:.2} MB/s", args.readers);
     }
     Ok(())
 }
