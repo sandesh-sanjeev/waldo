@@ -12,6 +12,9 @@ use std::collections::VecDeque;
 /// Type alias for sender of action result that have shared buffer(s).
 pub(super) type BufSender<T, E> = FateSender<BufResult<T, E>>;
 
+/// Type alias for receiver of action result that have shared buffer(s).
+pub(super) type BufReceiver<T, E> = FateReceiver<BufResult<T, E>>;
+
 /// An async I/O action initiated from a page.
 #[derive(Debug)]
 pub(super) struct PageIo {
@@ -126,6 +129,29 @@ pub(super) enum Action {
 
     /// Action to append into storage.
     Append(Append),
+}
+
+impl Action {
+    /// Create a query action.
+    ///
+    /// # Arguments
+    ///
+    /// * `after_seq_no` - Sequence number to query logs after.
+    /// * `buf` - Buffer to append log bytes read from storage.
+    pub(super) fn query(after_seq_no: u64, buf: IoBuf) -> (Self, BufReceiver<(), QueryError>) {
+        let (tx, rx) = AsyncFate::channel();
+        (Action::Query(Query { buf, tx, after_seq_no }), rx)
+    }
+
+    /// Create an append action.
+    ///
+    /// # Arguments
+    ///
+    /// * `buf` - Buffer of logs to append to storage.
+    pub(super) fn append(buf: IoBuf) -> (Self, BufReceiver<(), AppendError>) {
+        let (tx, rx) = AsyncFate::channel();
+        (Action::Append(Append { buf, tx }), rx)
+    }
 }
 
 /// A request to query for some bytes from page.

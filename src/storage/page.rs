@@ -12,6 +12,15 @@ use crate::{
 use std::io;
 
 /// A chunk of contiguous sequence of logs within storage.
+///
+/// Each page is backed by a file on disk, some pre-allocated memory for
+/// log index entries along with some other bits of in-memory state.
+///
+/// A page can be uninitialized (just empty space), empty (no logs) or
+/// filled with logs. An uninitialized page can be initialized at runtime.
+///
+/// A page has a pre-determined maximum size. Then the page runs out of capacity,
+/// it must be reset or rotated away to make space for new log records.
 #[derive(Debug)]
 pub(super) struct Page {
     // Index of the page in the ring buffer.
@@ -74,6 +83,20 @@ impl Page {
         self.state.as_ref().copied()
     }
 
+    /// Append a list of logs records into the page.
+    ///
+    /// If the page is initialized, logs are appended in the right sequence and there is
+    /// no pending append or resets in page, then this initiates an async action to write
+    /// a range of bytes into the underlying file.
+    ///
+    /// Note that this method returns [`ActionIo::Overflow`] if the action could not be
+    /// issued because the page ran out of space. When this happens space must be reclaimed
+    /// from the oldest page to make room for the new append.
+    ///
+    /// # Arguments
+    ///
+    /// * `append` - Append action against the page.
+    /// * `queue` - I/O queue to append I/O actions.
     pub(super) fn append(&mut self, append: Append, queue: &mut IoQueue) -> ActionIo {
         let mut state = self.assert_load_state();
         let Append { buf, tx } = append;
@@ -152,6 +175,16 @@ impl Page {
         ActionIo::Issued
     }
 
+    /// Query for a range of log records from page.
+    ///
+    /// If the page is initialized, contains requested range of logs and is not
+    /// currently being reset, then this initiates an async action to read a range
+    /// of bytes from underlying file.
+    ///
+    /// # Arguments
+    ///
+    /// * `query` - Query action against the page.
+    /// * `queue` - I/O queue to append I/O actions.
     pub(super) fn query(&mut self, query: Query, queue: &mut IoQueue) -> ActionIo {
         let mut state = self.assert_load_state();
         let Query {
@@ -219,8 +252,20 @@ impl Page {
         ActionIo::Issued
     }
 
+    /// Reset page to empty.
+    ///
+    /// If the page is initialized and there are no pending I/O operations
+    /// on the page, then this initiates an async action to truncate the
+    /// underlying page to size zero.
+    ///
+    /// # Arguments
+    ///
+    /// * `queue` - Queue to append I/O actions.
     pub(super) fn reset(&mut self, queue: &mut IoQueue) -> ActionIo {
-        let mut state = self.assert_load_state();
+        // No need to reset a page that is already empty.
+        let Some(mut state) = self.state.as_ref().copied() else {
+            return ActionIo::Completed;
+        };
 
         // If there is any pending I/O in the page, it cannot be reset.
         // The worker will just have to retry the operation.
@@ -262,7 +307,7 @@ impl Page {
                 // Get ownership of the shared buffer.
                 let buf = action.take_buf().expect("Page action should have shared buffer");
                 if result != buf.len() as u32 {
-                    let error = QueryError::IncompleteRead(buf.len(), result);
+                    let error = QueryError::Fault("Incomplete read in a query action");
                     tx.send(buf, Err(error));
                     return;
                 }
@@ -279,7 +324,7 @@ impl Page {
                 // Get ownership of the shared buffer.
                 let buf = action.take_buf().expect("Page action should have shared buffer");
                 if result != buf.len() as u32 {
-                    let error = AppendError::IncompleteWrite(buf.len(), result);
+                    let error = AppendError::Fault("Incomplete write in an append action");
                     tx.send(buf, Err(error));
                     return;
                 }
@@ -316,7 +361,7 @@ impl Page {
                 state.pending.complete_reset();
                 self.state = Some(state);
 
-                // TODO: Tracing/log/etc.
+                // FIXME: Should we abort all pending append actions?
                 eprintln!("Page reset aborted with error: {error:?}");
             }
 

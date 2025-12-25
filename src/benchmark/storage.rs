@@ -5,7 +5,7 @@ use std::time::{Duration, Instant};
 use tokio::fs::create_dir_all;
 use waldo::{
     log::Log,
-    storage::{Options, PageOptions, Storage},
+    storage::{Options, PageOptions, PoolOptions, Storage},
 };
 
 /// Arguments for the I/O runtime benchmark.
@@ -24,16 +24,12 @@ struct Arguments {
     #[arg(long, default_value = "256")]
     queue_depth: u16,
 
-    /// Size of buffers used for reads and writes in MB.
-    #[arg(long, default_value = "2")]
-    buf_capacity_mb: usize,
-
     /// Number of pre-allocated I/O buffers.
     #[arg(long, default_value = "256")]
     pool_size: u16,
 
     /// Maximum number of logs in a page.
-    #[arg(long, default_value = "5000000")]
+    #[arg(long, default_value = "10000000")]
     page_capacity: u64,
 
     /// Maximum size of file backing a page in GB.
@@ -41,7 +37,7 @@ struct Arguments {
     page_file_capacity_gb: u64,
 
     /// Maximum size of index backing a page.
-    #[arg(long, default_value = "50000")]
+    #[arg(long, default_value = "100000")]
     page_index_capacity: usize,
 
     /// Maximum gap between indexed log records.
@@ -53,7 +49,7 @@ struct Arguments {
     index_sparse_bytes: usize,
 
     /// Maximum number of logs to append in benchmark.
-    #[arg(long, default_value = "50000000")]
+    #[arg(long, default_value = "100000000")]
     count: u64,
 
     /// Size of payload of a log record.
@@ -65,23 +61,25 @@ struct Arguments {
     readers: u32,
 
     /// Milliseconds between append operations.
-    #[arg(long, default_value = "100")]
+    #[arg(long, default_value = "50")]
     append_delay: u64,
 
     /// Milliseconds between query operations.
-    #[arg(long, default_value = "100")]
+    #[arg(long, default_value = "50")]
     query_delay: u64,
 }
 
 impl From<&Arguments> for Options {
     fn from(value: &Arguments) -> Self {
         Self {
-            huge_buf: true,
             ring_size: value.ring_size,
-            pool_size: value.pool_size,
             queue_depth: value.queue_depth,
-            buf_capacity: value.buf_capacity_mb * 1024 * 1024,
-            page_options: PageOptions {
+            pool: PoolOptions {
+                huge_buf: true,
+                pool_size: value.pool_size,
+                buf_capacity: 2 * 1024 * 1024,
+            },
+            page: PageOptions {
                 page_capacity: value.page_capacity,
                 index_capacity: value.page_index_capacity,
                 index_sparse_count: value.index_sparse_count,
@@ -96,6 +94,7 @@ impl From<&Arguments> for Options {
 async fn main() -> anyhow::Result<()> {
     // Parse command line arguments.
     let args = Arguments::parse();
+    let opts = Options::from(&args);
 
     // Random log data to use with log records.
     let count = args.count;
@@ -105,7 +104,7 @@ async fn main() -> anyhow::Result<()> {
     let log_data = vec![5; args.log_size];
 
     // Maximum number of log records that can be stored in allocated buffers.
-    let batch_size = (args.buf_capacity_mb * 1024 * 1024) / log_size;
+    let batch_size = opts.pool.buf_capacity / log_size;
 
     // Create directory to store benchmark files.
     create_dir_all(&args.path).await?;
@@ -132,8 +131,9 @@ async fn main() -> anyhow::Result<()> {
                 // Logs to write to page.
                 logs.clear();
                 for _ in 0..batch_size {
-                    logs.push(Log::new_borrowed(prev_seq_no + 1, prev_seq_no, &log_data));
-                    prev_seq_no += 1;
+                    let seq_no = prev_seq_no + 1;
+                    logs.push(Log::new_borrowed(seq_no, prev_seq_no, &log_data));
+                    prev_seq_no = seq_no;
                 }
 
                 // Append the next set of bytes.

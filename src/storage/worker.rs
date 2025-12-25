@@ -3,8 +3,8 @@
 use crate::{
     runtime::IoRuntime,
     storage::{
-        Action, Page, Query,
-        action::{ActionCtx, IoQueue, PageIo},
+        Action, Page,
+        action::{ActionCtx, IoQueue, PageIo, Query},
         page::ActionIo,
         session::QueryError,
     },
@@ -190,9 +190,6 @@ impl WorkerState {
                     // Latest page is the page where all the writes happen.
                     // And this page must always be initialized, rules.
                     let page = &mut self.pages[self.next];
-                    assert!(page.is_initialized(), "Writeable page must be initialized");
-
-                    // If the current page is full, rollover to the new page.
                     if let ActionIo::Overflow = page.append(append, &mut self.io_queue) {
                         // Fetch the state of the previous page.
                         // We need this to link the sequence numbers for the next page.
