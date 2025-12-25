@@ -2,7 +2,10 @@
 
 use crate::{
     runtime::{IoAction, IoBuf},
-    storage::{AppendError, BufResult, QueryError},
+    storage::{
+        BufResult,
+        session::{AppendError, QueryError},
+    },
 };
 use std::collections::VecDeque;
 

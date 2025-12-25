@@ -20,55 +20,7 @@ use std::{
     sync::Arc,
 };
 
-pub type BufResult<T, E> = (IoBuf, Result<T, E>);
-
-#[derive(Debug, thiserror::Error)]
-pub enum QueryError {
-    #[error(transparent)]
-    Storage(#[from] Error),
-
-    #[error("Attempted to read {0} bytes, but only {1} was read")]
-    IncompleteRead(usize, u32),
-
-    #[error("Requested range of log after: {0} are trimmed")]
-    Trimmed(u64),
-}
-
-#[derive(Debug, thiserror::Error)]
-pub enum AppendError {
-    #[error(transparent)]
-    Storage(#[from] Error),
-
-    #[error("A conflicting append is already in progress")]
-    Conflict,
-
-    #[error("Log record: {0} has prev: {1}, but expected prev: {2}")]
-    Sequence(u64, u64, u64),
-
-    #[error("Log record: {0} has size: {1} that exceeds limit: {2}")]
-    ExceedsLimit(u64, usize, usize),
-
-    #[error("Attempted to write {0} bytes, but only {1} was written")]
-    IncompleteWrite(usize, u32),
-}
-
-#[derive(Debug, thiserror::Error)]
-pub enum Error {
-    #[error(transparent)]
-    Io(#[from] std::io::Error),
-
-    #[error("Fate of an append operation was lost")]
-    ActionLost,
-
-    #[error("Action rejected because storage is closing")]
-    UnexpectedClose,
-}
-
-impl From<FateError> for Error {
-    fn from(_value: FateError) -> Self {
-        Error::ActionLost
-    }
-}
+type BufResult<T, E> = (IoBuf, Result<T, E>);
 
 #[derive(Debug, Clone)]
 pub struct Storage {

@@ -1,8 +1,56 @@
 use crate::{
     log::Log,
     runtime::IoBuf,
-    storage::{Action, Append, AppendError, AsyncFate, Error, Query, QueryError},
+    storage::{Action, Append, AsyncFate, FateError, Query},
 };
+
+#[derive(Debug, thiserror::Error)]
+pub enum QueryError {
+    #[error(transparent)]
+    Io(#[from] std::io::Error),
+
+    #[error("Fate of an append operation was lost")]
+    Fault,
+
+    #[error("Attempted to read {0} bytes, but only {1} was read")]
+    IncompleteRead(usize, u32),
+
+    #[error("Requested range of log after: {0} are trimmed")]
+    Trimmed(u64),
+}
+
+impl From<FateError> for QueryError {
+    fn from(_value: FateError) -> Self {
+        QueryError::Fault
+    }
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum AppendError {
+    #[error(transparent)]
+    Io(#[from] std::io::Error),
+
+    #[error("Fate of an action was lost for unknown reasons")]
+    Fault,
+
+    #[error("A conflicting append is already in progress")]
+    Conflict,
+
+    #[error("Log record: {0} has prev: {1}, but expected prev: {2}")]
+    Sequence(u64, u64, u64),
+
+    #[error("Log record: {0} has size: {1} that exceeds limit: {2}")]
+    ExceedsLimit(u64, usize, usize),
+
+    #[error("Attempted to write {0} bytes, but only {1} was written")]
+    IncompleteWrite(usize, u32),
+}
+
+impl From<FateError> for AppendError {
+    fn from(_value: FateError) -> Self {
+        AppendError::Fault
+    }
+}
 
 /// An open session to read and write from storage.
 pub struct Session<'a> {
@@ -21,6 +69,7 @@ impl Session<'_> {
     }
 
     pub async fn append(&mut self, logs: &[Log<'_>]) -> Result<(), AppendError> {
+        // Return early if there is nothing to append.
         if logs.is_empty() {
             return Ok(());
         }
@@ -33,37 +82,24 @@ impl Session<'_> {
         // write all those chunks into storage.
         let mut logs = logs;
         while !logs.is_empty() {
-            // Fetch buffer to bytes to submit to storage.
-            let mut buf = self.buf.take().ok_or(Error::UnexpectedClose)?;
-            buf.clear(); // Clear any state from previous action.
-
-            // Populate the buffer, with as many logs as possible.
-            let mut consumed = 0;
-            for log in logs {
-                // We've consumed enough if buffer doesn't have space for the log.
-                if !log.write(&mut buf) {
-                    break;
-                }
-
-                // Track the last log written into the buffer.
-                consumed += 1;
-            }
+            // Write log bytes to buffer.
+            let mut buf = self.buf.take().ok_or(AppendError::Fault)?;
+            buf.clear(); // Clear previous state.
+            logs = Self::populate_buf(&mut buf, logs);
 
             // Append buffer bytes to storage.
             // Submit action to append bytes into storage.
             let (tx, rx) = AsyncFate::channel();
+            let append = Action::Append(Append { buf, tx });
             self.action_tx
-                .send_async(Action::Append(Append { buf, tx }))
+                .send_async(append)
                 .await
-                .map_err(|_| Error::UnexpectedClose)?;
+                .map_err(|_| AppendError::Fault)?;
 
             // Await and return result from storage.
-            let (buf, result) = rx.recv_async().await.map_err(Error::from)?;
+            let (buf, result) = rx.recv_async().await?;
             self.buf.replace(buf);
-
-            // Process results from append operation.
             result?;
-            logs = logs.split_at(consumed).1;
         }
 
         // All the log records were successfully appended.
@@ -72,18 +108,16 @@ impl Session<'_> {
 
     pub async fn query(&mut self, after_seq_no: u64) -> Result<impl Iterator<Item = Log<'_>>, QueryError> {
         // Fetch buffer to bytes to submit to storage.
-        let mut buf = self.buf.take().ok_or(Error::UnexpectedClose)?;
+        let mut buf = self.buf.take().ok_or(QueryError::Fault)?;
         buf.clear(); // Clear any state from previous action.
 
         // Submit action to append bytes into storage.
         let (tx, rx) = AsyncFate::channel();
-        self.action_tx
-            .send_async(Action::Query(Query { buf, tx, after_seq_no }))
-            .await
-            .map_err(|_| Error::UnexpectedClose)?;
+        let query = Action::Query(Query { buf, tx, after_seq_no });
+        self.action_tx.send_async(query).await.map_err(|_| QueryError::Fault)?;
 
         // Await and return result from storage.
-        let (buf, result) = rx.recv_async().await.map_err(Error::from)?;
+        let (buf, result) = rx.recv_async().await?;
         self.buf.replace(buf);
         result?; // First return error, if any, from storage.
 
@@ -115,5 +149,18 @@ impl Session<'_> {
         }
 
         Ok(())
+    }
+
+    fn populate_buf<'a>(buf: &mut IoBuf, logs: &'a [Log<'a>]) -> &'a [Log<'a>] {
+        let mut consumed = 0;
+        for log in logs {
+            if !log.write(buf) {
+                break;
+            }
+
+            consumed += 1;
+        }
+
+        logs.split_at(consumed).1
     }
 }

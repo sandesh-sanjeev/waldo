@@ -3,9 +3,10 @@
 use crate::{
     runtime::IoRuntime,
     storage::{
-        Action, Page, Query, QueryError,
+        Action, Page, Query,
         action::{ActionCtx, IoQueue, PageIo},
         page::ActionIo,
+        session::QueryError,
     },
 };
 use std::{

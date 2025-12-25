@@ -4,8 +4,9 @@ use crate::{
     log::Log,
     runtime::{IoAction, IoFixedFd},
     storage::{
-        AppendError, Error, PageOptions, QueryError,
+        PageOptions,
         action::{Action, ActionCtx, Append, IoQueue, PageIo, Query},
+        session::{AppendError, QueryError},
     },
 };
 use std::io;
@@ -328,7 +329,7 @@ impl Page {
                 self.state = Some(state);
 
                 // Return error from the action.
-                tx.send(buf, Err(Error::from(error).into()));
+                tx.send(buf, Err(error.into()));
             }
 
             ActionCtx::Append { tx, .. } => {
@@ -340,7 +341,7 @@ impl Page {
                 self.state = Some(state);
 
                 // Return error from the action.
-                tx.send(buf, Err(Error::from(error).into()));
+                tx.send(buf, Err(error.into()));
             }
         }
     }
