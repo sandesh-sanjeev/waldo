@@ -1,9 +1,11 @@
 mod action;
 mod page;
+mod session;
 mod worker;
 
+pub use self::session::Session;
+
 use crate::{
-    log::Log,
     runtime::{BufPool, IoBuf, IoRuntime, RawBytes},
     storage::{
         action::{Action, Append, AsyncFate, FateError, IoQueue, Query},
@@ -27,12 +29,18 @@ pub enum QueryError {
 
     #[error("Attempted to read {0} bytes, but only {1} was read")]
     IncompleteRead(usize, u32),
+
+    #[error("Requested range of log after: {0} are trimmed")]
+    Trimmed(u64),
 }
 
 #[derive(Debug, thiserror::Error)]
 pub enum AppendError {
     #[error(transparent)]
     Storage(#[from] Error),
+
+    #[error("A conflicting append is already in progress")]
+    Conflict,
 
     #[error("Log record: {0} has prev: {1}, but expected prev: {2}")]
     Sequence(u64, u64, u64),
@@ -70,7 +78,7 @@ pub struct Storage {
 }
 
 impl Storage {
-    pub fn open<P: AsRef<Path>>(path: P, after_seq_no: u64, opts: Options) -> io::Result<Self> {
+    pub fn create<P: AsRef<Path>>(path: P, after_seq_no: u64, opts: Options) -> io::Result<Self> {
         // Allocate all memory for buffer pool.
         let pool_size = usize::from(opts.pool_size);
         let mut buffers = (0..pool_size)
@@ -100,7 +108,6 @@ impl Storage {
             .collect();
 
         // Initialize the first page with starting seq_no.
-        // FIXME: Obviously we need to do this better.
         if let Some(page) = pages.first_mut() {
             page.initialize(after_seq_no);
         }
@@ -125,10 +132,18 @@ impl Storage {
     }
 
     pub async fn session(&self) -> Session<'_> {
-        Session {
-            action_tx: &self.tx,
-            buf: Some(self.buf_pool.take_async().await),
-        }
+        let buf = self.buf_pool.take();
+        Session::new(buf, &self.tx)
+    }
+
+    pub async fn try_session(&self) -> Option<Session<'_>> {
+        let buf = self.buf_pool.try_take()?;
+        Some(Session::new(buf, &self.tx))
+    }
+
+    pub async fn session_async(&self) -> Session<'_> {
+        let buf = self.buf_pool.take_async().await;
+        Session::new(buf, &self.tx)
     }
 
     fn open_page_file<P: AsRef<Path>>(path: P, index: u32) -> io::Result<File> {
@@ -138,81 +153,6 @@ impl Storage {
             .write(true)
             .read(true)
             .open(path.as_ref().join(format!("{index:0>10}.page")))
-    }
-}
-
-/// An open session to read and write from storage.
-pub struct Session<'a> {
-    buf: Option<IoBuf>,
-    action_tx: &'a flume::Sender<Action>,
-}
-
-impl Session<'_> {
-    pub async fn append(&mut self, logs: &[Log<'_>]) -> Result<(), AppendError> {
-        // TODO: Perform log validations.
-
-        // Write out all the logs to storage.
-        let mut logs = logs;
-        while !logs.is_empty() {
-            // Fetch buffer to bytes to submit to storage.
-            let mut buf = self.buf.take().ok_or(Error::UnexpectedClose)?;
-            buf.clear(); // Clear any state from previous action.
-
-            // Populate the buffer, with as many logs as possible.
-            let mut consumed = 0;
-            for log in logs {
-                // We've consumed enough if buffer doesn't have space for the log.
-                if !log.write(&mut buf) {
-                    break;
-                }
-
-                // Track the last log written into the buffer.
-                consumed += 1;
-            }
-
-            // Append buffer bytes to storage.
-            // Submit action to append bytes into storage.
-            let (tx, rx) = AsyncFate::channel();
-            self.action_tx
-                .send_async(Action::Append(Append { buf, tx }))
-                .await
-                .map_err(|_| Error::UnexpectedClose)?;
-
-            // Await and return result from storage.
-            let (buf, result) = rx.recv_async().await.map_err(Error::from)?;
-            self.buf.replace(buf);
-
-            // Process results from append operation.
-            result?;
-            logs = logs.split_at(consumed).1;
-        }
-
-        // All the log records were successfully appended.
-        Ok(())
-    }
-
-    pub async fn query(&mut self, after_seq_no: u64) -> Result<impl Iterator<Item = Log<'_>>, QueryError> {
-        // Fetch buffer to bytes to submit to storage.
-        let mut buf = self.buf.take().ok_or(Error::UnexpectedClose)?;
-        buf.clear(); // Clear any state from previous action.
-
-        // Submit action to append bytes into storage.
-        let (tx, rx) = AsyncFate::channel();
-        self.action_tx
-            .send_async(Action::Query(Query { buf, tx, after_seq_no }))
-            .await
-            .map_err(|_| Error::UnexpectedClose)?;
-
-        // Await and return result from storage.
-        let (buf, result) = rx.recv_async().await.map_err(Error::from)?;
-        self.buf.replace(buf);
-        result?; // First return error, if any, from storage.
-
-        // Return reference to all the log records read from query.
-        // A filter is necessary here because storage can read slightly more logs are
-        // the beginning. It's more efficient to filter it out here
-        let buf = self.buf.as_ref().expect("Associated buffer must exist");
-        Ok(buf.into_iter().filter(move |log| log.seq_no() > after_seq_no))
     }
 }
 

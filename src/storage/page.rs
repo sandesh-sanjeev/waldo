@@ -1,3 +1,5 @@
+//! Contiguous sequence of logs in storage.
+
 use crate::{
     log::Log,
     runtime::{IoAction, IoFixedFd},
@@ -46,7 +48,6 @@ impl Page {
     }
 
     /// Returns true if the page is already initialized, false otherwise.
-    #[allow(dead_code)]
     pub(super) fn is_initialized(&self) -> bool {
         self.state.is_some()
     }
@@ -67,17 +68,176 @@ impl Page {
         true
     }
 
-    /// Process an action.
-    ///
-    /// # Arguments
-    ///
-    /// * `action` - Action to process against the page.
-    /// * `queue` - I/O queue to issue/retry actions.
-    pub(super) fn action(&mut self, action: Action, queue: &mut IoQueue) -> ActionIo {
-        match action {
-            Action::Query(query) => self.query(query, queue),
-            Action::Append(append) => self.append(append, queue),
+    /// Returns current state of page if page is initialized, empty otherwise.
+    pub(super) fn state(&self) -> Option<PageState> {
+        self.state.as_ref().copied()
+    }
+
+    pub(super) fn append(&mut self, append: Append, queue: &mut IoQueue) -> ActionIo {
+        let mut state = self.assert_load_state();
+        let Append { buf, tx } = append;
+
+        // Return early if there is already an append in progress.
+        if state.pending.append {
+            tx.send(buf, Err(AppendError::Conflict));
+            return ActionIo::Completed;
         }
+
+        // Return early if there is nothing to append.
+        if buf.is_empty() {
+            tx.send(buf, Ok(()));
+            return ActionIo::Completed;
+        }
+
+        // Perform validations on log records being appended.
+        let mut error = None;
+        let mut index_count = self.index.len();
+        let mut scratch = state;
+        for log in &buf {
+            // Make sure sequence of appended logs is not broken.
+            if log.prev_seq_no() != scratch.prev_seq_no {
+                error = Some(AppendError::Sequence(
+                    log.seq_no(),
+                    log.prev_seq_no(),
+                    scratch.prev_seq_no,
+                ));
+                break;
+            }
+
+            // For capacity calculations.
+            if scratch.apply(&log, self.opts).is_some() {
+                index_count += 1;
+                scratch.index.reset();
+            }
+        }
+
+        // Return early if sequence validation failed.
+        if let Some(error) = error {
+            tx.send(buf, Err(error));
+            return ActionIo::Completed;
+        }
+
+        // Return early if there is no complete log in the buffer.
+        if scratch.prev_seq_no == state.prev_seq_no {
+            tx.send(buf, Ok(()));
+            return ActionIo::Completed;
+        }
+
+        // Re-queue the action and indicate that page does not have enough capacity.
+        if scratch.count > self.opts.page_capacity
+            || scratch.offset > self.opts.file_capacity
+            || index_count > self.opts.index_capacity
+        {
+            queue.reprocess(Action::Append(Append { buf, tx }));
+            return ActionIo::Overflow;
+        }
+
+        // Re-queue the action if the page is currently being reset.
+        if state.pending.reset {
+            queue.reprocess(Action::Append(Append { buf, tx }));
+            return ActionIo::Pending;
+        }
+
+        // Track the in-progress query.
+        state.pending.pending_append();
+        self.state = Some(state);
+
+        // Enqueue I/O action for execution asynchronously.
+        queue.issue(PageIo {
+            id: self.id,
+            ctx: ActionCtx::append(tx),
+            action: IoAction::write_at(self.file, state.offset, buf),
+        });
+        ActionIo::Issued
+    }
+
+    pub(super) fn query(&mut self, query: Query, queue: &mut IoQueue) -> ActionIo {
+        let mut state = self.assert_load_state();
+        let Query {
+            after_seq_no: after,
+            mut buf,
+            tx,
+        } = query;
+
+        // Return early if the page doesn't contain the requested range of logs.
+        if after >= state.prev_seq_no || after < state.after_seq_no {
+            buf.clear(); // Make sure to reflect no read.
+            tx.send(buf, Ok(()));
+            return ActionIo::Completed;
+        }
+
+        // Find index to the closet log record that has seq_no <= after.
+        let offset = match self.index.binary_search_by_key(&after, IndexEntry::after_seq_no) {
+            // Query from beginning of the page.
+            Err(0) => 0,
+
+            // Found exact match start at.
+            Ok(i) => self.index[i].offset(),
+
+            // Exact match would have been at this index, but there is no exact match.
+            // Everything before has seq_no < after and everything after has > seq_no.
+            // So we pick the previous one and skip tasks that are not part of this query.
+            Err(i) => self.index[i - 1].offset(),
+        };
+
+        // Do not attempt to read beyond known end of file.
+        let remaining = state.offset.saturating_sub(offset);
+        let remaining = usize::try_from(remaining).unwrap_or(usize::MAX);
+
+        // Return early if there are no bytes to read.
+        if remaining == 0 || buf.capacity() == 0 {
+            buf.clear(); // Make sure to reflect no read.
+            tx.send(buf, Ok(()));
+            return ActionIo::Completed;
+        }
+
+        // Re-queue the action if the page is currently being reset.
+        if state.pending.reset {
+            queue.reprocess(Action::Query(Query {
+                buf,
+                tx,
+                after_seq_no: after,
+            }));
+            return ActionIo::Pending;
+        }
+
+        // Make enough space in buffer for new bytes.
+        let len = std::cmp::min(remaining, buf.capacity());
+        buf.set_len(len);
+
+        // Track the in-progress query.
+        state.pending.pending_query();
+        self.state = Some(state);
+
+        // Enqueue I/O action for execution asynchronously.
+        queue.issue(PageIo {
+            id: self.id,
+            ctx: ActionCtx::query(tx),
+            action: IoAction::read_at(self.file, offset, buf),
+        });
+        ActionIo::Issued
+    }
+
+    pub(super) fn reset(&mut self, queue: &mut IoQueue) -> ActionIo {
+        let mut state = self.assert_load_state();
+
+        // If there is any pending I/O in the page, it cannot be reset.
+        // The worker will just have to retry the operation.
+        if state.pending.has_pending() {
+            return ActionIo::Pending;
+        }
+
+        // Track the in-progress reset.
+        state.pending.pending_reset();
+        self.state = Some(state);
+
+        // Enqueue I/O action for execution asynchronously.
+        queue.issue(PageIo {
+            id: self.id,
+            ctx: ActionCtx::Reset,
+            action: IoAction::resize(self.file, 0),
+        });
+        ActionIo::Issued
     }
 
     /// Process successfully completed async actions.
@@ -88,8 +248,7 @@ impl Page {
     /// * `action` - I/O action completed.
     /// * `ctx` - Context associated with the action.
     pub(super) fn commit(&mut self, result: u32, action: IoAction, ctx: ActionCtx) {
-        let mut state = self.load_state();
-
+        let mut state = self.assert_load_state();
         match ctx {
             ActionCtx::Reset => {
                 // Underlying file is already truncated.
@@ -150,8 +309,7 @@ impl Page {
     /// * `action` - I/O action that errored out.
     /// * `ctx` - Context associated with the action.
     pub(super) fn abort(&mut self, error: io::Error, action: IoAction, ctx: ActionCtx) {
-        let mut state = self.load_state();
-
+        let mut state = self.assert_load_state();
         match ctx {
             ActionCtx::Reset => {
                 state.pending.complete_reset();
@@ -187,150 +345,11 @@ impl Page {
         }
     }
 
-    fn query(&mut self, query: Query, queue: &mut IoQueue) -> ActionIo {
-        let mut state = self.load_state();
-        let Query {
-            after_seq_no: after,
-            mut buf,
-            tx,
-        } = query;
-
-        // Return early if the page doesn't contain the requested range of logs.
-        if after >= state.prev_seq_no || after < state.after_seq_no {
-            buf.clear(); // Make sure to reflect no read.
-            tx.send(buf, Ok(()));
-            return ActionIo::Completed;
-        }
-
-        // Find index to the closet log record that has seq_no <= after.
-        let offset = match self.index.binary_search_by_key(&after, IndexEntry::after_seq_no) {
-            // Query from beginning of the page.
-            Err(0) => 0,
-
-            // Found exact match start at.
-            Ok(i) => self.index[i].offset(),
-
-            // Exact match would have been at this index, but there is no exact match.
-            // Everything before has seq_no < after and everything after has > seq_no.
-            // So we pick the previous one and skip tasks that are not part of this query.
-            Err(i) => self.index[i - 1].offset(),
-        };
-
-        // Do not attempt to read beyond known end of file.
-        let remaining = state.offset.saturating_sub(offset);
-        let remaining = usize::try_from(remaining).unwrap_or(usize::MAX);
-
-        // Return early if there are no bytes to read.
-        if remaining == 0 || buf.capacity() == 0 {
-            buf.clear(); // Make sure to reflect no read.
-            tx.send(buf, Ok(()));
-            return ActionIo::Completed;
-        }
-
-        // Make enough space in buffer for new bytes.
-        let len = std::cmp::min(remaining, buf.capacity());
-        buf.set_len(len);
-
-        // Track the in-progress query.
-        state.pending.pending_query();
-        self.state = Some(state);
-
-        // Enqueue I/O action for execution asynchronously.
-        queue.issue(PageIo {
-            id: self.id,
-            ctx: ActionCtx::query(tx),
-            action: IoAction::read_at(self.file, offset, buf),
-        });
-        ActionIo::Issued
-    }
-
-    fn append(&mut self, append: Append, queue: &mut IoQueue) -> ActionIo {
-        let mut state = self.load_state();
-        let Append { buf, tx } = append;
-
-        // Return early if there is nothing to append.
-        if buf.is_empty() {
-            tx.send(buf, Ok(()));
-            return ActionIo::Completed;
-        }
-
-        // Perform validations on log records being appended.
-        let mut error = None;
-        let mut prev_seq_no = state.prev_seq_no;
-        let mut index_count = self.index.len();
-        let mut scratch = state;
-        for log in &buf {
-            // Make sure sequence of appended logs is not broken.
-            if log.prev_seq_no() != prev_seq_no {
-                error = Some(AppendError::Sequence(log.seq_no(), prev_seq_no, log.prev_seq_no()));
-                break;
-            }
-
-            // Update for next iteration.
-            prev_seq_no = log.seq_no();
-
-            // For capacity calculations.
-            if scratch.apply(&log, self.opts).is_some() {
-                index_count += 1;
-                scratch.index.reset();
-            }
-        }
-
-        // Return early if sequence validation failed.
-        if let Some(error) = error {
-            tx.send(buf, Err(error));
-            return ActionIo::Completed;
-        }
-
-        // Return early if there is no complete log in the buffer.
-        if prev_seq_no == state.prev_seq_no {
-            tx.send(buf, Ok(()));
-            return ActionIo::Completed;
-        }
-
-        // Re-queue the action and indicate that page does not have enough capacity.
-        if scratch.offset > self.opts.file_capacity || index_count > self.opts.index_capacity {
-            queue.pending(Action::Append(Append { buf, tx }));
-            return ActionIo::Overflow;
-        }
-
-        // Track the in-progress query.
-        state.pending.pending_append();
-        self.state = Some(state);
-
-        // Enqueue I/O action for execution asynchronously.
-        queue.issue(PageIo {
-            id: self.id,
-            ctx: ActionCtx::append(tx),
-            action: IoAction::write_at(self.file, state.offset, buf),
-        });
-        ActionIo::Issued
-    }
-
-    #[allow(dead_code)]
-    pub(super) fn reset(&mut self, queue: &mut IoQueue) -> ActionIo {
-        let mut state = self.load_state();
-
-        // FIXME: Make sure there is no pending I/O.
-
-        // Track the in-progress reset.
-        state.pending.pending_reset();
-        self.state = Some(state);
-
-        // Enqueue I/O action for execution asynchronously.
-        queue.issue(PageIo {
-            id: self.id,
-            ctx: ActionCtx::Reset,
-            action: IoAction::fsync(self.file),
-        });
-        ActionIo::Issued
-    }
-
-    fn load_state(&self) -> PageState {
-        *self
-            .state
+    fn assert_load_state(&self) -> PageState {
+        self.state
             .as_ref()
-            .expect("State should not be loaded in uninitialized page")
+            .copied()
+            .expect("Loading state from an uninitialized page")
     }
 }
 
@@ -338,19 +357,20 @@ impl Page {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum ActionIo {
     Issued,
+    Pending,
     Overflow,
     Completed,
 }
 
 /// State of a storage page.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct PageState {
-    count: u64,
-    offset: u64,
-    prev_seq_no: u64,
-    after_seq_no: u64,
-    index: IndexState,
-    pending: PendingIo,
+pub(super) struct PageState {
+    pub(super) count: u64,
+    pub(super) offset: u64,
+    pub(super) prev_seq_no: u64,
+    pub(super) after_seq_no: u64,
+    pub(super) index: IndexState,
+    pub(super) pending: PendingIo,
 }
 
 impl PageState {
@@ -383,9 +403,9 @@ impl PageState {
 
 /// State of a page index.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct IndexState {
-    count_since: usize,
-    bytes_since: usize,
+pub(super) struct IndexState {
+    pub(super) count_since: usize,
+    pub(super) bytes_since: usize,
 }
 
 impl IndexState {
@@ -415,36 +435,19 @@ impl IndexState {
     }
 }
 
-/// Offset of an indexed sequence number.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct IndexEntry {
-    offset: u64,
-    after_seq_no: u64,
-}
-
-impl IndexEntry {
-    fn new(offset: u64, after_seq_no: u64) -> Self {
-        Self { offset, after_seq_no }
-    }
-
-    fn offset(&self) -> u64 {
-        self.offset
-    }
-
-    fn after_seq_no(&self) -> u64 {
-        self.after_seq_no
-    }
-}
-
 /// Status around pending I/O actions.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-struct PendingIo {
-    reset: bool,
-    query: u32,
-    append: bool,
+pub(super) struct PendingIo {
+    pub(super) reset: bool,
+    pub(super) query: u32,
+    pub(super) append: bool,
 }
 
 impl PendingIo {
+    fn has_pending(&self) -> bool {
+        self.reset || self.append || self.query > 0
+    }
+
     fn pending_reset(&mut self) {
         self.reset = true;
     }
@@ -467,5 +470,26 @@ impl PendingIo {
 
     fn complete_query(&mut self) {
         self.query -= 1;
+    }
+}
+
+/// Offset of an indexed sequence number.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct IndexEntry {
+    offset: u64,
+    after_seq_no: u64,
+}
+
+impl IndexEntry {
+    fn new(offset: u64, after_seq_no: u64) -> Self {
+        Self { offset, after_seq_no }
+    }
+
+    fn offset(&self) -> u64 {
+        self.offset
+    }
+
+    fn after_seq_no(&self) -> u64 {
+        self.after_seq_no
     }
 }

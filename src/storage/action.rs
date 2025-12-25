@@ -1,4 +1,4 @@
-//! Asynchronous actions initiated in Storage.
+//! Asynchronous actions initiated, processed and completed in Storage.
 
 use crate::{
     runtime::{IoAction, IoBuf},
@@ -23,10 +23,13 @@ pub(super) struct IoQueue {
     // Async actions initiated by one or more pages.
     issued: VecDeque<PageIo>,
 
-    // Pending actions that have not yet been processed
-    // by any of the pages. It could be due to retries,
-    // scheduling, etc.
-    pending: VecDeque<Action>,
+    // Actions that have been queued for processing.
+    queued: VecDeque<Action>,
+
+    // Actions that were processed by a page, but must be reprocessed
+    // because another thing has to happen. This will be re-processed
+    // later as the scheduler sees fit.
+    reprocess: VecDeque<Action>,
 }
 
 impl IoQueue {
@@ -37,19 +40,25 @@ impl IoQueue {
     /// * `capacity` - Initially allocated capacity of the queue.
     pub(super) fn with_capacity(capacity: usize) -> Self {
         Self {
+            queued: VecDeque::with_capacity(capacity),
             issued: VecDeque::with_capacity(capacity),
-            pending: VecDeque::with_capacity(capacity),
+            reprocess: VecDeque::with_capacity(capacity),
         }
     }
 
     /// Total number of I/O actions currently queued.
     pub(super) fn len(&self) -> usize {
-        self.issued.len() + self.pending.len()
+        self.queued.len() + self.issued.len() + self.reprocess.len()
     }
 
     /// True if there is nothing queued, false otherwise.
     pub(super) fn is_empty(&self) -> bool {
         self.len() == 0
+    }
+
+    /// True if there are issued io actions.
+    pub(super) fn is_empty_issued(&self) -> bool {
+        self.issued.is_empty()
     }
 
     /// Issue a new page action.
@@ -73,22 +82,36 @@ impl IoQueue {
     }
 
     /// Dequeue an issued page action.
-    pub(super) fn dequeue_issued(&mut self) -> Option<PageIo> {
+    pub(super) fn pop_issued(&mut self) -> Option<PageIo> {
         self.issued.pop_front()
     }
 
-    /// Enqueue a storage action.
+    /// Enqueue an action to be processed.
+    ///
+    /// # Arguments
+    ///
+    /// * `action` - Action to enqueue for processing.
+    pub(super) fn queue(&mut self, action: Action) {
+        self.queued.push_back(action);
+    }
+
+    /// Dequeue an action for processing.
+    pub(super) fn pop_queued(&mut self) -> Option<Action> {
+        self.queued.pop_front()
+    }
+
+    /// Enqueue a storage action for reprocessing later.
     ///
     /// # Arguments
     ///
     /// * `action` - Action to enqueue.
-    pub(super) fn pending(&mut self, action: Action) {
-        self.pending.push_back(action);
+    pub(super) fn reprocess(&mut self, action: Action) {
+        self.reprocess.push_back(action);
     }
 
-    /// Dequeue a pending storage action.
-    pub(super) fn dequeue_pending(&mut self) -> Option<Action> {
-        self.pending.pop_front()
+    /// Dequeue a pending storage action for reprocessing.
+    pub(super) fn pop_reprocess(&mut self) -> Option<Action> {
+        self.reprocess.pop_front()
     }
 }
 

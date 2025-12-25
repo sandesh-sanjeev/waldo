@@ -17,8 +17,8 @@ struct Arguments {
     path: String,
 
     /// Maximum number of pages in storage.
-    #[arg(long, default_value = "1")]
-    ring_size: u16,
+    #[arg(long, default_value = "4")]
+    ring_size: u32,
 
     /// Maximum concurrency supported by storage.
     #[arg(long, default_value = "256")]
@@ -33,7 +33,7 @@ struct Arguments {
     pool_size: u16,
 
     /// Maximum number of logs in a page.
-    #[arg(long, default_value = "10000000")]
+    #[arg(long, default_value = "5000000")]
     page_capacity: u64,
 
     /// Maximum size of file backing a page in GB.
@@ -41,7 +41,7 @@ struct Arguments {
     page_file_capacity_gb: u64,
 
     /// Maximum size of index backing a page.
-    #[arg(long, default_value = "100000")]
+    #[arg(long, default_value = "50000")]
     page_index_capacity: usize,
 
     /// Maximum gap between indexed log records.
@@ -53,7 +53,7 @@ struct Arguments {
     index_sparse_bytes: usize,
 
     /// Maximum number of logs to append in benchmark.
-    #[arg(long, default_value = "5000000")]
+    #[arg(long, default_value = "50000000")]
     count: u64,
 
     /// Size of payload of a log record.
@@ -76,8 +76,8 @@ struct Arguments {
 impl From<&Arguments> for Options {
     fn from(value: &Arguments) -> Self {
         Self {
-            ring_size: 1,
             huge_buf: true,
+            ring_size: value.ring_size,
             pool_size: value.pool_size,
             queue_depth: value.queue_depth,
             buf_capacity: value.buf_capacity_mb * 1024 * 1024,
@@ -111,7 +111,7 @@ async fn main() -> anyhow::Result<()> {
     create_dir_all(&args.path).await?;
 
     // Open storage at the given path.
-    let storage = Storage::open(&args.path, 0, Options::from(&args))?;
+    let storage = Storage::create(&args.path, 0, Options::from(&args))?;
 
     // Number of workers participating in the benchmark.
     let mut workers = Vec::new();
@@ -124,7 +124,7 @@ async fn main() -> anyhow::Result<()> {
             let mut prev_seq_no = 0;
             let mut interval = tokio::time::interval(delay);
             let mut logs = Vec::with_capacity(batch_size);
-            let mut session = storage.session().await;
+            let mut session = storage.session_async().await;
             while prev_seq_no < count {
                 // To run with a specific cadence.
                 interval.tick().await;
@@ -151,7 +151,7 @@ async fn main() -> anyhow::Result<()> {
         workers.push(tokio::spawn(async move {
             let mut prev_seq_no = 0;
             let mut interval = tokio::time::interval(delay);
-            let mut session = storage.session().await;
+            let mut session = storage.session_async().await;
             while prev_seq_no < count {
                 // To run with a specific cadence.
                 interval.tick().await;

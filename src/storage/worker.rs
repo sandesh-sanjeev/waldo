@@ -3,8 +3,9 @@
 use crate::{
     runtime::IoRuntime,
     storage::{
-        Action, Page,
+        Action, Page, Query, QueryError,
         action::{ActionCtx, IoQueue, PageIo},
+        page::ActionIo,
     },
 };
 use std::{
@@ -72,24 +73,27 @@ impl WorkerState {
     fn process(mut self, closing: Arc<AtomicBool>) -> io::Result<()> {
         loop {
             // Check if graceful shutdown has begun.
+            // We'll continue to complete all pending work.
             let is_closing = closing.load(Ordering::Relaxed);
 
-            // If not closing, await for an action.
-            // If closing, we just want to flush all the pending work and shutdown.
+            // If not closing, await for an action, i.e, blocking wait for a processable
+            // action to be available. If closing, we just want to flush all the pending
+            // work and shutdown, so no blocking wait.
             if !is_closing {
                 self.await_queue_action();
             }
 
-            // Drain the channel and queue up as many actions as possible.
+            // Drain the channel and queue up as many actions as possible for processing.
             self.try_queue_actions();
 
-            // Process any of the pending I/O actions.
+            // Process any of the queued up I/O actions.
             self.process_actions();
 
-            // If there is nothing to do, it can only mean one of two things,
-            // graceful shutdown as begun and we have flushed all pending work.
-            // Or all the senders of actions have dropped, either case, shutdown.
-            if self.runtime.pending_io() == 0 && self.io_queue.is_empty() {
+            // If there is no work to do at this point it can mean a few different things:
+            // 1. Closing as begun and we have flushed all work.
+            // 2. All the actions where completed and did not need I/O.
+            // 2. There are actions that must be retried.
+            if self.runtime.pending_io() == 0 && self.io_queue.is_empty_issued() {
                 if is_closing {
                     // Cause we have flushed on pending actions.
                     break;
@@ -101,7 +105,7 @@ impl WorkerState {
                 }
             }
 
-            // Submit queued up actions.
+            // Submit queued up actions to the runtime.
             self.submit_actions();
 
             // Wait for at least one pending I/O action to complete.
@@ -110,54 +114,116 @@ impl WorkerState {
             }
 
             // Process all the completed actions.
-            while let Some(result) = self.runtime.pop() {
-                match result {
-                    Ok(success) => {
-                        // Find the page that must complete the I/O request.
-                        let index = success.attachment.0;
-                        let page = self
-                            .pages
-                            .get_mut(index as usize)
-                            .expect("Got I/O response for a page that does not exist");
-
-                        // Complete the I/O operation.
-                        page.commit(success.result, success.action, success.attachment.1);
-                    }
-
-                    Err(error) => {
-                        // Find the page that must complete the I/O request.
-                        let index = error.attachment.0;
-                        let page = self
-                            .pages
-                            .get_mut(index as usize)
-                            .expect("Got I/O response for a page that does not exist");
-
-                        page.abort(error.error, error.action, error.attachment.1);
-                    }
-                }
-            }
+            self.process_completions();
         }
         Ok(())
     }
 
-    fn process_actions(&mut self) {
-        // Process any pending action, if possible.
-        while let Some(action) = self.io_queue.dequeue_pending() {
-            // Fetch the right page to perform the action on.
-            // TODO: Support more than one page.
-            let Some(page) = self.pages.get_mut(self.next) else {
-                unreachable!("Every ring buffer must have one open page");
-            };
+    fn process_completions(&mut self) {
+        while let Some(result) = self.runtime.pop() {
+            match result {
+                Ok(success) => {
+                    // Find the page that must complete the I/O request.
+                    let index = success.attachment.0;
+                    let page = self
+                        .pages
+                        .get_mut(index as usize)
+                        .expect("Got I/O response for a page that does not exist");
 
-            // Execute action on the page.
-            page.action(action, &mut self.io_queue);
+                    // Complete the I/O operation.
+                    page.commit(success.result, success.action, success.attachment.1);
+                }
+
+                Err(error) => {
+                    // Find the page that must complete the I/O request.
+                    let index = error.attachment.0;
+                    let page = self
+                        .pages
+                        .get_mut(index as usize)
+                        .expect("Got I/O response for a page that does not exist");
+
+                    page.abort(error.error, error.action, error.attachment.1);
+                }
+            }
+        }
+    }
+
+    fn process_actions(&mut self) {
+        while let Some(action) = self.io_queue.pop_queued() {
+            match action {
+                Action::Query(Query { buf, after_seq_no, tx }) => {
+                    // Find the page that actually contains the requested logs.
+                    let mut prev = None;
+                    loop {
+                        // Next of the next page to check.
+                        let index = prev.unwrap_or(self.next);
+
+                        // Check if we are just rotating over and over again.
+                        if prev.is_some() && index == self.next {
+                            tx.send(buf, Err(QueryError::Trimmed(after_seq_no)));
+                            break;
+                        }
+
+                        // Get the next page to check.
+                        let page = &mut self.pages[index];
+                        let Some(state) = page.state() else {
+                            // There is no page that contains the requested range of logs.
+                            tx.send(buf, Err(QueryError::Trimmed(after_seq_no)));
+                            break;
+                        };
+
+                        // If the page could contain requested logs, we attempt to read it.
+                        if state.after_seq_no <= after_seq_no {
+                            let result = page.query(Query { buf, after_seq_no, tx }, &mut self.io_queue);
+                            assert!(!matches!(result, ActionIo::Overflow));
+                            break;
+                        }
+
+                        // Go back pages and check again.
+                        let next_prev = if index == 0 { self.pages.len() - 1 } else { index - 1 };
+                        prev = Some(next_prev);
+                    }
+                }
+
+                Action::Append(append) => {
+                    // Latest page is the page where all the writes happen.
+                    // And this page must always be initialized, rules.
+                    let page = &mut self.pages[self.next];
+                    assert!(page.is_initialized(), "Writeable page must be initialized");
+
+                    // If the current page is full, rollover to the new page.
+                    if let ActionIo::Overflow = page.append(append, &mut self.io_queue) {
+                        // Fetch the state of the previous page.
+                        // We need this to link the sequence numbers for the next page.
+                        let state = page.state().expect("Latest page should be initialized");
+
+                        // Fetch the next page in the ring buffer.
+                        let next = self.next + 1;
+                        let next = if next >= self.pages.len() { 0 } else { next };
+                        let next_page = &mut self.pages[next];
+
+                        // The the page is currently initialized, it needs to be
+                        // wiped clean for the new set of logs.
+                        if next_page.is_initialized() {
+                            let result = next_page.reset(&mut self.io_queue);
+                            assert!(!matches!(result, ActionIo::Overflow));
+                            continue; // Append will be retried after page reset.
+                        }
+
+                        // If the page is currently uninitialized, nothing else to
+                        // do other than initialize the next page and start using it.
+                        assert!(next_page.initialize(state.prev_seq_no));
+                        self.next = next; // Append will be retried whenever.
+                    }
+                }
+            }
         }
     }
 
     fn submit_actions(&mut self) {
         // Submit the I/O request into the runtime.
         // Attempt to fully saturate the io-uring.
-        while let Some(action) = self.io_queue.dequeue_issued() {
+        while let Some(action) = self.io_queue.pop_issued() {
             let attachment = (action.id, action.ctx);
             if let Err(((id, ctx), action)) = self.runtime.push(action.action, attachment) {
                 // I/O runtime doesn't have enough space for more entries.
@@ -187,7 +253,7 @@ impl WorkerState {
         };
 
         // Queue up the awaited action.
-        self.io_queue.pending(action);
+        self.io_queue.queue(action);
     }
 
     fn try_queue_actions(&mut self) {
@@ -203,7 +269,12 @@ impl WorkerState {
 
             // Queue up the newly discovered action.
             remaining -= 1;
-            self.io_queue.pending(action);
+            self.io_queue.queue(action);
+        }
+
+        // Retry pending actions in this iteration.
+        while let Some(action) = self.io_queue.pop_reprocess() {
+            self.io_queue.queue(action);
         }
     }
 }
