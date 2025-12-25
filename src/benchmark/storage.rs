@@ -1,7 +1,14 @@
 //! Definition of benchmarks for I/O uring runtime.
 
 use clap::Parser;
-use std::time::{Duration, Instant};
+use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
+use std::{
+    sync::{
+        Arc,
+        atomic::{AtomicU64, Ordering},
+    },
+    time::{Duration, Instant},
+};
 use tokio::fs::create_dir_all;
 use waldo::{
     log::Log,
@@ -29,15 +36,15 @@ struct Arguments {
     pool_size: u16,
 
     /// Maximum number of logs in a page.
-    #[arg(long, default_value = "10000000")]
+    #[arg(long, default_value = "1000000")]
     page_capacity: u64,
 
     /// Maximum size of file backing a page in GB.
-    #[arg(long, default_value = "4")]
+    #[arg(long, default_value = "1")]
     page_file_capacity_gb: u64,
 
     /// Maximum size of index backing a page.
-    #[arg(long, default_value = "100000")]
+    #[arg(long, default_value = "10000")]
     page_index_capacity: usize,
 
     /// Maximum gap between indexed log records.
@@ -49,7 +56,7 @@ struct Arguments {
     index_sparse_bytes: usize,
 
     /// Maximum number of logs to append in benchmark.
-    #[arg(long, default_value = "100000000")]
+    #[arg(long, default_value = "10000000")]
     count: u64,
 
     /// Size of payload of a log record.
@@ -112,6 +119,48 @@ async fn main() -> anyhow::Result<()> {
     // Open storage at the given path.
     let storage = Storage::create(&args.path, 0, Options::from(&args))?;
 
+    // To track progress.
+    let appended_logs = Arc::new(AtomicU64::new(0));
+
+    // Thread to print progress of benchmark.
+    let progress_logs = appended_logs.clone();
+    let progress = std::thread::spawn(move || {
+        let pb = MultiProgress::new();
+
+        // Define all the progress bars.
+        let count_pd = pb.add(ProgressBar::new(count));
+        let size_pd = pb.add(ProgressBar::new(count * log_size as u64));
+
+        size_pd.set_style(
+            ProgressStyle::default_bar()
+                .template("[{elapsed_precise}] [{wide_bar:.cyan/blue}] {bytes}/{total_bytes} ({eta})")?
+                .progress_chars("#>-"),
+        );
+
+        count_pd.set_style(
+            ProgressStyle::with_template("[{elapsed_precise}] [{wide_bar:.cyan/blue}] {pos}/{len} ({eta}")?
+                .progress_chars("#>-"),
+        );
+
+        // Keep the progress bar updated while benchmark is in progress.
+        loop {
+            // Update progress bar.
+            let progress = progress_logs.load(Ordering::Relaxed);
+            count_pd.set_position(progress);
+            size_pd.set_position(progress * log_size as u64);
+
+            // Quit when benchmark is complete.
+            if progress >= count {
+                break;
+            }
+
+            // Sleep for a bit before next iteration.
+            std::thread::sleep(Duration::from_secs(1));
+        }
+
+        Ok::<_, anyhow::Error>(())
+    });
+
     // Number of workers participating in the benchmark.
     let mut workers = Vec::new();
 
@@ -138,6 +187,7 @@ async fn main() -> anyhow::Result<()> {
 
                 // Append the next set of bytes.
                 session.append(&logs).await?;
+                appended_logs.fetch_add(batch_size as _, Ordering::Relaxed);
             }
 
             Ok::<_, anyhow::Error>(())
@@ -172,6 +222,9 @@ async fn main() -> anyhow::Result<()> {
     for worker in workers {
         worker.await??;
     }
+
+    // Wait for the progress bar thread to complete.
+    progress.join().expect("Progress bar thread completed in error")?;
 
     // For calculating rates.
     let seconds = start.elapsed().as_secs_f64();

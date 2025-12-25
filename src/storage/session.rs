@@ -73,8 +73,9 @@ impl<T> From<flume::SendError<T>> for AppendError {
     }
 }
 
-/// A session represents a long lived connection to storage. It allows one to
-/// append and query log records from storage.
+/// A long lived connection to storage.
+///
+/// A session allows one to append and query log records from storage.
 ///
 /// Note that a session borrows limited resources, you limit creation of new
 /// sessions by holding on to a session. So depending on how to you plan to use

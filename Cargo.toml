@@ -4,7 +4,7 @@ version = "0.1.0"
 edition = "2024"
 
 [features]
-benchmark = ["dep:clap", "dep:tokio", "dep:anyhow"]
+benchmark = ["dep:clap", "dep:tokio", "dep:anyhow", "dep:indicatif"]
 
 [[bin]]
 name = "bench_runtime"
@@ -28,6 +28,7 @@ oneshot = { version = "0.1", features = ["async"] }
 anyhow = { version = "1.0", optional = true }
 clap = { version = "4.5", optional = true, features = ["derive"] }
 tokio = { version = "1.48", optional = true, features = ["full"] }
+indicatif = { version = "0.18", optional = true }
 
 [profile.bench]
 debug = true
