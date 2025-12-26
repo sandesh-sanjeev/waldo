@@ -19,8 +19,8 @@ required-features = ["benchmark"]
 [dependencies]
 libc = "0.2"
 flume = "0.12"
-io-uring = "0.7"
 memmap2 = "0.9"
+io-uring = "0.7"
 thiserror = "2.0"
 oneshot = { version = "0.1", features = ["async"] }
 

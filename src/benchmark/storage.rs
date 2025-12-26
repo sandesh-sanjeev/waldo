@@ -24,7 +24,7 @@ struct Arguments {
     path: String,
 
     /// Maximum number of pages in storage.
-    #[arg(long, default_value = "4")]
+    #[arg(long, default_value = "8")]
     ring_size: u32,
 
     /// Maximum concurrency supported by storage.
@@ -36,7 +36,7 @@ struct Arguments {
     pool_size: u16,
 
     /// Maximum number of logs in a page.
-    #[arg(long, default_value = "1000000")]
+    #[arg(long, default_value = "2000000")]
     page_capacity: u64,
 
     /// Maximum size of file backing a page in GB.
@@ -44,7 +44,7 @@ struct Arguments {
     page_file_capacity_gb: u64,
 
     /// Maximum size of index backing a page.
-    #[arg(long, default_value = "10000")]
+    #[arg(long, default_value = "20000")]
     page_index_capacity: usize,
 
     /// Maximum gap between indexed log records.
@@ -60,7 +60,7 @@ struct Arguments {
     count: u64,
 
     /// Size of payload of a log record.
-    #[arg(long, default_value = "250")]
+    #[arg(long, default_value = "492")]
     log_size: usize,
 
     /// Numbers of readers in benchmark.
@@ -68,11 +68,11 @@ struct Arguments {
     readers: u32,
 
     /// Milliseconds between append operations.
-    #[arg(long, default_value = "50")]
+    #[arg(long, default_value = "100")]
     append_delay: u64,
 
     /// Milliseconds between query operations.
-    #[arg(long, default_value = "50")]
+    #[arg(long, default_value = "100")]
     query_delay: u64,
 }
 
@@ -129,24 +129,31 @@ async fn main() -> anyhow::Result<()> {
 
         // Define all the progress bars.
         let count_pd = pb.add(ProgressBar::new(count));
-        let size_pd = pb.add(ProgressBar::new(count * log_size as u64));
-
-        size_pd.set_style(
-            ProgressStyle::default_bar()
-                .template("[{elapsed_precise}] [{wide_bar:.cyan/blue}] {bytes}/{total_bytes} ({eta})")?
+        count_pd.set_style(
+            ProgressStyle::with_template("[{elapsed_precise}] [{msg} Logs/s][{wide_bar:.cyan/blue}] {pos}/{len}")?
                 .progress_chars("#>-"),
         );
 
-        count_pd.set_style(
-            ProgressStyle::with_template("[{elapsed_precise}] [{wide_bar:.cyan/blue}] {pos}/{len} ({eta}")?
+        let size_pd = pb.add(ProgressBar::new(count * log_size as u64));
+        size_pd.set_style(
+            ProgressStyle::default_bar()
+                .template("[{eta_precise}] [{msg} MB/s] [{wide_bar:.cyan/blue}] {bytes}/{total_bytes}")?
                 .progress_chars("#>-"),
         );
 
         // Keep the progress bar updated while benchmark is in progress.
+        let mut prev_progress = 0;
         loop {
-            // Update progress bar.
+            // Figure out progress in benchmark.
             let progress = progress_logs.load(Ordering::Relaxed);
+            let new_progress = progress - prev_progress;
+            let progress_mbps = (new_progress as f64 * log_size as f64) / (1024.0 * 1024.0);
+
+            // Update the UI with progress.
+            count_pd.set_message(format!("{new_progress}"));
             count_pd.set_position(progress);
+
+            size_pd.set_message(format!("{progress_mbps:.2}"));
             size_pd.set_position(progress * log_size as u64);
 
             // Quit when benchmark is complete.
@@ -155,6 +162,7 @@ async fn main() -> anyhow::Result<()> {
             }
 
             // Sleep for a bit before next iteration.
+            prev_progress = progress;
             std::thread::sleep(Duration::from_secs(1));
         }
 
@@ -165,6 +173,8 @@ async fn main() -> anyhow::Result<()> {
     let mut workers = Vec::new();
 
     // Define writer.
+    // Write hangs on to the session for the entire duration of benchmark.
+    // This makes sure writer makes progress and is not subject to scheduling delays (most part).
     {
         let storage = storage.clone();
         let delay = Duration::from_millis(args.append_delay);
@@ -201,12 +211,12 @@ async fn main() -> anyhow::Result<()> {
         workers.push(tokio::spawn(async move {
             let mut prev_seq_no = 0;
             let mut interval = tokio::time::interval(delay);
-            let mut session = storage.session_async().await;
             while prev_seq_no < count {
                 // To run with a specific cadence.
                 interval.tick().await;
 
                 // Append the next set of bytes.
+                let mut session = storage.session_async().await;
                 for log in session.query(prev_seq_no).await? {
                     assert_eq!(prev_seq_no, log.prev_seq_no());
                     prev_seq_no = log.seq_no();
@@ -237,7 +247,7 @@ async fn main() -> anyhow::Result<()> {
     // Print stats for writer.
     let rate = count as f64 / seconds;
     let byte_rate = bytes_size / mbps;
-    println!("Writer: {rate:.2} Logs/s and {byte_rate:.2} MBps");
+    println!("Writer: {rate:.2} Logs/s and {byte_rate:.2} MB/s");
 
     // Print stats for readers.
     if args.readers > 0 {
