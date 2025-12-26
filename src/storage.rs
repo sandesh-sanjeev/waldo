@@ -96,26 +96,8 @@ impl Storage {
         })
     }
 
-    /// Create a new session.
-    ///
-    /// Note that this operation blocks till memory is available in the pool.
-    /// For a non-blocking variant use [`Storage::try_session`] or [`Storage::session_async`] for async.
-    pub async fn session(&self) -> Session<'_> {
-        let buf = self.buf_pool.take();
-        Session::new(buf, &self.tx)
-    }
-
-    /// Create a new session if one can be created without blocking.
-    ///
-    /// Note that this operation does not block waiting for memory to be available from the pool.
-    /// For a blocking variant use [`Storage::session`] or [`Storage::session_async`] for async.
-    pub async fn try_session(&self) -> Option<Session<'_>> {
-        let buf = self.buf_pool.try_take()?;
-        Some(Session::new(buf, &self.tx))
-    }
-
     /// Create a new session asynchronously.
-    pub async fn session_async(&self) -> Session<'_> {
+    pub async fn session(&self) -> Session<'_> {
         let buf = self.buf_pool.take_async().await;
         Session::new(buf, &self.tx)
     }
@@ -129,6 +111,16 @@ impl Storage {
             .read(true)
             .open(path.as_ref().join(format!("{index:0>10}.page")))
     }
+}
+
+/// Current state of storage.
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+pub struct StorageState {
+    pub after_seq_no: u64,
+    pub prev_seq_no: u64,
+    pub disk_size: u64,
+    pub log_count: u64,
+    pub index_count: u64,
 }
 
 /// Options to customize the behavior of storage.

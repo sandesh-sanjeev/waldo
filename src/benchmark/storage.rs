@@ -3,6 +3,7 @@
 use clap::Parser;
 use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
 use std::{
+    ops::AddAssign,
     sync::{
         Arc,
         atomic::{AtomicU64, Ordering},
@@ -28,11 +29,11 @@ struct Arguments {
     ring_size: u32,
 
     /// Maximum concurrency supported by storage.
-    #[arg(long, default_value = "256")]
+    #[arg(long, default_value = "64")]
     queue_depth: u16,
 
     /// Number of pre-allocated I/O buffers.
-    #[arg(long, default_value = "256")]
+    #[arg(long, default_value = "64")]
     pool_size: u16,
 
     /// Maximum number of logs in a page.
@@ -64,16 +65,8 @@ struct Arguments {
     log_size: usize,
 
     /// Numbers of readers in benchmark.
-    #[arg(long, default_value = "255")]
+    #[arg(long, default_value = "63")]
     readers: u32,
-
-    /// Milliseconds between append operations.
-    #[arg(long, default_value = "100")]
-    append_delay: u64,
-
-    /// Milliseconds between query operations.
-    #[arg(long, default_value = "100")]
-    query_delay: u64,
 }
 
 impl From<&Arguments> for Options {
@@ -177,16 +170,12 @@ async fn main() -> anyhow::Result<()> {
     // This makes sure writer makes progress and is not subject to scheduling delays (most part).
     {
         let storage = storage.clone();
-        let delay = Duration::from_millis(args.append_delay);
         workers.push(tokio::spawn(async move {
             let mut prev_seq_no = 0;
-            let mut interval = tokio::time::interval(delay);
+            let mut stats = Stats::default();
+            let mut session = storage.session().await;
             let mut logs = Vec::with_capacity(batch_size);
-            let mut session = storage.session_async().await;
             while prev_seq_no < count {
-                // To run with a specific cadence.
-                interval.tick().await;
-
                 // Logs to write to page.
                 logs.clear();
                 for _ in 0..batch_size {
@@ -196,64 +185,107 @@ async fn main() -> anyhow::Result<()> {
                 }
 
                 // Append the next set of bytes.
+                let start = Instant::now();
                 session.append(&logs).await?;
+
+                // Update for next iteration.
+                stats.appends += 1;
+                stats.append_time += start.elapsed();
                 appended_logs.fetch_add(batch_size as _, Ordering::Relaxed);
             }
 
-            Ok::<_, anyhow::Error>(())
+            Ok::<_, anyhow::Error>(stats)
         }));
     }
 
     // Define all the readers.
     for _ in 0..args.readers {
         let storage = storage.clone();
-        let delay = Duration::from_millis(args.query_delay);
         workers.push(tokio::spawn(async move {
             let mut prev_seq_no = 0;
-            let mut interval = tokio::time::interval(delay);
+            let mut stats = Stats::default();
+            let mut session = storage.session().await;
             while prev_seq_no < count {
-                // To run with a specific cadence.
-                interval.tick().await;
+                // Attempt to fetch the next set of logs.
+                let start = Instant::now();
+                let logs = session.query(prev_seq_no).await?;
 
-                // Append the next set of bytes.
-                let mut session = storage.session_async().await;
-                for log in session.query(prev_seq_no).await? {
+                // Consume logs queried from storage.
+                stats.queries += 1;
+                stats.query_time += start.elapsed();
+                for log in logs {
                     assert_eq!(prev_seq_no, log.prev_seq_no());
                     prev_seq_no = log.seq_no();
                 }
             }
 
-            Ok(())
+            Ok(stats)
         }));
     }
 
     // Wait for readers and writes to complete.
-    let start = Instant::now();
+    let mut stats = Stats::default();
     for worker in workers {
-        worker.await??;
+        stats += worker.await??;
     }
 
     // Wait for the progress bar thread to complete.
     progress.join().expect("Progress bar thread completed in error")?;
-
-    // For calculating rates.
-    let seconds = start.elapsed().as_secs_f64();
-    let seconds = if seconds == 0.0 { 1.0 } else { seconds };
-    let mbps = seconds * (1024.0 * 1024.0);
-
-    // Total number of bytes in logs.
-    let bytes_size = (count * (args.log_size as u64 + 20)) as f64;
-
-    // Print stats for writer.
-    let rate = count as f64 / seconds;
-    let byte_rate = bytes_size / mbps;
-    println!("Writer: {rate:.2} Logs/s and {byte_rate:.2} MB/s");
-
-    // Print stats for readers.
-    if args.readers > 0 {
-        let rate = (count as f64 * args.readers as f64) / seconds;
-        let byte_rate = (bytes_size * args.readers as f64) / mbps;
-        println!("{} Readers: {rate:.2} Logs/s and {byte_rate:.2} MB/s", args.readers);
-    }
+    stats.append_stats(count, log_size);
+    stats.query_stats(count, log_size, args.readers);
     Ok(())
+}
+
+/// Stats from a benchmark worker.
+#[derive(Debug, Copy, Clone, PartialEq, Eq, Default)]
+struct Stats {
+    queries: u64,
+    appends: u64,
+    query_time: Duration,
+    append_time: Duration,
+}
+
+impl Stats {
+    fn append_stats(&self, count: u64, log_size: usize) {
+        // Total time spent in storage.
+        let seconds = self.append_time.as_secs_f64();
+        let seconds = if seconds == 0.0 { 1.0 } else { seconds };
+
+        // Stats for query.
+        let tps = self.appends as f64 / seconds;
+        let mbps = (count as f64 * log_size as f64) / (seconds * 1024.0 * 1024.0);
+
+        // Calculate avg latency for the operation.
+        let appends = if self.appends == 0 { 1 } else { self.appends };
+        let latency = self.append_time.as_millis() / appends as u128;
+        println!("Writer | {latency} ms, {tps:.2} TPS and {mbps:.2} MB/s");
+    }
+
+    fn query_stats(&self, count: u64, log_size: usize, readers: u32) {
+        // Total time spent in storage.
+        let seconds = self.query_time.as_secs_f64();
+        let seconds = if seconds == 0.0 { 1.0 } else { seconds };
+
+        // Stats for query.
+        let tps = self.queries as f64 / seconds;
+
+        // Total mbps across all readers.
+        let query_time = seconds / readers as f64;
+        let total_count = count as f64 * readers as f64;
+        let mbps = (total_count * log_size as f64) / (query_time * 1024.0 * 1024.0);
+
+        // Calculate avg latency for the operation.
+        let queries = if self.queries == 0 { 1 } else { self.queries };
+        let latency = self.query_time.as_millis() / queries as u128;
+        println!("Readers {readers}  | {latency} ms, {tps:.2} TPS and {mbps:.2} MB/s");
+    }
+}
+
+impl AddAssign for Stats {
+    fn add_assign(&mut self, rhs: Self) {
+        self.queries += rhs.queries;
+        self.appends += rhs.appends;
+        self.query_time += rhs.query_time;
+        self.append_time += rhs.append_time;
+    }
 }
