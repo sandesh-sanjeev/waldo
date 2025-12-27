@@ -13,7 +13,7 @@ where
     seq_no: u64,
     prev_seq_no: u64,
     data: Cow<'a, [u8]>,
-    hash: u32,
+    data_hash: u32,
 }
 
 impl Log<'_> {
@@ -32,7 +32,7 @@ impl Log<'_> {
         Log {
             seq_no,
             prev_seq_no,
-            hash: Self::gen_hash(seq_no, prev_seq_no, data),
+            data_hash: Self::gen_hash(data),
             data: Cow::Borrowed(data),
         }
     }
@@ -48,14 +48,14 @@ impl Log<'_> {
         Log {
             seq_no,
             prev_seq_no,
-            hash: Self::gen_hash(seq_no, prev_seq_no, &data),
+            data_hash: Self::gen_hash(&data),
             data: Cow::Owned(data),
         }
     }
 
     /// Registered hash of the log record.
-    pub fn hash(&self) -> u32 {
-        self.hash
+    pub fn data_hash(&self) -> u32 {
+        self.data_hash
     }
 
     /// Sequence number of the log record.
@@ -141,18 +141,14 @@ impl Log<'_> {
         Some(Log {
             seq_no: header.seq_no,
             prev_seq_no: header.prev_seq_no,
-            hash: header.hash,
+            data_hash: header.data_hash,
             data: Cow::Borrowed(data),
         })
     }
 
     /// Generate hash for the log record.
-    fn gen_hash(seq_no: u64, prev_seq_no: u64, data: &[u8]) -> u32 {
-        let mut hasher = xxhash_rust::xxh3::Xxh3::new();
-        hasher.update(&seq_no.to_be_bytes());
-        hasher.update(&prev_seq_no.to_be_bytes());
-        hasher.update(data);
-        hasher.digest() as u32
+    fn gen_hash(data: &[u8]) -> u32 {
+        xxhash_rust::xxh3::xxh3_64(data) as u32
     }
 }
 
@@ -243,10 +239,10 @@ impl<'a> Iterator for CheckedLogIter<'a> {
             }
 
             // Make sure log bytes are intact.
-            let hash = Log::gen_hash(log.seq_no(), log.prev_seq_no(), log.data());
-            if hash != log.hash() {
+            let hash = Log::gen_hash(log.data());
+            if hash != log.data_hash() {
                 self.is_error = true;
-                return Some(Err(Error::Corruption(log.seq_no(), log.hash(), hash)));
+                return Some(Err(Error::Corruption(log.seq_no(), log.data_hash(), hash)));
             }
 
             // Alright, everything looks good!
@@ -262,7 +258,7 @@ impl<'a> Iterator for CheckedLogIter<'a> {
 struct Header {
     seq_no: u64,
     prev_seq_no: u64,
-    hash: u32,
+    data_hash: u32,
     data_size: u32,
 }
 
@@ -272,7 +268,7 @@ impl From<&Log<'_>> for Header {
             seq_no: value.seq_no(),
             prev_seq_no: value.prev_seq_no(),
             data_size: value.data().len() as u32,
-            hash: value.hash,
+            data_hash: value.data_hash(),
         }
     }
 }

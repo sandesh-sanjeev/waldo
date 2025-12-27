@@ -60,11 +60,11 @@ struct Arguments {
     count: u64,
 
     /// Size of payload of a log record.
-    #[arg(long, default_value = "492")]
+    #[arg(long, default_value = "488")]
     log_size: usize,
 
     /// Numbers of readers in benchmark.
-    #[arg(long, default_value = "2048")]
+    #[arg(long, default_value = "2500")]
     readers: u32,
 
     /// Delay between storage actions in milliseconds.
