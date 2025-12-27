@@ -1,7 +1,7 @@
 //! A long lived connection to storage.
 
 use crate::{
-    log::Log,
+    log::{CheckedLogIter, Log},
     runtime::IoBuf,
     storage::{Action, FateError},
 };
@@ -23,6 +23,10 @@ pub enum QueryError {
     /// Error when requested logs are trimmed from storage.
     #[error("Requested range of log after: {0} are trimmed")]
     Trimmed(u64),
+
+    /// Error when logs are appended out of sequence.
+    #[error("Log record: {0} has prev: {1}, but expected prev: {2}")]
+    Sequence(u64, u64, u64),
 }
 
 impl From<FateError> for QueryError {
@@ -149,7 +153,7 @@ impl Session<'_> {
     /// # Arguments
     ///
     /// * `after_seq_no` - Query for logs after this sequence number.
-    pub async fn query(&mut self, after_seq_no: u64) -> Result<impl Iterator<Item = Log<'_>>, QueryError> {
+    pub async fn query(&mut self, after_seq_no: u64) -> Result<CheckedLogIter<'_>, QueryError> {
         // Take ownership of the buffer to share with storage.
         let Some(buf) = self.take_empty_buf() else {
             return Err(QueryError::Fault("Buffer does not exist in a session"));
@@ -166,7 +170,7 @@ impl Session<'_> {
 
         // Return reference to all the log records read from query.
         let buf = self.buf.as_ref().expect("Associated buffer must exist");
-        Ok(buf.into_iter().filter(move |log| log.seq_no() > after_seq_no))
+        Ok(CheckedLogIter::new(buf, after_seq_no))
     }
 
     /// Take an empty buffer associated with this session.

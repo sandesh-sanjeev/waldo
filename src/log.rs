@@ -13,6 +13,7 @@ where
     seq_no: u64,
     prev_seq_no: u64,
     data: Cow<'a, [u8]>,
+    hash: u32,
 }
 
 impl Log<'_> {
@@ -31,6 +32,7 @@ impl Log<'_> {
         Log {
             seq_no,
             prev_seq_no,
+            hash: Self::gen_hash(seq_no, prev_seq_no, data),
             data: Cow::Borrowed(data),
         }
     }
@@ -46,8 +48,14 @@ impl Log<'_> {
         Log {
             seq_no,
             prev_seq_no,
+            hash: Self::gen_hash(seq_no, prev_seq_no, &data),
             data: Cow::Owned(data),
         }
+    }
+
+    /// Registered hash of the log record.
+    pub fn hash(&self) -> u32 {
+        self.hash
     }
 
     /// Sequence number of the log record.
@@ -130,7 +138,21 @@ impl Log<'_> {
         let (data, _) = rest.split_at(data_size);
 
         // Return fully deserialized log record.
-        Some(Log::new_borrowed(header.seq_no, header.prev_seq_no, data))
+        Some(Log {
+            seq_no: header.seq_no,
+            prev_seq_no: header.prev_seq_no,
+            hash: header.hash,
+            data: Cow::Borrowed(data),
+        })
+    }
+
+    /// Generate hash for the log record.
+    fn gen_hash(seq_no: u64, prev_seq_no: u64, data: &[u8]) -> u32 {
+        let mut hasher = xxhash_rust::xxh3::Xxh3::new();
+        hasher.update(&seq_no.to_be_bytes());
+        hasher.update(&prev_seq_no.to_be_bytes());
+        hasher.update(data);
+        hasher.digest() as u32
     }
 }
 
@@ -157,14 +179,91 @@ impl<'a> Iterator for LogIter<'a> {
     }
 }
 
+/// Different types of errors when validating a log record.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+pub enum Error {
+    /// Error when an out of sequence log is detected.
+    #[error("Log record: {0} has prev: {1}, but expected prev: {2}")]
+    Sequence(u64, u64, u64),
+
+    /// Error when a corrupted log record is detected.
+    #[error("Log record: {0} has hash: {1}, but expected hash: {2}")]
+    Corruption(u64, u32, u32),
+}
+
+/// An iterator that validates logs before handing them out.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CheckedLogIter<'a> {
+    bytes: &'a [u8],
+    prev_seq_no: u64,
+    is_error: bool,
+}
+
+impl CheckedLogIter<'_> {
+    /// Create a new checked iterator.
+    ///
+    /// # Arguments
+    ///
+    /// * `bytes` - Bytes to iterate through.
+    /// * `prev_seq_no` - Sequence number of the immediately previous log.
+    pub(crate) fn new(bytes: &[u8], prev_seq_no: u64) -> CheckedLogIter<'_> {
+        CheckedLogIter {
+            bytes,
+            prev_seq_no,
+            is_error: false,
+        }
+    }
+}
+
+impl<'a> Iterator for CheckedLogIter<'a> {
+    type Item = Result<Log<'a>, Error>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        // Return early if this iterator already completed with an error.
+        if self.is_error {
+            return None;
+        }
+
+        // There might be a few excess logs at the beginning.
+        // We'll need to spin a few times to skip those.
+        loop {
+            // Attempt to deserialize the next set of bytes into log.
+            let log = Log::read(self.bytes)?;
+            self.bytes = self.bytes.split_at(log.size()).1;
+
+            // Skip the excess logs mentioned above.
+            if log.seq_no() <= self.prev_seq_no {
+                continue;
+            }
+
+            // Make sure unbroken sequence of logs.
+            if self.prev_seq_no != log.prev_seq_no() {
+                self.is_error = true;
+                return Some(Err(Error::Sequence(log.seq_no(), log.prev_seq_no(), self.prev_seq_no)));
+            }
+
+            // Make sure log bytes are intact.
+            let hash = Log::gen_hash(log.seq_no(), log.prev_seq_no(), log.data());
+            if hash != log.hash() {
+                self.is_error = true;
+                return Some(Err(Error::Corruption(log.seq_no(), log.hash(), hash)));
+            }
+
+            // Alright, everything looks good!
+            self.prev_seq_no = log.seq_no();
+            return Some(Ok(log));
+        }
+    }
+}
+
 /// Header of a log record.
 #[repr(C)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Pod, Zeroable)]
 struct Header {
     seq_no: u64,
     prev_seq_no: u64,
+    hash: u32,
     data_size: u32,
-    padding: u32,
 }
 
 impl From<&Log<'_>> for Header {
@@ -173,7 +272,7 @@ impl From<&Log<'_>> for Header {
             seq_no: value.seq_no(),
             prev_seq_no: value.prev_seq_no(),
             data_size: value.data().len() as u32,
-            padding: 0, // TODO: Add checksum here.
+            hash: value.hash,
         }
     }
 }

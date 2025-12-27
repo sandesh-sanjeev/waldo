@@ -3,7 +3,6 @@
 use clap::Parser;
 use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
 use std::{
-    ops::AddAssign,
     sync::{
         Arc,
         atomic::{AtomicU64, Ordering},
@@ -57,7 +56,7 @@ struct Arguments {
     index_sparse_bytes: usize,
 
     /// Maximum number of logs to append in benchmark.
-    #[arg(long, default_value = "5000000")]
+    #[arg(long, default_value = "1000000")]
     count: u64,
 
     /// Size of payload of a log record.
@@ -65,11 +64,11 @@ struct Arguments {
     log_size: usize,
 
     /// Numbers of readers in benchmark.
-    #[arg(long, default_value = "1000")]
+    #[arg(long, default_value = "2048")]
     readers: u32,
 
     /// Delay between storage actions in milliseconds.
-    #[arg(long, default_value = "110")]
+    #[arg(long, default_value = "200")]
     delay: u64,
 }
 
@@ -172,6 +171,30 @@ async fn main() -> anyhow::Result<()> {
     // Number of workers participating in the benchmark.
     let mut workers = Vec::new();
 
+    // Define all the readers.
+    for _ in 0..args.readers {
+        let storage = storage.clone();
+        workers.push(tokio::spawn(async move {
+            let mut prev_seq_no = 0;
+            let mut interval = tokio::time::interval(delay);
+            while prev_seq_no < count {
+                // Wait for enough time to have passed.
+                interval.tick().await;
+
+                // Attempt to fetch the next set of logs.
+                let mut session = storage.session().await;
+                let logs = session.query(prev_seq_no).await?;
+
+                // Consume logs queried from storage.
+                for log in logs {
+                    prev_seq_no = log?.seq_no();
+                }
+            }
+
+            Ok(())
+        }));
+    }
+
     // Define writer.
     // Write hangs on to the session for the entire duration of benchmark.
     // This makes sure writer makes progress and is not subject to scheduling delays (most part).
@@ -179,7 +202,6 @@ async fn main() -> anyhow::Result<()> {
         let storage = storage.clone();
         workers.push(tokio::spawn(async move {
             let mut prev_seq_no = 0;
-            let mut stats = Stats::default();
             let mut interval = tokio::time::interval(delay);
             let mut logs = Vec::with_capacity(batch_size);
             while prev_seq_no < count {
@@ -195,122 +217,46 @@ async fn main() -> anyhow::Result<()> {
                 }
 
                 // Append the next set of bytes.
-                let start = Instant::now();
                 let mut session = storage.session().await;
                 session.append(&logs).await?;
-
-                // Update for next iteration.
-                stats.appends += 1;
-                stats.appended += logs.len() as u64;
-                stats.append_time += start.elapsed();
                 appended_logs.fetch_add(batch_size as _, Ordering::Relaxed);
             }
 
-            Ok::<_, anyhow::Error>(stats)
-        }));
-    }
-
-    // Define all the readers.
-    for _ in 0..args.readers {
-        let storage = storage.clone();
-        workers.push(tokio::spawn(async move {
-            let mut prev_seq_no = 0;
-            let mut stats = Stats::default();
-            let mut interval = tokio::time::interval(delay);
-            while prev_seq_no < count {
-                // Wait for enough time to have passed.
-                interval.tick().await;
-
-                // Attempt to fetch the next set of logs.
-                let start = Instant::now();
-                let mut session = storage.session().await;
-                let logs = session.query(prev_seq_no).await?;
-
-                // Consume logs queried from storage.
-                stats.queries += 1;
-                stats.query_time += start.elapsed();
-                for log in logs {
-                    assert_eq!(prev_seq_no, log.prev_seq_no());
-                    prev_seq_no = log.seq_no();
-                    stats.queried += 1;
-                }
-            }
-
-            Ok(stats)
+            Ok::<_, anyhow::Error>(())
         }));
     }
 
     // Wait for readers and writes to complete.
-    let mut stats = Stats::default();
+    let start = Instant::now();
     for worker in workers {
-        stats += worker.await??;
+        worker.await??;
     }
+
+    // Total number of readers in the test.
+    let readers = args.readers as f64;
+
+    // Total time spent in storage.
+    let time = start.elapsed();
+    let seconds = time.as_secs_f64();
+    let seconds = if seconds == 0.0 { 1.0 } else { seconds };
+    let per_mb_s = seconds * 1024.0 * 1024.0;
+
+    // Total number of things written to storage.
+    let w_count = count as f64;
+    let r_count = w_count * readers;
+    let w_bytes = log_size as f64 * w_count;
+    let r_bytes = readers * w_bytes;
+
+    // Calculate rates
+    let w_tps = count as f64 / seconds;
+    let w_mbps = w_bytes as f64 / per_mb_s;
+    let r_tps = r_count as f64 / seconds;
+    let r_mbps = r_bytes as f64 / per_mb_s;
 
     // Wait for the progress bar thread to complete.
     progress.join().expect("Progress bar thread completed in error")?;
-    stats.append_stats(log_size);
-    stats.query_stats(args.readers, log_size);
+    println!("{time:?} | {readers} Readers | {count} Logs | {delay:?} Delay");
+    println!("Writer | {w_tps:.2} Logs/s, {w_mbps:.2} MB/s");
+    println!("Readers | {r_tps:.2} Logs/s, {r_mbps:.2} MB/s");
     Ok(())
-}
-
-/// Stats from a benchmark worker.
-#[derive(Debug, Copy, Clone, PartialEq, Eq, Default)]
-struct Stats {
-    queries: u64,
-    appends: u64,
-    queried: u64,
-    appended: u64,
-    query_time: Duration,
-    append_time: Duration,
-}
-
-impl Stats {
-    fn append_stats(&self, log_size: usize) {
-        // Total time spent in storage.
-        let seconds = self.append_time.as_secs_f64();
-        let seconds = if seconds == 0.0 { 1.0 } else { seconds };
-
-        // Stats for query.
-        let tps = self.appends as f64 / seconds;
-        let lps = self.appended as f64 / seconds;
-        let mbps = (log_size as f64 * self.appended as f64) / (seconds * 1024.0 * 1024.0);
-
-        // Calculate avg latency for the operation.
-        let appends = if self.appends == 0 { 1 } else { self.appends };
-        let latency = self.append_time.as_millis() / appends as u128;
-        println!("Writer | {latency} ms, {tps:.2} TPS, {lps:.2} Logs/s and {mbps:.2} MB/s");
-    }
-
-    fn query_stats(&self, readers: u32, log_size: usize) {
-        // Don't attempt to print stats if there were no readers.
-        if readers == 0 {
-            return;
-        }
-
-        // Total time spent in storage.
-        let seconds = self.query_time.as_secs_f64();
-        let seconds = if seconds == 0.0 { 1.0 } else { seconds };
-        let query_time = seconds / readers as f64;
-
-        // Stats for query using avg query time (to get aggregate results).
-        let tps = self.queries as f64 / query_time;
-        let lps = self.queried as f64 / query_time;
-        let mbps = (log_size as f64 * self.queried as f64) / (query_time * 1024.0 * 1024.0);
-
-        // Calculate avg latency for the operation.
-        let queries = if self.queries == 0 { 1 } else { self.queries };
-        let latency = self.query_time.as_millis() / queries as u128;
-        println!("Readers {readers}  | {latency} ms, {tps:.2} TPS, {lps:.2} Logs/s a and {mbps:.2} MB/s");
-    }
-}
-
-impl AddAssign for Stats {
-    fn add_assign(&mut self, rhs: Self) {
-        self.queries += rhs.queries;
-        self.appends += rhs.appends;
-        self.queried += rhs.queried;
-        self.appended += rhs.appended;
-        self.query_time += rhs.query_time;
-        self.append_time += rhs.append_time;
-    }
 }
