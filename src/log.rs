@@ -1,8 +1,7 @@
 //! User supplied sequenced log record.
 
-use bytemuck::{Pod, Zeroable};
-
 use crate::runtime::IoBuf;
+use bytemuck::{Pod, Zeroable};
 use std::borrow::Cow;
 
 /// A sequenced log record that can be appended into Journal.
@@ -66,16 +65,26 @@ impl Log<'_> {
         &self.data
     }
 
-    pub(crate) fn size(&self) -> usize {
+    /// Serialized size of the log record.
+    pub fn size(&self) -> usize {
         let size = self.true_size();
         let padding = size % 8;
         size + padding
     }
 
+    /// True size of the log record, excluding padding.
     pub(crate) fn true_size(&self) -> usize {
         Header::SIZE + self.data.len()
     }
 
+    /// Write serialized log bytes into a buffer.
+    ///
+    /// Returns true when bytes were successfully written, false otherwise.
+    /// This happens when buffer runs out of space for log bytes.
+    ///
+    /// # Arguments
+    ///
+    /// * `buf` - Destination buffer to write bytes.
     pub(crate) fn write(&self, buf: &mut IoBuf) -> bool {
         // Make sure buffer has enough remaining bytes.
         let size = self.size();
@@ -96,6 +105,11 @@ impl Log<'_> {
         true
     }
 
+    /// Read next N bytes into a Log record, if there is one.
+    ///
+    /// # Arguments
+    ///
+    /// * `bytes` - Source byte slice to fetch bytes.
     pub(crate) fn read(bytes: &[u8]) -> Option<Log<'_>> {
         // Not enough bytes for next log header.
         if bytes.len() < Header::SIZE {
@@ -103,7 +117,7 @@ impl Log<'_> {
         }
 
         // Cast next N bytes into log header.
-        let (header, rest) = unsafe { bytes.split_at_unchecked(Header::SIZE) };
+        let (header, rest) = bytes.split_at(Header::SIZE);
         let header = Header::from_bytes(header);
 
         // Check if there is enough space associated log bytes.
@@ -113,7 +127,7 @@ impl Log<'_> {
         }
 
         // Cast next N bytes as log payload.
-        let (data, _) = unsafe { rest.split_at_unchecked(data_size) };
+        let (data, _) = rest.split_at(data_size);
 
         // Return fully deserialized log record.
         Some(Log::new_borrowed(header.seq_no, header.prev_seq_no, data))
@@ -165,7 +179,8 @@ impl From<&Log<'_>> for Header {
 }
 
 impl Header {
-    const SIZE: usize = (2 * size_of::<u64>()) + (2 * size_of::<u32>());
+    /// A header has fixed set of attributes with fixed sizes.
+    const SIZE: usize = size_of::<Self>();
 
     fn bytes_of(&self) -> &[u8] {
         bytemuck::bytes_of(self)

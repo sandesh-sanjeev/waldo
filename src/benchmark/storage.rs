@@ -29,23 +29,23 @@ struct Arguments {
     ring_size: u32,
 
     /// Maximum concurrency supported by storage.
-    #[arg(long, default_value = "128")]
+    #[arg(long, default_value = "256")]
     queue_depth: u16,
 
     /// Number of pre-allocated I/O buffers.
-    #[arg(long, default_value = "128")]
+    #[arg(long, default_value = "256")]
     pool_size: u16,
 
     /// Maximum number of logs in a page.
-    #[arg(long, default_value = "4000000")]
+    #[arg(long, default_value = "2000000")]
     page_capacity: u64,
 
     /// Maximum size of file backing a page in GB.
-    #[arg(long, default_value = "2")]
+    #[arg(long, default_value = "1")]
     page_file_capacity_gb: u64,
 
     /// Maximum size of index backing a page.
-    #[arg(long, default_value = "40000")]
+    #[arg(long, default_value = "20000")]
     page_index_capacity: usize,
 
     /// Maximum gap between indexed log records.
@@ -57,7 +57,7 @@ struct Arguments {
     index_sparse_bytes: usize,
 
     /// Maximum number of logs to append in benchmark.
-    #[arg(long, default_value = "50000000")]
+    #[arg(long, default_value = "5000000")]
     count: u64,
 
     /// Size of payload of a log record.
@@ -65,8 +65,12 @@ struct Arguments {
     log_size: usize,
 
     /// Numbers of readers in benchmark.
-    #[arg(long, default_value = "127")]
+    #[arg(long, default_value = "1000")]
     readers: u32,
+
+    /// Delay between storage actions in milliseconds.
+    #[arg(long, default_value = "110")]
+    delay: u64,
 }
 
 impl From<&Arguments> for Options {
@@ -95,6 +99,9 @@ async fn main() -> anyhow::Result<()> {
     // Parse command line arguments.
     let args = Arguments::parse();
     let opts = Options::from(&args);
+
+    // Amount of time to sleep between iterations.
+    let delay = Duration::from_millis(args.delay);
 
     // Random log data to use with log records.
     let count = args.count;
@@ -173,8 +180,12 @@ async fn main() -> anyhow::Result<()> {
         workers.push(tokio::spawn(async move {
             let mut prev_seq_no = 0;
             let mut stats = Stats::default();
+            let mut interval = tokio::time::interval(delay);
             let mut logs = Vec::with_capacity(batch_size);
             while prev_seq_no < count {
+                // Wait for enough time to have passed.
+                interval.tick().await;
+
                 // Logs to write to page.
                 logs.clear();
                 for _ in 0..batch_size {
@@ -205,7 +216,11 @@ async fn main() -> anyhow::Result<()> {
         workers.push(tokio::spawn(async move {
             let mut prev_seq_no = 0;
             let mut stats = Stats::default();
+            let mut interval = tokio::time::interval(delay);
             while prev_seq_no < count {
+                // Wait for enough time to have passed.
+                interval.tick().await;
+
                 // Attempt to fetch the next set of logs.
                 let start = Instant::now();
                 let mut session = storage.session().await;
@@ -277,7 +292,7 @@ impl Stats {
         let seconds = if seconds == 0.0 { 1.0 } else { seconds };
         let query_time = seconds / readers as f64;
 
-        // Stats for query.
+        // Stats for query using avg query time (to get aggregate results).
         let tps = self.queries as f64 / query_time;
         let lps = self.queried as f64 / query_time;
         let mbps = (log_size as f64 * self.queried as f64) / (query_time * 1024.0 * 1024.0);

@@ -33,6 +33,7 @@ tokio = { version = "1.48", optional = true, features = [
     "sync",
     "fs",
     "rt-multi-thread",
+    "time",
 ] }
 indicatif = { version = "0.18", optional = true }
 
