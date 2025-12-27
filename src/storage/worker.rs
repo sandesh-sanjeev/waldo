@@ -4,7 +4,7 @@ use crate::{
     runtime::IoRuntime,
     storage::{
         Action, Page,
-        action::{ActionCtx, IoQueue, PageIo, Query},
+        action::{ActionCtx, Append, IoQueue, PageIo, Query},
         page::ActionIo,
         session::QueryError,
     },
@@ -152,69 +152,102 @@ impl WorkerState {
     fn process_actions(&mut self) {
         while let Some(action) = self.io_queue.pop_queued() {
             match action {
-                Action::Query(Query { buf, after_seq_no, tx }) => {
-                    // Find the page that actually contains the requested logs.
-                    let mut prev = None;
-                    loop {
-                        // Next of the next page to check.
-                        let index = prev.unwrap_or(self.next);
-
-                        // Check if we are just rotating over and over again.
-                        if prev.is_some() && index == self.next {
-                            tx.send(buf, Err(QueryError::Trimmed(after_seq_no)));
-                            break;
-                        }
-
-                        // Get the next page to check.
-                        let page = &mut self.pages[index];
-                        let Some(state) = page.state() else {
-                            // There is no page that contains the requested range of logs.
-                            tx.send(buf, Err(QueryError::Trimmed(after_seq_no)));
-                            break;
-                        };
-
-                        // If the page could contain requested logs, we attempt to read it.
-                        if state.after_seq_no <= after_seq_no {
-                            let result = page.query(Query { buf, after_seq_no, tx }, &mut self.io_queue);
-                            assert!(!matches!(result, ActionIo::Overflow));
-                            break;
-                        }
-
-                        // Go back pages and check again.
-                        let next_prev = if index == 0 { self.pages.len() - 1 } else { index - 1 };
-                        prev = Some(next_prev);
-                    }
-                }
-
-                Action::Append(append) => {
-                    // Latest page is the page where all the writes happen.
-                    // And this page must always be initialized, rules.
-                    let page = &mut self.pages[self.next];
-                    if let ActionIo::Overflow = page.append(append, &mut self.io_queue) {
-                        // Fetch the state of the previous page.
-                        // We need this to link the sequence numbers for the next page.
-                        let state = page.state().expect("Latest page should be initialized");
-
-                        // Fetch the next page in the ring buffer.
-                        let next = self.next + 1;
-                        let next = if next >= self.pages.len() { 0 } else { next };
-                        let next_page = &mut self.pages[next];
-
-                        // The the page is currently initialized, it needs to be
-                        // wiped clean for the new set of logs.
-                        if next_page.is_initialized() {
-                            let result = next_page.reset(&mut self.io_queue);
-                            assert!(!matches!(result, ActionIo::Overflow));
-                            continue; // Append will be retried after page reset.
-                        }
-
-                        // If the page is currently uninitialized, nothing else to
-                        // do other than initialize the next page and start using it.
-                        assert!(next_page.initialize(state.prev_seq_no));
-                        self.next = next; // Append will be retried whenever.
-                    }
-                }
+                Action::Query(query) => self.process_query(query),
+                Action::Append(append) => self.process_append(append),
             }
+        }
+    }
+
+    fn process_append(&mut self, append: Append) {
+        // Latest page is the page where all the writes happen.
+        let page = &mut self.pages[self.next];
+
+        // If the latest page is not already initialized, it means
+        // that storage was newly created or open with no log records.
+        if !page.is_initialized() {
+            // Fetch the first log to initialize the latest page.
+            let mut iter = append.buf.into_iter();
+            let Some(first) = iter.next() else {
+                append.tx.send(append.buf, Ok(()));
+                return;
+            };
+
+            // Logs in storage will be after this sequence number.
+            assert!(page.initialize(first.prev_seq_no()));
+        }
+
+        // Attempt to append the buffer of logs into the latest page.
+        if let ActionIo::Overflow = page.append(append, &mut self.io_queue) {
+            // Fetch the state of the previous page.
+            // We need this to link the sequence numbers for the next page.
+            let state = page.state().expect("Latest page should be initialized");
+
+            // Fetch the next page in the ring buffer.
+            let next = self.next + 1;
+            let next = if next >= self.pages.len() { 0 } else { next };
+            let next_page = &mut self.pages[next];
+
+            // The the page is currently initialized,
+            // it needs to be wiped clean for the new buffer of logs.
+            if next_page.is_initialized() {
+                let result = next_page.reset(&mut self.io_queue);
+                assert!(!matches!(result, ActionIo::Overflow));
+                return;
+            }
+
+            // Otherwise the next page needs to be initialized before use.
+            assert!(next_page.initialize(state.prev_seq_no));
+            self.next = next;
+        }
+    }
+
+    fn process_query(&mut self, query: Query) {
+        let Query {
+            mut buf,
+            after_seq_no,
+            tx,
+        } = query;
+
+        // Check if storage has not been fully initialized.
+        // If storage hasn't been initialized yet, act as though requested
+        // logs are not yet available in storage.
+        let page = &mut self.pages[self.next];
+        if !page.is_initialized() {
+            buf.clear();
+            tx.send(buf, Ok(()));
+            return;
+        }
+
+        // Find the page that actually contains the requested logs.
+        let mut prev = None;
+        loop {
+            // Next of the next page to check.
+            let index = prev.unwrap_or(self.next);
+
+            // Check if we are just rotating over and over again.
+            if prev.is_some() && index == self.next {
+                tx.send(buf, Err(QueryError::Trimmed(after_seq_no)));
+                break;
+            }
+
+            // Get the next page to check.
+            let page = &mut self.pages[index];
+            let Some(state) = page.state() else {
+                // There is no page that contains the requested range of logs.
+                tx.send(buf, Err(QueryError::Trimmed(after_seq_no)));
+                break;
+            };
+
+            // If the page could contain requested logs, we attempt to read it.
+            if state.after_seq_no <= after_seq_no {
+                let result = page.query(Query { buf, after_seq_no, tx }, &mut self.io_queue);
+                assert!(!matches!(result, ActionIo::Overflow));
+                break;
+            }
+
+            // Go back pages and check again.
+            let next_prev = if index == 0 { self.pages.len() - 1 } else { index - 1 };
+            prev = Some(next_prev);
         }
     }
 

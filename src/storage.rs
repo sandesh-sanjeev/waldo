@@ -41,9 +41,8 @@ impl Storage {
     /// # Arguments
     ///
     /// * `path` - Path to the directory on disk.
-    /// * `after_seq_no` - Logs will be appended to storage after this sequence number.
     /// * `opts` - Options used to create storage.
-    pub fn create<P: AsRef<Path>>(path: P, after_seq_no: u64, opts: Options) -> io::Result<Self> {
+    pub fn create<P: AsRef<Path>>(path: P, opts: Options) -> io::Result<Self> {
         // Allocate all memory for buffer pool.
         let pool_size = usize::from(opts.pool.pool_size);
         let mut buffers = (0..pool_size)
@@ -66,16 +65,11 @@ impl Storage {
         let buf_pool = BufPool::new(buffers);
 
         // Create all the pages in ring buffer.
-        let mut pages: Vec<_> = io_files
+        let pages = io_files
             .into_iter()
             .enumerate()
             .map(|(index, file)| Page::new_empty(index as _, file, opts.page))
             .collect();
-
-        // Initialize the first page with starting seq_no.
-        if let Some(page) = pages.first_mut() {
-            page.initialize(after_seq_no);
-        }
 
         // Create starting state for the background storage worker.
         let io_queue = IoQueue::with_capacity(pool_size);

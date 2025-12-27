@@ -62,6 +62,11 @@ impl Page {
         self.state.is_some()
     }
 
+    /// Returns current state of page if page is initialized, empty otherwise.
+    pub(super) fn state(&self) -> Option<PageState> {
+        self.state.as_ref().copied()
+    }
+
     /// (Re)Initialize a page.
     ///
     /// # Arguments
@@ -76,11 +81,6 @@ impl Page {
         // Initialize the page with the new starting state.
         self.state.replace(PageState::new(after_seq_no));
         true
-    }
-
-    /// Returns current state of page if page is initialized, empty otherwise.
-    pub(super) fn state(&self) -> Option<PageState> {
-        self.state.as_ref().copied()
     }
 
     /// Append a list of logs records into the page.
@@ -101,16 +101,24 @@ impl Page {
         let mut state = self.assert_load_state();
         let Append { buf, tx } = append;
 
+        // Return early if there is nothing to append.
+        if buf.is_empty() {
+            tx.send(buf, Ok(()));
+            return ActionIo::Completed;
+        }
+
         // Return early if there is already an append in progress.
+        // In theory we can support pipelining of writes, but it ain't simple.
         if state.pending.append {
             tx.send(buf, Err(AppendError::Conflict));
             return ActionIo::Completed;
         }
 
-        // Return early if there is nothing to append.
-        if buf.is_empty() {
-            tx.send(buf, Ok(()));
-            return ActionIo::Completed;
+        // Re-queue the action if the page is currently being reset.
+        // Once reset and initialization is complete, this page can accept logs.
+        if state.pending.reset || state.resetting {
+            queue.reprocess(Action::Append(Append { buf, tx }));
+            return ActionIo::Pending;
         }
 
         // Perform validations on log records being appended.
@@ -156,12 +164,6 @@ impl Page {
             return ActionIo::Overflow;
         }
 
-        // Re-queue the action if the page is currently being reset.
-        if state.pending.reset {
-            queue.reprocess(Action::Append(Append { buf, tx }));
-            return ActionIo::Pending;
-        }
-
         // Track the in-progress query.
         state.pending.pending_append();
         self.state = Some(state);
@@ -193,10 +195,26 @@ impl Page {
             tx,
         } = query;
 
+        // Return early if the query was incorrectly routed to this page.
+        if after < state.after_seq_no {
+            buf.clear(); // Make sure to reflect no read.
+            tx.send(buf, Err(QueryError::Fault("Query routed to wrong page")));
+            return ActionIo::Completed;
+        }
+
         // Return early if the page doesn't contain the requested range of logs.
-        if after >= state.prev_seq_no || after < state.after_seq_no {
+        if after >= state.prev_seq_no {
             buf.clear(); // Make sure to reflect no read.
             tx.send(buf, Ok(()));
+            return ActionIo::Completed;
+        }
+
+        // We can fail the request saying requested log range is trimmed,
+        // because once reset completes, this page won't contain requested logs.
+        // There is an assumption here however that it is illegal for a reset to fail.
+        if state.pending.reset || state.resetting {
+            buf.clear(); // Make sure to reflect no read.
+            tx.send(buf, Err(QueryError::Trimmed(after)));
             return ActionIo::Completed;
         }
 
@@ -223,16 +241,6 @@ impl Page {
             buf.clear(); // Make sure to reflect no read.
             tx.send(buf, Ok(()));
             return ActionIo::Completed;
-        }
-
-        // Re-queue the action if the page is currently being reset.
-        if state.pending.reset {
-            queue.reprocess(Action::Query(Query {
-                buf,
-                tx,
-                after_seq_no: after,
-            }));
-            return ActionIo::Pending;
         }
 
         // Make enough space in buffer for new bytes.
@@ -267,8 +275,19 @@ impl Page {
             return ActionIo::Completed;
         };
 
+        // Return early if there is already a pending reset.
+        if state.pending.reset {
+            return ActionIo::Completed;
+        }
+
+        // Store in-memory state that says page reset has begun.
+        // This allows us to reject new actions while gracefully,
+        // completing pending actions.
+        state.resetting = true;
+
         // If there is any pending I/O in the page, it cannot be reset.
-        // The worker will just have to retry the operation.
+        // The worker will just have to retry the operation after all the
+        // pending I/O on this page have been drained.
         if state.pending.has_pending() {
             return ActionIo::Pending;
         }
@@ -358,6 +377,7 @@ impl Page {
         let mut state = self.assert_load_state();
         match ctx {
             ActionCtx::Reset => {
+                state.resetting = false;
                 state.pending.complete_reset();
                 self.state = Some(state);
 
@@ -417,6 +437,7 @@ pub(super) struct PageState {
     pub(super) after_seq_no: u64,
     pub(super) index: IndexState,
     pub(super) pending: PendingIo,
+    pub(super) resetting: bool,
 }
 
 impl PageState {
@@ -425,6 +446,7 @@ impl PageState {
             count: 0,
             offset: 0,
             after_seq_no,
+            resetting: false,
             prev_seq_no: after_seq_no,
             index: IndexState::new(),
             pending: PendingIo::default(),

@@ -37,15 +37,15 @@ struct Arguments {
     pool_size: u16,
 
     /// Maximum number of logs in a page.
-    #[arg(long, default_value = "2000000")]
+    #[arg(long, default_value = "4000000")]
     page_capacity: u64,
 
     /// Maximum size of file backing a page in GB.
-    #[arg(long, default_value = "1")]
+    #[arg(long, default_value = "2")]
     page_file_capacity_gb: u64,
 
     /// Maximum size of index backing a page.
-    #[arg(long, default_value = "20000")]
+    #[arg(long, default_value = "40000")]
     page_index_capacity: usize,
 
     /// Maximum gap between indexed log records.
@@ -57,7 +57,7 @@ struct Arguments {
     index_sparse_bytes: usize,
 
     /// Maximum number of logs to append in benchmark.
-    #[arg(long, default_value = "10000000")]
+    #[arg(long, default_value = "50000000")]
     count: u64,
 
     /// Size of payload of a log record.
@@ -110,7 +110,7 @@ async fn main() -> anyhow::Result<()> {
     create_dir_all(&args.path).await?;
 
     // Open storage at the given path.
-    let storage = Storage::create(&args.path, 0, Options::from(&args))?;
+    let storage = Storage::create(&args.path, Options::from(&args))?;
 
     // To track progress.
     let appended_logs = Arc::new(AtomicU64::new(0));
@@ -173,7 +173,6 @@ async fn main() -> anyhow::Result<()> {
         workers.push(tokio::spawn(async move {
             let mut prev_seq_no = 0;
             let mut stats = Stats::default();
-            let mut session = storage.session().await;
             let mut logs = Vec::with_capacity(batch_size);
             while prev_seq_no < count {
                 // Logs to write to page.
@@ -186,10 +185,12 @@ async fn main() -> anyhow::Result<()> {
 
                 // Append the next set of bytes.
                 let start = Instant::now();
+                let mut session = storage.session().await;
                 session.append(&logs).await?;
 
                 // Update for next iteration.
                 stats.appends += 1;
+                stats.appended += logs.len() as u64;
                 stats.append_time += start.elapsed();
                 appended_logs.fetch_add(batch_size as _, Ordering::Relaxed);
             }
@@ -204,10 +205,10 @@ async fn main() -> anyhow::Result<()> {
         workers.push(tokio::spawn(async move {
             let mut prev_seq_no = 0;
             let mut stats = Stats::default();
-            let mut session = storage.session().await;
             while prev_seq_no < count {
                 // Attempt to fetch the next set of logs.
                 let start = Instant::now();
+                let mut session = storage.session().await;
                 let logs = session.query(prev_seq_no).await?;
 
                 // Consume logs queried from storage.
@@ -216,6 +217,7 @@ async fn main() -> anyhow::Result<()> {
                 for log in logs {
                     assert_eq!(prev_seq_no, log.prev_seq_no());
                     prev_seq_no = log.seq_no();
+                    stats.queried += 1;
                 }
             }
 
@@ -231,8 +233,8 @@ async fn main() -> anyhow::Result<()> {
 
     // Wait for the progress bar thread to complete.
     progress.join().expect("Progress bar thread completed in error")?;
-    stats.append_stats(count, log_size);
-    stats.query_stats(count, log_size, args.readers);
+    stats.append_stats(log_size);
+    stats.query_stats(args.readers, log_size);
     Ok(())
 }
 
@@ -241,43 +243,49 @@ async fn main() -> anyhow::Result<()> {
 struct Stats {
     queries: u64,
     appends: u64,
+    queried: u64,
+    appended: u64,
     query_time: Duration,
     append_time: Duration,
 }
 
 impl Stats {
-    fn append_stats(&self, count: u64, log_size: usize) {
+    fn append_stats(&self, log_size: usize) {
         // Total time spent in storage.
         let seconds = self.append_time.as_secs_f64();
         let seconds = if seconds == 0.0 { 1.0 } else { seconds };
 
         // Stats for query.
         let tps = self.appends as f64 / seconds;
-        let mbps = (count as f64 * log_size as f64) / (seconds * 1024.0 * 1024.0);
+        let lps = self.appended as f64 / seconds;
+        let mbps = (log_size as f64 * self.appended as f64) / (seconds * 1024.0 * 1024.0);
 
         // Calculate avg latency for the operation.
         let appends = if self.appends == 0 { 1 } else { self.appends };
         let latency = self.append_time.as_millis() / appends as u128;
-        println!("Writer | {latency} ms, {tps:.2} TPS and {mbps:.2} MB/s");
+        println!("Writer | {latency} ms, {tps:.2} TPS, {lps:.2} Logs/s and {mbps:.2} MB/s");
     }
 
-    fn query_stats(&self, count: u64, log_size: usize, readers: u32) {
+    fn query_stats(&self, readers: u32, log_size: usize) {
+        // Don't attempt to print stats if there were no readers.
+        if readers == 0 {
+            return;
+        }
+
         // Total time spent in storage.
         let seconds = self.query_time.as_secs_f64();
         let seconds = if seconds == 0.0 { 1.0 } else { seconds };
+        let query_time = seconds / readers as f64;
 
         // Stats for query.
-        let tps = self.queries as f64 / seconds;
-
-        // Total mbps across all readers.
-        let query_time = seconds / readers as f64;
-        let total_count = count as f64 * readers as f64;
-        let mbps = (total_count * log_size as f64) / (query_time * 1024.0 * 1024.0);
+        let tps = self.queries as f64 / query_time;
+        let lps = self.queried as f64 / query_time;
+        let mbps = (log_size as f64 * self.queried as f64) / (query_time * 1024.0 * 1024.0);
 
         // Calculate avg latency for the operation.
         let queries = if self.queries == 0 { 1 } else { self.queries };
         let latency = self.query_time.as_millis() / queries as u128;
-        println!("Readers {readers}  | {latency} ms, {tps:.2} TPS and {mbps:.2} MB/s");
+        println!("Readers {readers}  | {latency} ms, {tps:.2} TPS, {lps:.2} Logs/s a and {mbps:.2} MB/s");
     }
 }
 
@@ -285,6 +293,8 @@ impl AddAssign for Stats {
     fn add_assign(&mut self, rhs: Self) {
         self.queries += rhs.queries;
         self.appends += rhs.appends;
+        self.queried += rhs.queried;
+        self.appended += rhs.appended;
         self.query_time += rhs.query_time;
         self.append_time += rhs.append_time;
     }
