@@ -1,5 +1,7 @@
 //! User supplied sequenced log record.
 
+use bytemuck::{Pod, Zeroable};
+
 use crate::runtime::IoBuf;
 use std::borrow::Cow;
 
@@ -15,6 +17,10 @@ where
 }
 
 impl Log<'_> {
+    /// Padding bytes adding at the end of serialized log.
+    /// This allows log header to stay at 8 byte aligned addresses.
+    const PADDING: [u8; 7] = [0, 0, 0, 0, 0, 0, 0];
+
     /// Create new log from borrowed data.
     ///
     /// # Arguments
@@ -60,51 +66,57 @@ impl Log<'_> {
         &self.data
     }
 
-    pub(crate) const fn header_size() -> usize {
-        size_of::<u64>() // seq_no
-        + size_of::<u64>() // prev_seq_no
-        + size_of::<u32>() // data_size
+    pub(crate) fn size(&self) -> usize {
+        let size = self.true_size();
+        let padding = size % 8;
+        size + padding
     }
 
-    pub(crate) fn size(&self) -> usize {
-        Self::header_size() + self.data.len()
+    pub(crate) fn true_size(&self) -> usize {
+        Header::SIZE + self.data.len()
     }
 
     pub(crate) fn write(&self, buf: &mut IoBuf) -> bool {
         // Make sure buffer has enough remaining bytes.
-        if buf.remaining() < self.size() {
+        let size = self.size();
+        if buf.remaining() < size {
             return false; // Rejected due to overflow.
         }
 
-        // Serialize all the different parts of Log.
-        let seq_no_bytes = self.seq_no.to_be_bytes();
-        let prev_seq_no_bytes = self.prev_seq_no.to_be_bytes();
-        let log_size_bytes = (self.data.len() as u32).to_be_bytes();
+        // Header associated with the log.
+        let header = Header::from(self);
+        let padding = size - self.true_size();
 
         // Write serialized bytes into buffer.
-        buf.extend_from_slice(&seq_no_bytes);
-        buf.extend_from_slice(&prev_seq_no_bytes);
-        buf.extend_from_slice(&log_size_bytes);
+        buf.extend_from_slice(header.bytes_of());
         buf.extend_from_slice(&self.data);
+        buf.extend_from_slice(&Self::PADDING[..padding]);
 
         // Successfully written to buffer.
         true
     }
 
     pub(crate) fn read(bytes: &[u8]) -> Option<Log<'_>> {
-        // Split next N bytes into interesting sections.
-        let (header, rest) = bytes.split_at_checked(Self::header_size())?;
-        let (seq_no, header_rest) = header.split_at(size_of::<u64>());
-        let (prev_seq_no, data_size) = header_rest.split_at(size_of::<u64>());
+        // Not enough bytes for next log header.
+        if bytes.len() < Header::SIZE {
+            return None;
+        }
 
-        // Deserialize all the different sections of bytes.
-        let seq_no = u64::from_be_bytes(seq_no.try_into().ok()?);
-        let prev_seq_no = u64::from_be_bytes(prev_seq_no.try_into().ok()?);
-        let data_size = u32::from_be_bytes(data_size.try_into().ok()?);
-        let (data, _) = rest.split_at_checked(data_size as _)?;
+        // Cast next N bytes into log header.
+        let (header, rest) = unsafe { bytes.split_at_unchecked(Header::SIZE) };
+        let header = Header::from_bytes(header);
+
+        // Check if there is enough space associated log bytes.
+        let data_size = header.data_size as usize;
+        if rest.len() < data_size {
+            return None;
+        }
+
+        // Cast next N bytes as log payload.
+        let (data, _) = unsafe { rest.split_at_unchecked(data_size) };
 
         // Return fully deserialized log record.
-        Some(Log::new_borrowed(seq_no, prev_seq_no, data))
+        Some(Log::new_borrowed(header.seq_no, header.prev_seq_no, data))
     }
 }
 
@@ -128,5 +140,38 @@ impl<'a> Iterator for LogIter<'a> {
         let log = Log::read(self.0)?;
         self.0 = self.0.split_at(log.size()).1;
         Some(log)
+    }
+}
+
+/// Header of a log record.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Pod, Zeroable)]
+struct Header {
+    seq_no: u64,
+    prev_seq_no: u64,
+    data_size: u32,
+    padding: u32,
+}
+
+impl From<&Log<'_>> for Header {
+    fn from(value: &Log<'_>) -> Self {
+        Self {
+            seq_no: value.seq_no(),
+            prev_seq_no: value.prev_seq_no(),
+            data_size: value.data().len() as u32,
+            padding: 0, // TODO: Add checksum here.
+        }
+    }
+}
+
+impl Header {
+    const SIZE: usize = (2 * size_of::<u64>()) + (2 * size_of::<u32>());
+
+    fn bytes_of(&self) -> &[u8] {
+        bytemuck::bytes_of(self)
+    }
+
+    fn from_bytes(bytes: &[u8]) -> &Header {
+        bytemuck::from_bytes(bytes)
     }
 }

@@ -29,11 +29,11 @@ struct Arguments {
     ring_size: u32,
 
     /// Maximum concurrency supported by storage.
-    #[arg(long, default_value = "64")]
+    #[arg(long, default_value = "128")]
     queue_depth: u16,
 
     /// Number of pre-allocated I/O buffers.
-    #[arg(long, default_value = "64")]
+    #[arg(long, default_value = "128")]
     pool_size: u16,
 
     /// Maximum number of logs in a page.
@@ -65,7 +65,7 @@ struct Arguments {
     log_size: usize,
 
     /// Numbers of readers in benchmark.
-    #[arg(long, default_value = "63")]
+    #[arg(long, default_value = "127")]
     readers: u32,
 }
 
