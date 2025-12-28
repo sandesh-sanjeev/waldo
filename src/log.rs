@@ -143,7 +143,7 @@ impl Log<'_> {
         }
 
         // Cast next N bytes into log header.
-        let (header, rest) = bytes.split_at(Header::SIZE);
+        let (header, rest) = unsafe { bytes.split_at_unchecked(Header::SIZE) };
         let header = Header::from_bytes(header);
 
         // Check if there is enough space associated log bytes.
@@ -153,7 +153,7 @@ impl Log<'_> {
         }
 
         // Cast next N bytes as log payload.
-        let (data, _) = rest.split_at(data_size);
+        let (data, _) = unsafe { rest.split_at_unchecked(data_size) };
 
         // Return fully deserialized log record.
         Some(Log {
@@ -192,7 +192,7 @@ impl<'a> Iterator for LogIter<'a> {
 
     fn next(&mut self) -> Option<Self::Item> {
         let log = Log::read(self.0)?;
-        self.0 = self.0.split_at(log.size()).1;
+        self.0 = unsafe { self.0.split_at_unchecked(log.size()).1 };
         Some(log)
     }
 }
@@ -244,7 +244,7 @@ impl<'a> Iterator for SequencedLogIter<'a> {
 
         // Attempt to deserialize the next set of bytes into log.
         let log = Log::read(self.bytes)?;
-        self.bytes = self.bytes.split_at(log.size()).1;
+        self.bytes = unsafe { self.bytes.split_at_unchecked(log.size()).1 };
 
         // Make sure unbroken sequence of logs.
         if self.prev_seq_no != log.prev_seq_no() {
