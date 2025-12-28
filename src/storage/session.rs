@@ -6,9 +6,6 @@ use crate::{
     storage::{Action, FateError},
 };
 
-/// Maximum size of a log record of 1 MB.
-const LOG_SIZE_LIMIT: usize = 1024 * 1024;
-
 /// Different types of errors when querying for logs from storage.
 #[derive(Debug, thiserror::Error)]
 pub enum QueryError {
@@ -61,7 +58,7 @@ pub enum AppendError {
     Sequence(u64, u64, u64),
 
     /// Error when log record exceeds size limits.
-    #[error("Log record: {0} has size: {1} that exceeds limit: {limit}", limit = LOG_SIZE_LIMIT)]
+    #[error("Log record: {0} has size: {1} that exceeds limit: {limit}", limit = Log::SIZE_LIMIT)]
     ExceedsLimit(u64, usize),
 }
 
@@ -111,7 +108,7 @@ impl Session<'_> {
     /// # Arguments
     ///
     /// * `logs` - Log records to append into storage.
-    pub async fn append(&mut self, logs: &[Log<'_>]) -> Result<(), AppendError> {
+    pub async fn append(&mut self, mut logs: &[Log<'_>]) -> Result<(), AppendError> {
         // Return early if there is nothing to append.
         if logs.is_empty() {
             return Ok(());
@@ -119,14 +116,15 @@ impl Session<'_> {
 
         // Process the list of provided log records.
         Self::assert_logs(logs)?;
-        let mut logs = logs;
         while !logs.is_empty() {
             // Take ownership of the buffer to share with storage.
-            let Some(mut buf) = self.take_empty_buf() else {
-                return Err(AppendError::Fault("Buffer does not exist in a session"));
-            };
+            let mut buf = self
+                .take_buf()
+                .ok_or(AppendError::Fault("Buffer does not exist in a session"))?;
 
             // Populate buffer with serialized log bytes.
+            // Keep track of logs that couldn't be fit into buffer.
+            // These logs have to appended into storage in the next batch.
             logs = Self::populate_buf(&mut buf, logs);
 
             // Wait for a slot in the queue and submit append action.
@@ -155,9 +153,9 @@ impl Session<'_> {
     /// * `after_seq_no` - Query for logs after this sequence number.
     pub async fn query(&mut self, after_seq_no: u64) -> Result<SequencedLogIter<'_>, QueryError> {
         // Take ownership of the buffer to share with storage.
-        let Some(buf) = self.take_empty_buf() else {
-            return Err(QueryError::Fault("Buffer does not exist in a session"));
-        };
+        let buf = self
+            .take_buf()
+            .ok_or(QueryError::Fault("Buffer does not exist in a session"))?;
 
         // Submit action to append bytes into storage.
         let (query, rx) = Action::query(after_seq_no, buf);
@@ -189,7 +187,7 @@ impl Session<'_> {
     }
 
     /// Take an empty buffer associated with this session.
-    fn take_empty_buf(&mut self) -> Option<IoBuf> {
+    fn take_buf(&mut self) -> Option<IoBuf> {
         let mut buf = self.buf.take()?;
         buf.clear(); // Clear prior state.
         Some(buf)
@@ -199,7 +197,7 @@ impl Session<'_> {
     fn assert_logs(logs: &[Log<'_>]) -> Result<(), AppendError> {
         let mut prev_seq_no = None;
         for log in logs {
-            // Sequence validation on logs.
+            // Make sure a contiguous sequence of logs were provided.
             if let Some(prev) = prev_seq_no
                 && prev != log.prev_seq_no()
             {
@@ -207,7 +205,7 @@ impl Session<'_> {
             }
 
             // Make sure logs stay within their size limits.
-            if log.size() >= LOG_SIZE_LIMIT {
+            if log.size() >= Log::SIZE_LIMIT {
                 return Err(AppendError::ExceedsLimit(log.seq_no(), log.size()));
             }
 

@@ -3,8 +3,8 @@
 use crate::{
     runtime::IoRuntime,
     storage::{
-        Action, Page,
-        action::{ActionCtx, Append, IoQueue, PageIo, Query},
+        Action, Page, StorageState,
+        action::{ActionCtx, Append, IoQueue, LoadState, PageIo, Query},
         page::ActionIo,
         session::QueryError,
     },
@@ -152,10 +152,58 @@ impl WorkerState {
     fn process_actions(&mut self) {
         while let Some(action) = self.io_queue.pop_queued() {
             match action {
+                Action::State(state) => self.process_load_state(state),
                 Action::Query(query) => self.process_query(query),
                 Action::Append(append) => self.process_append(append),
             }
         }
+    }
+
+    fn process_load_state(&mut self, state: LoadState) {
+        let LoadState { tx } = state;
+
+        // Return early if storage has not been initialized.
+        let page = &mut self.pages[self.next];
+        let Some(state) = page.state() else {
+            tx.send(None);
+            return;
+        };
+
+        // Start populating state.
+        // Iterate through rest of the pages to populate state.
+        let mut state = StorageState {
+            prev_seq_no: state.prev_seq_no,
+            after_seq_no: state.after_seq_no,
+            disk_size: state.offset,
+            log_count: state.count,
+        };
+
+        let mut prev = self.next;
+        loop {
+            // Next of the next page to check.
+            let index = if prev == 0 { self.pages.len() - 1 } else { prev - 1 };
+
+            // Check if we are just rotating over and over again.
+            if index == self.next {
+                break;
+            }
+
+            // Break if we can out of initialized pages.
+            let Some(page_state) = &self.pages[index].state() else {
+                break;
+            };
+
+            // Consume the page.
+            state.after_seq_no = page_state.after_seq_no;
+            state.disk_size += page_state.offset;
+            state.log_count += page_state.count;
+
+            // For next iteration.
+            prev = index;
+        }
+
+        // Return the fully populated state.
+        tx.send(Some(state));
     }
 
     fn process_append(&mut self, append: Append) {
@@ -168,7 +216,7 @@ impl WorkerState {
             // Fetch the first log to initialize the latest page.
             let mut iter = append.buf.into_iter();
             let Some(first) = iter.next() else {
-                append.tx.send(append.buf, Ok(()));
+                append.tx.send_buf(append.buf, Ok(()));
                 return;
             };
 
@@ -214,7 +262,7 @@ impl WorkerState {
         let page = &mut self.pages[self.next];
         if !page.is_initialized() {
             buf.clear();
-            tx.send(buf, Ok(()));
+            tx.send_buf(buf, Ok(()));
             return;
         }
 
@@ -226,7 +274,7 @@ impl WorkerState {
 
             // Check if we are just rotating over and over again.
             if prev.is_some() && index == self.next {
-                tx.send(buf, Err(QueryError::Trimmed(after_seq_no)));
+                tx.send_buf(buf, Err(QueryError::Trimmed(after_seq_no)));
                 break;
             }
 
@@ -234,7 +282,7 @@ impl WorkerState {
             let page = &mut self.pages[index];
             let Some(state) = page.state() else {
                 // There is no page that contains the requested range of logs.
-                tx.send(buf, Err(QueryError::Trimmed(after_seq_no)));
+                tx.send_buf(buf, Err(QueryError::Trimmed(after_seq_no)));
                 break;
             };
 

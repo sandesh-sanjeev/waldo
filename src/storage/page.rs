@@ -1,7 +1,7 @@
 //! Contiguous sequence of logs in storage.
 
 use crate::{
-    log::Log,
+    log::{Log, LogIter},
     runtime::{IoAction, IoFixedFd},
     storage::{
         PageOptions,
@@ -9,7 +9,11 @@ use crate::{
         session::{AppendError, QueryError},
     },
 };
-use std::io;
+use memmap2::MmapOptions;
+use std::{
+    fs::File,
+    io::{self},
+};
 
 /// A chunk of contiguous sequence of logs within storage.
 ///
@@ -26,8 +30,11 @@ pub(super) struct Page {
     // Index of the page in the ring buffer.
     id: u32,
 
-    // File handle to the underlying file on disk.
-    file: IoFixedFd,
+    // Handle to the file that backs this page.
+    file: File,
+
+    // File registered with the I/O runtime.
+    io_file: IoFixedFd,
 
     // Current state of the page.
     state: Option<PageState>,
@@ -40,21 +47,39 @@ pub(super) struct Page {
 }
 
 impl Page {
-    /// Create a new empty page.
+    /// Read the current state of the file from disk.
+    ///
+    /// Note that this method truncates a file if corruption is detected at the
+    /// tip of the file (which might end of up being the entire file).
     ///
     /// # Arguments
     ///
     /// * `id` - Unique identity of the page.
-    /// * `file` - Handle to the file backing this page.
+    /// * `io_file` - Backing file registered with I/O runtime.
+    /// * `file` - Seed file to read state from.
     /// * `opts` - Options for the page.
-    pub(super) fn new_empty(id: u32, file: IoFixedFd, opts: PageOptions) -> Self {
-        Self {
+    pub(super) fn open(id: u32, io_file: IoFixedFd, file: File, opts: PageOptions) -> io::Result<Self> {
+        // Read state from the underlying file.
+        let (state, index) = PageState::try_file(&file, opts)?;
+        Ok(Self {
             id,
             file,
+            io_file,
             opts,
-            state: None,
-            index: Vec::with_capacity(opts.index_capacity),
-        }
+            state,
+            index,
+        })
+    }
+
+    /// Reset page unconditionally.
+    ///
+    /// Note that this method executes blocking I/O synchronously.
+    /// See [`Page::reset`] to execute the asynchronous variant.
+    pub(super) fn clear(&mut self) -> io::Result<()> {
+        self.file.set_len(0)?;
+        self.index.clear();
+        self.state = None;
+        Ok(())
     }
 
     /// Returns true if the page is already initialized, false otherwise.
@@ -103,14 +128,14 @@ impl Page {
 
         // Return early if there is nothing to append.
         if buf.is_empty() {
-            tx.send(buf, Ok(()));
+            tx.send_buf(buf, Ok(()));
             return ActionIo::Completed;
         }
 
         // Return early if there is already an append in progress.
         // In theory we can support pipelining of writes, but it ain't simple.
         if state.pending.append {
-            tx.send(buf, Err(AppendError::Conflict));
+            tx.send_buf(buf, Err(AppendError::Conflict));
             return ActionIo::Completed;
         }
 
@@ -145,13 +170,13 @@ impl Page {
 
         // Return early if sequence validation failed.
         if let Some(error) = error {
-            tx.send(buf, Err(error));
+            tx.send_buf(buf, Err(error));
             return ActionIo::Completed;
         }
 
         // Return early if there is no complete log in the buffer.
         if scratch.prev_seq_no == state.prev_seq_no {
-            tx.send(buf, Ok(()));
+            tx.send_buf(buf, Ok(()));
             return ActionIo::Completed;
         }
 
@@ -172,7 +197,7 @@ impl Page {
         queue.issue(PageIo {
             id: self.id,
             ctx: ActionCtx::append(tx),
-            action: IoAction::write_at(self.file, state.offset, buf),
+            action: IoAction::write_at(self.io_file, state.offset, buf),
         });
         ActionIo::Issued
     }
@@ -198,14 +223,14 @@ impl Page {
         // Return early if the query was incorrectly routed to this page.
         if after < state.after_seq_no {
             buf.clear(); // Make sure to reflect no read.
-            tx.send(buf, Err(QueryError::Fault("Query routed to wrong page")));
+            tx.send_buf(buf, Err(QueryError::Fault("Query routed to wrong page")));
             return ActionIo::Completed;
         }
 
         // Return early if the page doesn't contain the requested range of logs.
         if after >= state.prev_seq_no {
             buf.clear(); // Make sure to reflect no read.
-            tx.send(buf, Ok(()));
+            tx.send_buf(buf, Ok(()));
             return ActionIo::Completed;
         }
 
@@ -214,7 +239,7 @@ impl Page {
         // There is an assumption here however that it is illegal for a reset to fail.
         if state.pending.reset || state.resetting {
             buf.clear(); // Make sure to reflect no read.
-            tx.send(buf, Err(QueryError::Trimmed(after)));
+            tx.send_buf(buf, Err(QueryError::Trimmed(after)));
             return ActionIo::Completed;
         }
 
@@ -239,7 +264,7 @@ impl Page {
         // Return early if there are no bytes to read.
         if remaining == 0 || buf.capacity() == 0 {
             buf.clear(); // Make sure to reflect no read.
-            tx.send(buf, Ok(()));
+            tx.send_buf(buf, Ok(()));
             return ActionIo::Completed;
         }
 
@@ -255,7 +280,7 @@ impl Page {
         queue.issue(PageIo {
             id: self.id,
             ctx: ActionCtx::query(tx),
-            action: IoAction::read_at(self.file, offset, buf),
+            action: IoAction::read_at(self.io_file, offset, buf),
         });
         ActionIo::Issued
     }
@@ -300,7 +325,7 @@ impl Page {
         queue.issue(PageIo {
             id: self.id,
             ctx: ActionCtx::Reset,
-            action: IoAction::resize(self.file, 0),
+            action: IoAction::resize(self.io_file, 0),
         });
         ActionIo::Issued
     }
@@ -317,7 +342,7 @@ impl Page {
         match ctx {
             ActionCtx::Reset => {
                 // Underlying file is already truncated.
-                // We just need to reset all internal state.
+                // We just need to clear the in-memory state now.
                 self.index.clear();
                 self.state = None;
             }
@@ -327,7 +352,7 @@ impl Page {
                 let buf = action.take_buf().expect("Page action should have shared buffer");
                 if result != buf.len() as u32 {
                     let error = QueryError::Fault("Incomplete read in a query action");
-                    tx.send(buf, Err(error));
+                    tx.send_buf(buf, Err(error));
                     return;
                 }
 
@@ -336,7 +361,7 @@ impl Page {
                 self.state = Some(state);
 
                 // Return result of the action.
-                tx.send(buf, Ok(()));
+                tx.send_buf(buf, Ok(()));
             }
 
             ActionCtx::Append { tx } => {
@@ -344,7 +369,7 @@ impl Page {
                 let buf = action.take_buf().expect("Page action should have shared buffer");
                 if result != buf.len() as u32 {
                     let error = AppendError::Fault("Incomplete write in an append action");
-                    tx.send(buf, Err(error));
+                    tx.send_buf(buf, Err(error));
                     return;
                 }
 
@@ -361,7 +386,7 @@ impl Page {
                 self.state = Some(state);
 
                 // Return result of the action.
-                tx.send(buf, Ok(()));
+                tx.send_buf(buf, Ok(()));
             }
         }
     }
@@ -394,7 +419,7 @@ impl Page {
                 self.state = Some(state);
 
                 // Return error from the action.
-                tx.send(buf, Err(error.into()));
+                tx.send_buf(buf, Err(error.into()));
             }
 
             ActionCtx::Append { tx, .. } => {
@@ -406,7 +431,7 @@ impl Page {
                 self.state = Some(state);
 
                 // Return error from the action.
-                tx.send(buf, Err(error.into()));
+                tx.send_buf(buf, Err(error.into()));
             }
         }
     }
@@ -427,6 +452,9 @@ pub(super) enum ActionIo {
     Overflow,
     Completed,
 }
+
+/// Type alias for results of a file page parse.
+type PageSnapshot = (Option<PageState>, Vec<IndexEntry>);
 
 /// State of a storage page.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -453,6 +481,75 @@ impl PageState {
         }
     }
 
+    fn try_file(file: &File, opts: PageOptions) -> io::Result<PageSnapshot> {
+        // Safety: We assume here and everywhere else that this storage process
+        // has exclusive write access to the file.
+        let buf = unsafe { MmapOptions::new().map(file)? };
+
+        // Read from disk and build state.
+        let mut count = 0;
+        let mut offset = 0;
+        let mut prev_seq_no = None;
+        let mut after_seq_no = None;
+        let mut index_state = IndexState::new();
+        let mut index = Vec::with_capacity(opts.index_capacity);
+        for log in LogIter(&buf) {
+            // Initialize starting sequence number for the page.
+            if after_seq_no.is_none() {
+                after_seq_no = Some(log.prev_seq_no());
+                prev_seq_no = Some(log.prev_seq_no());
+            }
+
+            // Validate sequence for the log record.
+            if prev_seq_no != Some(log.prev_seq_no()) {
+                break;
+            }
+
+            // Make sure no corruption.
+            if log.validate_data().is_err() {
+                break;
+            }
+
+            // Update state to track the discovered log record.
+            count += 1;
+            prev_seq_no = Some(log.seq_no());
+            offset += log.size() as u64;
+
+            // Create an index record if one must be created.
+            if index_state.apply(&log, opts) {
+                index_state.reset();
+                index.push(IndexEntry::new(offset, log.seq_no()));
+            }
+        }
+
+        // We don't need the memory map anymore.
+        let len = buf.len() as u64;
+        drop(buf); // So that no mapping exists to the file we will truncate.
+
+        // Truncate all the unread bytes from file.
+        // We'll assume they are causality of a process/OS crash.
+        if len != offset {
+            file.set_len(offset)?;
+        }
+
+        // Use the results of the file scan.
+        let mut state = None;
+        if let (Some(after_seq_no), Some(prev_seq_no)) = (after_seq_no, prev_seq_no) {
+            state = Some(Self {
+                count,
+                offset,
+                after_seq_no,
+                prev_seq_no,
+                resetting: false,
+                index: index_state,
+                pending: PendingIo::default(),
+            });
+        };
+
+        // Return the current state of the file.
+        Ok((state, index))
+    }
+
     fn apply(&mut self, log: &Log<'_>, opts: PageOptions) -> Option<IndexEntry> {
         // Another sanity check to be super extra sure.
         assert_eq!(log.prev_seq_no(), self.prev_seq_no);
@@ -464,8 +561,12 @@ impl PageState {
 
         // Next check if an index must be created.
         // This is because we index offset of log after indexed seq_no.
-        let index = IndexEntry::new(self.offset, self.prev_seq_no);
-        if self.index.apply(log, opts) { Some(index) } else { None }
+        if !self.index.apply(log, opts) {
+            return None;
+        }
+
+        // Return index, if an index must be created.
+        Some(IndexEntry::new(self.offset, self.prev_seq_no))
     }
 }
 

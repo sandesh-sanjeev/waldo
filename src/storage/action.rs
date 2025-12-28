@@ -3,7 +3,7 @@
 use crate::{
     runtime::{IoAction, IoBuf},
     storage::{
-        BufResult,
+        BufResult, StorageState,
         session::{AppendError, QueryError},
     },
 };
@@ -129,6 +129,9 @@ pub(super) enum Action {
 
     /// Action to append into storage.
     Append(Append),
+
+    /// Action to get latest state of storage.
+    State(LoadState),
 }
 
 impl Action {
@@ -152,6 +155,19 @@ impl Action {
         let (tx, rx) = AsyncFate::channel();
         (Action::Append(Append { buf, tx }), rx)
     }
+
+    /// Create an action to get latest state.
+    pub(super) fn state() -> (Self, FateReceiver<Option<StorageState>>) {
+        let (tx, rx) = AsyncFate::channel();
+        (Action::State(LoadState { tx }), rx)
+    }
+}
+
+/// A request to load latest state of storage.
+#[derive(Debug)]
+pub(super) struct LoadState {
+    /// Sender to send action result asynchronously.
+    pub(super) tx: FateSender<Option<StorageState>>,
 }
 
 /// A request to query for some bytes from page.
@@ -237,6 +253,12 @@ impl AsyncFate {
 #[derive(Debug)]
 pub(super) struct FateSender<T>(oneshot::Sender<T>);
 
+impl<T> FateSender<T> {
+    pub(super) fn send(self, value: T) {
+        let _ = self.0.send(value);
+    }
+}
+
 impl<T, E> FateSender<BufResult<T, E>> {
     /// Send fate of an async operation.
     ///
@@ -244,7 +266,7 @@ impl<T, E> FateSender<BufResult<T, E>> {
     ///
     /// * `buf` - Buffer shared storage.
     /// * `value` - Result of the storage action.
-    pub(super) fn send(self, buf: IoBuf, value: Result<T, E>) {
+    pub(super) fn send_buf(self, buf: IoBuf, value: Result<T, E>) {
         if let Err(message) = self.0.send((buf, value)) {
             let (buf, _) = message.into_inner();
             drop(buf); // Explicitly return to pool, just cause.

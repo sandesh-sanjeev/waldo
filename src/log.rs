@@ -18,6 +18,10 @@ where
 }
 
 impl Log<'_> {
+    /// Maximum size of a log record of 1 MB.
+    /// TODO: Add checks for buffer size and bytes between sparse index.
+    pub const SIZE_LIMIT: usize = 1024 * 1024;
+
     /// Padding bytes adding at the end of serialized log.
     /// This allows log header to stay at 8 byte aligned addresses.
     const PADDING: [u8; 7] = [0, 0, 0, 0, 0, 0, 0];
@@ -88,11 +92,10 @@ impl Log<'_> {
     pub fn size(&self) -> usize {
         let size = self.true_size();
 
-        // Additional padding we need to add to a log record
-        // so that address of the starting offset of a log record
-        // to be aligned to 8 byte boundaries. This makes deserialization
-        // of the header a pure pointer cast, i.e, fast.
-        let extra = size & 7;
+        // Additional padding to add to a log record so that address of starting
+        // offset of the log record is aligned to 8 byte boundaries. This makes
+        // deserialization of the header a pure pointer cast, i.e, fast.
+        let extra = size & 7; // Equivalent to "size % 8"
         let padding = if extra > 0 { 8 - extra } else { 0 };
 
         size + padding
@@ -115,7 +118,7 @@ impl Log<'_> {
         // Make sure buffer has enough remaining bytes.
         let size = self.size();
         if buf.remaining() < size {
-            return false; // Rejected due to overflow.
+            return false;
         }
 
         // Header associated with the log.
@@ -126,8 +129,6 @@ impl Log<'_> {
         buf.extend_from_slice(header.bytes_of());
         buf.extend_from_slice(&self.data);
         buf.extend_from_slice(&Self::PADDING[..padding]);
-
-        // Successfully written to buffer.
         true
     }
 
@@ -137,23 +138,13 @@ impl Log<'_> {
     ///
     /// * `bytes` - Source byte slice to fetch bytes.
     pub(crate) fn read(bytes: &[u8]) -> Option<Log<'_>> {
-        // Not enough bytes for next log header.
-        if bytes.len() < Header::SIZE {
-            return None;
-        }
-
         // Cast next N bytes into log header.
-        let (header, rest) = unsafe { bytes.split_at_unchecked(Header::SIZE) };
+        let (header, rest) = bytes.split_at_checked(Header::SIZE)?;
         let header = Header::from_bytes(header);
 
-        // Check if there is enough space associated log bytes.
+        // Fetch payload associated with the log record.
         let data_size = header.data_size as usize;
-        if rest.len() < data_size {
-            return None;
-        }
-
-        // Cast next N bytes as log payload.
-        let (data, _) = unsafe { rest.split_at_unchecked(data_size) };
+        let (data, _) = rest.split_at_checked(data_size)?;
 
         // Return fully deserialized log record.
         Some(Log {
@@ -169,14 +160,17 @@ impl Log<'_> {
         // For an ideal hash function, any N bits should make
         // collision detection 1 / (2 ^ N - 1). We expect logs
         // to be < 1 KB most of the time, 32 bits should provide
-        // plenty of bites for collision resistance.
+        // plenty of bits for reasonable probably of collision
+        // resistance.
+        //
+        // TODO: Mix seq_no and prev_seq_no into the hash.
         xxh3::xxh3_64(data) as u32
     }
 }
 
 /// An iterator to iterate through a buffer of log records.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct LogIter<'a>(&'a [u8]);
+pub struct LogIter<'a>(pub(crate) &'a [u8]);
 
 impl<'a> IntoIterator for &'a IoBuf {
     type Item = Log<'a>;
@@ -191,8 +185,14 @@ impl<'a> Iterator for LogIter<'a> {
     type Item = Log<'a>;
 
     fn next(&mut self) -> Option<Self::Item> {
+        // Attempt to deserialize the next set of bytes into log.
         let log = Log::read(self.0)?;
+
+        // Safety: We just read enough bytes for the parsed log record.
+        // Compiler/LLVM is not smart enough to know this and remove bounds check.
         self.0 = unsafe { self.0.split_at_unchecked(log.size()).1 };
+
+        // Return fully parsed record.
         Some(log)
     }
 }
@@ -244,6 +244,9 @@ impl<'a> Iterator for SequencedLogIter<'a> {
 
         // Attempt to deserialize the next set of bytes into log.
         let log = Log::read(self.bytes)?;
+
+        // Safety: We just read enough bytes for the parsed log record.
+        // Compiler/LLVM is not smart enough to know this and remove bounds check.
         self.bytes = unsafe { self.bytes.split_at_unchecked(log.size()).1 };
 
         // Make sure unbroken sequence of logs.

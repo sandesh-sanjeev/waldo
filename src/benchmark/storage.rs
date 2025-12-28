@@ -12,7 +12,7 @@ use std::{
 use tokio::fs::create_dir_all;
 use waldo::{
     log::Log,
-    storage::{Options, PageOptions, PoolOptions, Storage},
+    storage::{Options, PageOptions, PoolOptions, Storage, StorageState},
 };
 
 /// Arguments for the I/O runtime benchmark.
@@ -36,7 +36,7 @@ struct Arguments {
     pool_size: u16,
 
     /// Maximum number of logs in a page.
-    #[arg(long, default_value = "2000000")]
+    #[arg(long, default_value = "1000000")]
     page_capacity: u64,
 
     /// Maximum size of file backing a page in GB.
@@ -44,7 +44,7 @@ struct Arguments {
     page_file_capacity_gb: u64,
 
     /// Maximum size of index backing a page.
-    #[arg(long, default_value = "20000")]
+    #[arg(long, default_value = "10000")]
     page_index_capacity: usize,
 
     /// Maximum gap between indexed log records.
@@ -52,7 +52,7 @@ struct Arguments {
     index_sparse_count: usize,
 
     /// Maximum gap in bytes between indexed log records.
-    #[arg(long, default_value = "65535")]
+    #[arg(long, default_value = "131070")]
     index_sparse_bytes: usize,
 
     /// Maximum number of logs to append in benchmark.
@@ -60,11 +60,11 @@ struct Arguments {
     count: u64,
 
     /// Size of payload of a log record.
-    #[arg(long, default_value = "488")]
+    #[arg(long, default_value = "1000")]
     log_size: usize,
 
     /// Numbers of readers in benchmark.
-    #[arg(long, default_value = "2048")]
+    #[arg(long, default_value = "3200")]
     readers: u32,
 
     /// Delay between storage actions in milliseconds.
@@ -106,7 +106,7 @@ async fn main() -> anyhow::Result<()> {
     let count = args.count;
 
     // Size of a log record.
-    let log_size = 20 + args.log_size;
+    let log_size = 24 + args.log_size;
     let log_data = vec![5; args.log_size];
 
     // Maximum number of log records that can be stored in allocated buffers.
@@ -116,13 +116,39 @@ async fn main() -> anyhow::Result<()> {
     create_dir_all(&args.path).await?;
 
     // Open storage at the given path.
-    let storage = Storage::create(&args.path, Options::from(&args))?;
+    let storage = Storage::open(&args.path, Options::from(&args))?;
+    let state = storage.state().await;
+
+    // Print starting state of storage.
+    if let Some(StorageState {
+        after_seq_no: after,
+        prev_seq_no: prev,
+        disk_size: size,
+        log_count: count,
+    }) = &state
+    {
+        let size = (*size as f64) / (1024.0 * 1024.0 * 1024.0);
+        println!("Storage | Logs: {count} | LogRange: ({after}, {prev}] | Size: {size:.2} GB");
+    } else {
+        println!("Storage | Empty");
+    }
+
+    // Print benchmark parameters.
+    let readers = args.readers;
+    let pool_size = opts.pool.pool_size;
+    let queue_depth = opts.queue_depth;
+    println!("Bench | BufPoolSize: {pool_size} | QueueDepth: {queue_depth} | Readers: {readers} | Delay: {delay:?}");
+    println!("Worker | Logs: {count} | LogSize: {log_size} B | BatchSize: {batch_size}");
+
+    // Range of log records to append into storage for this benchmark.
+    let prev = state.map(|state| state.prev_seq_no).unwrap_or(0);
+    let end = prev + count;
 
     // To track progress.
-    let appended_logs = Arc::new(AtomicU64::new(0));
+    let latest_seq_no = Arc::new(AtomicU64::new(prev));
 
     // Thread to print progress of benchmark.
-    let progress_logs = appended_logs.clone();
+    let progress_seq_no = latest_seq_no.clone();
     let progress = std::thread::spawn(move || {
         let pb = MultiProgress::new();
 
@@ -141,30 +167,37 @@ async fn main() -> anyhow::Result<()> {
         );
 
         // Keep the progress bar updated while benchmark is in progress.
-        let mut prev_progress = 0;
+        let mut prev_seq_no = prev;
+        let mut progress_count = 0;
         loop {
             // Figure out progress in benchmark.
-            let progress = progress_logs.load(Ordering::Relaxed);
-            let new_progress = progress - prev_progress;
-            let progress_mbps = (new_progress as f64 * log_size as f64) / (1024.0 * 1024.0);
+            let latest_seq_no = progress_seq_no.load(Ordering::Relaxed);
+            let new_count = latest_seq_no - prev_seq_no;
+            let progress_mbps = (new_count as f64 * log_size as f64) / (1024.0 * 1024.0);
+
+            // Update in-memory state.
+            prev_seq_no = latest_seq_no;
+            progress_count += new_count;
 
             // Update the UI with progress.
-            count_pd.set_message(format!("{new_progress}"));
-            count_pd.set_position(progress);
+            count_pd.set_message(format!("{new_count:}"));
+            count_pd.set_position(progress_count);
 
             size_pd.set_message(format!("{progress_mbps:.2}"));
-            size_pd.set_position(progress * log_size as u64);
+            size_pd.set_position(progress_count * log_size as u64);
 
             // Quit when benchmark is complete.
-            if progress >= count {
+            if prev_seq_no >= end {
                 break;
             }
 
             // Sleep for a bit before next iteration.
-            prev_progress = progress;
             std::thread::sleep(Duration::from_secs(1));
         }
 
+        // Complete and return.
+        count_pd.finish_and_clear();
+        size_pd.finish_and_clear();
         Ok::<_, anyhow::Error>(())
     });
 
@@ -175,9 +208,9 @@ async fn main() -> anyhow::Result<()> {
     for _ in 0..args.readers {
         let storage = storage.clone();
         workers.push(tokio::spawn(async move {
-            let mut prev_seq_no = 0;
+            let mut prev_seq_no = prev;
             let mut interval = tokio::time::interval(delay);
-            while prev_seq_no < count {
+            while prev_seq_no < end {
                 // Wait for enough time to have passed.
                 interval.tick().await;
 
@@ -201,10 +234,10 @@ async fn main() -> anyhow::Result<()> {
     {
         let storage = storage.clone();
         workers.push(tokio::spawn(async move {
-            let mut prev_seq_no = 0;
+            let mut prev_seq_no = prev;
             let mut interval = tokio::time::interval(delay);
             let mut logs = Vec::with_capacity(batch_size);
-            while prev_seq_no < count {
+            while prev_seq_no < end {
                 // Wait for enough time to have passed.
                 interval.tick().await;
 
@@ -219,7 +252,7 @@ async fn main() -> anyhow::Result<()> {
                 // Append the next set of bytes.
                 let mut session = storage.session().await;
                 session.append(&logs).await?;
-                appended_logs.fetch_add(batch_size as _, Ordering::Relaxed);
+                latest_seq_no.store(prev_seq_no, Ordering::Relaxed);
             }
 
             Ok::<_, anyhow::Error>(())
@@ -255,8 +288,7 @@ async fn main() -> anyhow::Result<()> {
 
     // Wait for the progress bar thread to complete.
     progress.join().expect("Progress bar thread completed in error")?;
-    println!("{time:?} | {readers} Readers | {count} Logs | {delay:?} Delay");
-    println!("Writer | {w_tps:.2} Logs/s, {w_mbps:.2} MB/s");
-    println!("Readers | {r_tps:.2} Logs/s, {r_mbps:.2} MB/s");
+    println!("Writer | {seconds:.2}s | {w_tps:.2} Logs/s | {w_mbps:.2} MB/s");
+    println!("Readers | {seconds:.2}s | {r_tps:.2} Logs/s | {r_mbps:.2} MB/s");
     Ok(())
 }
