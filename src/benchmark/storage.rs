@@ -24,7 +24,7 @@ struct Arguments {
     path: String,
 
     /// Maximum number of pages in storage.
-    #[arg(long, default_value = "8")]
+    #[arg(long, default_value = "4")]
     ring_size: u32,
 
     /// Maximum concurrency supported by storage.
@@ -64,7 +64,7 @@ struct Arguments {
     log_size: usize,
 
     /// Numbers of readers in benchmark.
-    #[arg(long, default_value = "2500")]
+    #[arg(long, default_value = "2048")]
     readers: u32,
 
     /// Delay between storage actions in milliseconds.

@@ -3,6 +3,7 @@
 use crate::runtime::IoBuf;
 use bytemuck::{Pod, Zeroable};
 use std::borrow::Cow;
+use xxhash_rust::xxh3;
 
 /// A sequenced log record that can be appended into Journal.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -58,6 +59,16 @@ impl Log<'_> {
         self.data_hash
     }
 
+    /// Validate integrity of log payload.
+    pub fn validate_data(&self) -> Result<(), Error> {
+        let hash = Log::gen_hash(self.data());
+        if hash != self.data_hash() {
+            return Err(Error::Corruption(self.seq_no, self.data_hash, hash));
+        }
+
+        Ok(())
+    }
+
     /// Sequence number of the log record.
     pub fn seq_no(&self) -> u64 {
         self.seq_no
@@ -76,7 +87,14 @@ impl Log<'_> {
     /// Serialized size of the log record.
     pub fn size(&self) -> usize {
         let size = self.true_size();
-        let padding = size % 8;
+
+        // Additional padding we need to add to a log record
+        // so that address of the starting offset of a log record
+        // to be aligned to 8 byte boundaries. This makes deserialization
+        // of the header a pure pointer cast, i.e, fast.
+        let extra = size & 7;
+        let padding = if extra > 0 { 8 - extra } else { 0 };
+
         size + padding
     }
 
@@ -148,7 +166,11 @@ impl Log<'_> {
 
     /// Generate hash for the log record.
     fn gen_hash(data: &[u8]) -> u32 {
-        xxhash_rust::xxh3::xxh3_64(data) as u32
+        // For an ideal hash function, any N bits should make
+        // collision detection 1 / (2 ^ N - 1). We expect logs
+        // to be < 1 KB most of the time, 32 bits should provide
+        // plenty of bites for collision resistance.
+        xxh3::xxh3_64(data) as u32
     }
 }
 
@@ -187,23 +209,23 @@ pub enum Error {
     Corruption(u64, u32, u32),
 }
 
-/// An iterator that validates logs before handing them out.
+/// An iterator that validates log sequence before handing them out.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct CheckedLogIter<'a> {
+pub struct SequencedLogIter<'a> {
     bytes: &'a [u8],
     prev_seq_no: u64,
     is_error: bool,
 }
 
-impl CheckedLogIter<'_> {
+impl SequencedLogIter<'_> {
     /// Create a new checked iterator.
     ///
     /// # Arguments
     ///
     /// * `bytes` - Bytes to iterate through.
     /// * `prev_seq_no` - Sequence number of the immediately previous log.
-    pub(crate) fn new(bytes: &[u8], prev_seq_no: u64) -> CheckedLogIter<'_> {
-        CheckedLogIter {
+    pub(crate) fn new(bytes: &[u8], prev_seq_no: u64) -> SequencedLogIter<'_> {
+        SequencedLogIter {
             bytes,
             prev_seq_no,
             is_error: false,
@@ -211,7 +233,7 @@ impl CheckedLogIter<'_> {
     }
 }
 
-impl<'a> Iterator for CheckedLogIter<'a> {
+impl<'a> Iterator for SequencedLogIter<'a> {
     type Item = Result<Log<'a>, Error>;
 
     fn next(&mut self) -> Option<Self::Item> {
@@ -220,35 +242,19 @@ impl<'a> Iterator for CheckedLogIter<'a> {
             return None;
         }
 
-        // There might be a few excess logs at the beginning.
-        // We'll need to spin a few times to skip those.
-        loop {
-            // Attempt to deserialize the next set of bytes into log.
-            let log = Log::read(self.bytes)?;
-            self.bytes = self.bytes.split_at(log.size()).1;
+        // Attempt to deserialize the next set of bytes into log.
+        let log = Log::read(self.bytes)?;
+        self.bytes = self.bytes.split_at(log.size()).1;
 
-            // Skip the excess logs mentioned above.
-            if log.seq_no() <= self.prev_seq_no {
-                continue;
-            }
-
-            // Make sure unbroken sequence of logs.
-            if self.prev_seq_no != log.prev_seq_no() {
-                self.is_error = true;
-                return Some(Err(Error::Sequence(log.seq_no(), log.prev_seq_no(), self.prev_seq_no)));
-            }
-
-            // Make sure log bytes are intact.
-            let hash = Log::gen_hash(log.data());
-            if hash != log.data_hash() {
-                self.is_error = true;
-                return Some(Err(Error::Corruption(log.seq_no(), log.data_hash(), hash)));
-            }
-
-            // Alright, everything looks good!
-            self.prev_seq_no = log.seq_no();
-            return Some(Ok(log));
+        // Make sure unbroken sequence of logs.
+        if self.prev_seq_no != log.prev_seq_no() {
+            self.is_error = true;
+            return Some(Err(Error::Sequence(log.seq_no(), log.prev_seq_no(), self.prev_seq_no)));
         }
+
+        // Alright, everything looks good!
+        self.prev_seq_no = log.seq_no();
+        Some(Ok(log))
     }
 }
 

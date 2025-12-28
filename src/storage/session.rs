@@ -1,7 +1,7 @@
 //! A long lived connection to storage.
 
 use crate::{
-    log::{CheckedLogIter, Log},
+    log::{Log, SequencedLogIter},
     runtime::IoBuf,
     storage::{Action, FateError},
 };
@@ -153,7 +153,7 @@ impl Session<'_> {
     /// # Arguments
     ///
     /// * `after_seq_no` - Query for logs after this sequence number.
-    pub async fn query(&mut self, after_seq_no: u64) -> Result<CheckedLogIter<'_>, QueryError> {
+    pub async fn query(&mut self, after_seq_no: u64) -> Result<SequencedLogIter<'_>, QueryError> {
         // Take ownership of the buffer to share with storage.
         let Some(buf) = self.take_empty_buf() else {
             return Err(QueryError::Fault("Buffer does not exist in a session"));
@@ -170,7 +170,22 @@ impl Session<'_> {
 
         // Return reference to all the log records read from query.
         let buf = self.buf.as_ref().expect("Associated buffer must exist");
-        Ok(CheckedLogIter::new(buf, after_seq_no))
+
+        // Figure out offset to the starting seq_no.
+        // For performance reasons storage might return a few extra logs
+        // at the beginning of the buffer. We have to skip past those.
+        let mut offset = 0;
+        for log in buf {
+            // We've reached the target offset in the underlying buffer.
+            if log.seq_no() > after_seq_no {
+                break;
+            }
+
+            offset += log.size();
+        }
+
+        // Return iterator for the rest of the log records.
+        Ok(SequencedLogIter::new(&buf[offset..], after_seq_no))
     }
 
     /// Take an empty buffer associated with this session.

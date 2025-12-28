@@ -165,7 +165,7 @@ impl Page {
         }
 
         // Track the in-progress query.
-        state.pending.pending_append();
+        state.pending.append = true;
         self.state = Some(state);
 
         // Enqueue I/O action for execution asynchronously.
@@ -248,7 +248,7 @@ impl Page {
         buf.set_len(len);
 
         // Track the in-progress query.
-        state.pending.pending_query();
+        state.pending.query += 1;
         self.state = Some(state);
 
         // Enqueue I/O action for execution asynchronously.
@@ -293,7 +293,7 @@ impl Page {
         }
 
         // Track the in-progress reset.
-        state.pending.pending_reset();
+        state.pending.reset = true;
         self.state = Some(state);
 
         // Enqueue I/O action for execution asynchronously.
@@ -332,7 +332,7 @@ impl Page {
                 }
 
                 // Stop tracking the completed query.
-                state.pending.complete_query();
+                state.pending.query -= 1;
                 self.state = Some(state);
 
                 // Return result of the action.
@@ -357,7 +357,7 @@ impl Page {
                 }
 
                 // Stop tracking the completed action.
-                state.pending.complete_append();
+                state.pending.append = false;
                 self.state = Some(state);
 
                 // Return result of the action.
@@ -378,7 +378,7 @@ impl Page {
         match ctx {
             ActionCtx::Reset => {
                 state.resetting = false;
-                state.pending.complete_reset();
+                state.pending.reset = false;
                 self.state = Some(state);
 
                 // FIXME: Should we abort all pending append actions?
@@ -390,7 +390,7 @@ impl Page {
                 let buf = action.take_buf().expect("Page action should have shared buffer");
 
                 // Stop tracking the aborted query.
-                state.pending.complete_query();
+                state.pending.query -= 1;
                 self.state = Some(state);
 
                 // Return error from the action.
@@ -402,7 +402,7 @@ impl Page {
                 let buf = action.take_buf().expect("Page action should have shared buffer");
 
                 // Stop tracking the aborted append.
-                state.pending.complete_append();
+                state.pending.append = false;
                 self.state = Some(state);
 
                 // Return error from the action.
@@ -514,30 +514,6 @@ pub(super) struct PendingIo {
 impl PendingIo {
     fn has_pending(&self) -> bool {
         self.reset || self.append || self.query > 0
-    }
-
-    fn pending_reset(&mut self) {
-        self.reset = true;
-    }
-
-    fn pending_append(&mut self) {
-        self.append = true;
-    }
-
-    fn pending_query(&mut self) {
-        self.query += 1;
-    }
-
-    fn complete_reset(&mut self) {
-        self.reset = false;
-    }
-
-    fn complete_append(&mut self) {
-        self.append = false;
-    }
-
-    fn complete_query(&mut self) {
-        self.query -= 1;
     }
 }
 
