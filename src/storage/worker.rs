@@ -72,6 +72,8 @@ impl WorkerState {
     }
 
     fn process(mut self, closing: Arc<AtomicBool>) -> io::Result<()> {
+        use rayon::prelude::*;
+
         loop {
             // Check if graceful shutdown has begun.
             // We'll continue to complete all pending work.
@@ -117,6 +119,13 @@ impl WorkerState {
             // Process all the completed actions.
             self.process_completions();
         }
+
+        // Close all the pages.
+        self.pages.into_par_iter().for_each(|page| {
+            if let Err(e) = page.close() {
+                eprintln!("Error during graceful close of page: {e}");
+            }
+        });
         Ok(())
     }
 
@@ -132,7 +141,7 @@ impl WorkerState {
                         .expect("Got I/O response for a page that does not exist");
 
                     // Complete the I/O operation.
-                    page.commit(success.result, success.action, success.attachment.1);
+                    page.commit(success.result, success.action, success.attachment.1, &mut self.io_queue);
                 }
 
                 Err(error) => {
@@ -143,7 +152,7 @@ impl WorkerState {
                         .get_mut(index as usize)
                         .expect("Got I/O response for a page that does not exist");
 
-                    page.abort(error.error, error.action, error.attachment.1);
+                    page.abort(error.error, error.action, error.attachment.1, &mut self.io_queue);
                 }
             }
         }

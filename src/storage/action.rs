@@ -210,6 +210,9 @@ pub(super) enum ActionCtx {
 
     /// System action to clear a page.
     Reset,
+
+    /// System action to sync data to disk.
+    Fsync,
 }
 
 impl ActionCtx {
@@ -254,6 +257,11 @@ impl AsyncFate {
 pub(super) struct FateSender<T>(oneshot::Sender<T>);
 
 impl<T> FateSender<T> {
+    /// Send fate of an async operation.
+    ///
+    /// # Arguments
+    ///
+    /// * `value` - Result of the storage action.
     pub(super) fn send(self, value: T) {
         let _ = self.0.send(value);
     }

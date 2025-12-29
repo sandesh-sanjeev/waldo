@@ -116,8 +116,10 @@ async fn main() -> anyhow::Result<()> {
     create_dir_all(&args.path).await?;
 
     // Open storage at the given path.
+    let start = Instant::now();
     let storage = Storage::open(&args.path, Options::from(&args))?;
     let state = storage.state().await;
+    let init_time = start.elapsed().as_secs_f64();
 
     // Print starting state of storage.
     if let Some(StorageState {
@@ -128,17 +130,18 @@ async fn main() -> anyhow::Result<()> {
     }) = &state
     {
         let size = (*size as f64) / (1024.0 * 1024.0 * 1024.0);
-        println!("Storage | Logs: {count} | LogRange: ({after}, {prev}] | Size: {size:.2} GB");
+        println!("Storage | InitTime: {init_time:.2} s | Logs: {count} in ({after}, {prev}] | Size: {size:.2} GB");
     } else {
-        println!("Storage | Empty");
+        println!("Storage | InitTime: {init_time:.2} s | Empty");
     }
 
     // Print benchmark parameters.
     let readers = args.readers;
     let pool_size = opts.pool.pool_size;
     let queue_depth = opts.queue_depth;
+    let write_size = (log_size as f64 * count as f64) / (1024.0 * 1024.0 * 1024.0);
     println!("Bench | BufPoolSize: {pool_size} | QueueDepth: {queue_depth} | Readers: {readers} | Delay: {delay:?}");
-    println!("Worker | Logs: {count} | LogSize: {log_size} B | BatchSize: {batch_size}");
+    println!("Worker | Logs: {count} | LogSize: {log_size} B | BatchSize: {batch_size} | Total: {write_size:.2} GB");
 
     // Range of log records to append into storage for this benchmark.
     let prev = state.map(|state| state.prev_seq_no).unwrap_or(0);

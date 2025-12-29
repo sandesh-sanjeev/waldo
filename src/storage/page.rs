@@ -71,17 +71,6 @@ impl Page {
         })
     }
 
-    /// Reset page unconditionally.
-    ///
-    /// Note that this method executes blocking I/O synchronously.
-    /// See [`Page::reset`] to execute the asynchronous variant.
-    pub(super) fn clear(&mut self) -> io::Result<()> {
-        self.file.set_len(0)?;
-        self.index.clear();
-        self.state = None;
-        Ok(())
-    }
-
     /// Returns true if the page is already initialized, false otherwise.
     pub(super) fn is_initialized(&self) -> bool {
         self.state.is_some()
@@ -108,6 +97,21 @@ impl Page {
         true
     }
 
+    /// Reset page unconditionally.
+    ///
+    /// Note that this method executes blocking I/O synchronously.
+    /// See [`Page::reset`] to execute the asynchronous variant.
+    pub(super) fn clear(&mut self) -> io::Result<()> {
+        // Get rid of any bytes on the underlying file.
+        self.file.set_len(0)?;
+        self.file.sync_all()?;
+
+        // Update in-memory state.
+        self.index.clear();
+        self.state = None;
+        Ok(())
+    }
+
     /// Append a list of logs records into the page.
     ///
     /// If the page is initialized, logs are appended in the right sequence and there is
@@ -123,8 +127,13 @@ impl Page {
     /// * `append` - Append action against the page.
     /// * `queue` - I/O queue to append I/O actions.
     pub(super) fn append(&mut self, append: Append, queue: &mut IoQueue) -> ActionIo {
-        let mut state = self.assert_load_state();
         let Append { buf, tx } = append;
+
+        // Something is wrong if an action is routed to an uninitialized page.
+        let Some(mut state) = self.state.as_ref().copied() else {
+            tx.send_buf(buf, Err(AppendError::Fault("Append routed to uninitialized page")));
+            return ActionIo::Completed;
+        };
 
         // Return early if there is nothing to append.
         if buf.is_empty() {
@@ -213,12 +222,17 @@ impl Page {
     /// * `query` - Query action against the page.
     /// * `queue` - I/O queue to append I/O actions.
     pub(super) fn query(&mut self, query: Query, queue: &mut IoQueue) -> ActionIo {
-        let mut state = self.assert_load_state();
         let Query {
             after_seq_no: after,
             mut buf,
             tx,
         } = query;
+
+        // Something is wrong if an action is routed to an uninitialized page.
+        let Some(mut state) = self.state.as_ref().copied() else {
+            tx.send_buf(buf, Err(QueryError::Fault("Query routed to uninitialized page")));
+            return ActionIo::Completed;
+        };
 
         // Return early if the query was incorrectly routed to this page.
         if after < state.after_seq_no {
@@ -236,10 +250,13 @@ impl Page {
 
         // We can fail the request saying requested log range is trimmed,
         // because once reset completes, this page won't contain requested logs.
-        // There is an assumption here however that it is illegal for a reset to fail.
+        // There is an assumption here that rest will succeed. If that assumption
+        // is violated users might observe a log range that has been reported to
+        // have been trimmed. For that reason, we'll act as though there are no
+        // new logs. That way, users know logs are trimmed the "regular" way.
         if state.pending.reset || state.resetting {
             buf.clear(); // Make sure to reflect no read.
-            tx.send_buf(buf, Err(QueryError::Trimmed(after)));
+            tx.send_buf(buf, Ok(()));
             return ActionIo::Completed;
         }
 
@@ -337,14 +354,28 @@ impl Page {
     /// * `result` - Result of the I/O operation.
     /// * `action` - I/O action completed.
     /// * `ctx` - Context associated with the action.
-    pub(super) fn commit(&mut self, result: u32, action: IoAction, ctx: ActionCtx) {
+    /// * `queue` - Queue to append I/O actions.
+    pub(super) fn commit(&mut self, result: u32, action: IoAction, ctx: ActionCtx, queue: &mut IoQueue) {
         let mut state = self.assert_load_state();
         match ctx {
+            ActionCtx::Fsync => {
+                state.pending.fsync = false;
+                self.state = Some(state);
+            }
+
             ActionCtx::Reset => {
                 // Underlying file is already truncated.
-                // We just need to clear the in-memory state now.
+                // Update in-memory state to reflect reset.
                 self.index.clear();
                 self.state = None;
+
+                // Initiate a sync to disk.
+                // Makes sure page reset is durably stored to disk.
+                queue.issue(PageIo {
+                    id: self.id,
+                    ctx: ActionCtx::Fsync,
+                    action: IoAction::fsync(self.io_file),
+                });
             }
 
             ActionCtx::Query { tx, .. } => {
@@ -387,6 +418,8 @@ impl Page {
 
                 // Return result of the action.
                 tx.send_buf(buf, Ok(()));
+
+                // TODO: Should we fsync byte range to disk?
             }
         }
     }
@@ -398,9 +431,16 @@ impl Page {
     /// * `error` - I/O error performing the operation.
     /// * `action` - I/O action that errored out.
     /// * `ctx` - Context associated with the action.
-    pub(super) fn abort(&mut self, error: io::Error, action: IoAction, ctx: ActionCtx) {
+    /// * `queue` - Queue to append I/O actions.
+    pub(super) fn abort(&mut self, error: io::Error, action: IoAction, ctx: ActionCtx, _queue: &mut IoQueue) {
         let mut state = self.assert_load_state();
         match ctx {
+            ActionCtx::Fsync => {
+                state.pending.fsync = false;
+                self.state = Some(state);
+                eprintln!("Page fsync aborted with error: {error:?}");
+            }
+
             ActionCtx::Reset => {
                 state.resetting = false;
                 state.pending.reset = false;
@@ -426,6 +466,7 @@ impl Page {
                 // Get ownership of the shared buffer.
                 let buf = action.take_buf().expect("Page action should have shared buffer");
 
+                // TODO: Should we attempt to truncate that underlying file to known size?
                 // Stop tracking the aborted append.
                 state.pending.append = false;
                 self.state = Some(state);
@@ -434,6 +475,18 @@ impl Page {
                 tx.send_buf(buf, Err(error.into()));
             }
         }
+    }
+
+    /// Gracefully close the page.
+    pub(super) fn close(self) -> io::Result<()> {
+        // If the page was initialized, this gets rid of any failed writes.
+        // Well this might fail as well, if the disk is really broken!
+        if let Some(state) = self.state {
+            self.file.set_len(state.offset)?;
+        }
+
+        // Make sure any change to disk is durably stored on disk.
+        self.file.sync_all()
     }
 
     fn assert_load_state(&self) -> PageState {
@@ -610,11 +663,12 @@ pub(super) struct PendingIo {
     pub(super) reset: bool,
     pub(super) query: u32,
     pub(super) append: bool,
+    pub(super) fsync: bool,
 }
 
 impl PendingIo {
     fn has_pending(&self) -> bool {
-        self.reset || self.append || self.query > 0
+        self.reset || self.append || self.query > 0 || self.fsync
     }
 }
 

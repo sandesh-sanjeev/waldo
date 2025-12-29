@@ -218,6 +218,9 @@ pub enum IoAction {
     /// Flush contents of a file to disk.
     Fsync { file: IoFile },
 
+    /// Flush data changes to range of bytes in file.
+    DSyncRange { file: IoFile, offset: u64, len: u32 },
+
     /// Resize a file to new length.
     Resize { file: IoFile, len: u64 },
 
@@ -240,6 +243,14 @@ impl IoAction {
     /// * `file` - File to read from.
     pub fn fsync<F: Into<IoFile>>(file: F) -> Self {
         Self::Fsync { file: file.into() }
+    }
+
+    pub fn dsync_range<F: Into<IoFile>>(file: F, offset: u64, len: u32) -> Self {
+        Self::DSyncRange {
+            file: file.into(),
+            offset,
+            len,
+        }
     }
 
     /// Resize file to a new length.
@@ -306,6 +317,16 @@ impl IoAction {
             Self::Fsync { file } => match file {
                 IoFile::Fd(fd) => opcode::Fsync::new(types::Fd(fd.0)).build(),
                 IoFile::Fixed(fd) => opcode::Fsync::new(types::Fixed(fd.0)).build(),
+            },
+
+            Self::DSyncRange { file, offset, len } => match file {
+                IoFile::Fd(fd) => opcode::SyncFileRange::new(types::Fd(fd.0), *len)
+                    .offset(*offset)
+                    .build(),
+
+                IoFile::Fixed(fd) => opcode::SyncFileRange::new(types::Fixed(fd.0), *len)
+                    .offset(*offset)
+                    .build(),
             },
 
             Self::Resize { file, len } => match file {
