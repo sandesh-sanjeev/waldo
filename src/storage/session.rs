@@ -167,7 +167,7 @@ impl Session<'_> {
         result?;
 
         // Return reference to all the log records read from query.
-        let buf = self.buf.as_ref().expect("Associated buffer must exist");
+        let buf = unsafe { self.buf.as_ref().unwrap_unchecked() };
 
         // Figure out offset to the starting seq_no.
         // For performance reasons storage might return a few extra logs
@@ -182,18 +182,19 @@ impl Session<'_> {
             offset += log.size();
         }
 
+        // Range of log bytes to return.
+        let bytes = unsafe { buf.split_at_unchecked(offset).1 };
+
         // Return iterator for the rest of the log records.
-        Ok(SequencedLogIter::new(&buf[offset..], after_seq_no))
+        Ok(SequencedLogIter::new(bytes, after_seq_no))
     }
 
-    /// Take an empty buffer associated with this session.
     fn take_buf(&mut self) -> Option<IoBuf> {
         let mut buf = self.buf.take()?;
         buf.clear(); // Clear prior state.
         Some(buf)
     }
 
-    /// Assert log records are valid, return user error otherwise.
     fn assert_logs(logs: &[Log<'_>]) -> Result<(), AppendError> {
         let mut prev_seq_no = None;
         for log in logs {
@@ -215,7 +216,6 @@ impl Session<'_> {
         Ok(())
     }
 
-    /// Populate buffer with logs and return overflow logs.
     fn populate_buf<'a>(buf: &mut IoBuf, logs: &'a [Log<'a>]) -> &'a [Log<'a>] {
         let mut consumed = 0;
         for log in logs {
@@ -227,6 +227,6 @@ impl Session<'_> {
         }
 
         // Return unconsumed log records.
-        logs.split_at(consumed).1
+        unsafe { logs.split_at_unchecked(consumed).1 }
     }
 }

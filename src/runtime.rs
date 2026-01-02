@@ -49,10 +49,7 @@ pub struct IoRuntime<A> {
 impl<A> IoRuntime<A> {
     /// Create a new async I/O runtime.
     pub fn new(queue_depth: u32) -> io::Result<Self> {
-        let io_ring = IoUring::builder()
-            .setup_single_issuer()
-            .setup_coop_taskrun()
-            .build(queue_depth)?;
+        let io_ring = IoUring::builder().build(queue_depth)?;
 
         // Our limit on maximum pending I/O.
         // To protect against completion queue overflow.

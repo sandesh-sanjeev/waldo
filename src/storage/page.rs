@@ -27,8 +27,10 @@ pub struct PageOptions {
     /// Maximum number of log records in a page.
     pub capacity: u64,
 
+    /// Options for file backing a page.
     pub file_opts: FileOpts,
 
+    /// Options for index backing a page.
     pub index_opts: IndexOpts,
 }
 
@@ -40,7 +42,7 @@ pub struct PageOptions {
 /// A page can be uninitialized (just empty space), empty (no logs) or
 /// filled with logs. An uninitialized page can be initialized at runtime.
 ///
-/// A page has a pre-determined maximum size. Then the page runs out of capacity,
+/// A page has a pre-determined maximum size. When the page runs out of capacity,
 /// it must be reset or rotated away to make space for new log records.
 #[derive(Debug)]
 pub(super) struct Page {
@@ -60,11 +62,10 @@ impl Page {
     /// # Arguments
     ///
     /// * `id` - Unique identity of the page.
-    /// * `io_file` - Backing file registered with I/O runtime.
-    /// * `file` - Seed file to read state from.
+    /// * `path` - Path to the home directory.
     /// * `opts` - Options for the page.
     pub(super) fn open<P: AsRef<Path>>(id: u32, path: P, opts: PageOptions) -> io::Result<Self> {
-        let mut file = PageFile::new(path, opts.file_opts)?;
+        let mut file = PageFile::open(path, opts.file_opts)?;
         let mut index = PageIndex::new(opts.index_opts);
 
         // Read from disk and build state.
@@ -126,23 +127,32 @@ impl Page {
         })
     }
 
+    /// Raw file descriptor to the underlying file.
     pub(super) fn raw_fd(&self) -> RawFd {
         self.file.raw_fd()
     }
 
+    /// Set registered file in io-uring runtime.
+    ///
+    /// # Arguments
+    ///
+    /// * `file` - File registered in io-uring runtime.
     pub(super) fn set_io_file(&mut self, file: IoFixedFd) {
         self.file.set_io_file(file);
     }
 
-    /// Returns current state of page if page is initialized, empty otherwise.
+    /// Returns metadata of the page, if page is initialized.
     pub(super) fn metadata(&self) -> Option<PageMetadata> {
         let state = self.state.as_ref()?;
         let file_state = self.file.state();
+        let index_state = self.index.state();
         Some(PageMetadata {
             count: state.count,
+            index_count: index_state.len as _,
             prev_seq_no: state.prev_seq_no,
             after_seq_no: state.after_seq_no,
             file_size: file_state.offset,
+            index_size: (index_state.len * PageIndex::ENTRY_SIZE) as _,
         })
     }
 
@@ -158,29 +168,10 @@ impl Page {
     /// * `after_seq_no` - Sequence number of the immediately previous log.
     pub(super) fn initialize(&mut self, after_seq_no: u64) {
         // Make sure page is not already initialized.
-        if self.state.is_some() {
-            return;
-        }
+        let_assert!(None = &self.state);
 
         // Initialize the page with the new starting state.
         self.state.replace(PageState::new(after_seq_no));
-    }
-
-    /// Reset page.
-    ///
-    /// Note that this method executes blocking I/O synchronously.
-    /// See [`Page::reset`] to execute the asynchronous variant.
-    pub(super) fn clear(&mut self) -> io::Result<()> {
-        // If the page is not currently cleared, nothing else to do.
-        if self.state.is_some() {
-            return Ok(());
-        }
-
-        // Truncate file and reset underlying state.
-        self.file.truncate(0)?;
-        self.index.clear();
-        self.state = None;
-        Ok(())
     }
 
     /// Append a list of logs records into the page.
@@ -189,9 +180,9 @@ impl Page {
     /// no pending append or resets in page, then this initiates an async action to write
     /// a range of bytes into the underlying file.
     ///
-    /// Note that this method returns [`ActionIo::Overflow`] if the action could not be
-    /// issued because the page ran out of space. When this happens space must be reclaimed
-    /// from the oldest page to make room for the new append.
+    /// Note that this method returns false if the action could not be issued because the
+    /// page ran out of space. When this happens space must be reclaimed from the oldest
+    /// page to make room for the new append.
     ///
     /// # Arguments
     ///
@@ -307,15 +298,13 @@ impl Page {
 
         // Return early if the query was incorrectly routed to this page.
         if after_seq_no < state.after_seq_no {
-            buf.clear();
-            tx.send_buf(buf, Err(QueryError::Fault("Query routed to wrong page")));
+            tx.send_clear_buf(buf, Err(QueryError::Fault("Query routed to wrong page")));
             return;
         }
 
         // Return early if the page doesn't contain the requested range of logs.
         if after_seq_no >= state.prev_seq_no {
-            buf.clear();
-            tx.send_buf(buf, Ok(()));
+            tx.send_clear_buf(buf, Ok(()));
             return;
         }
 
@@ -327,8 +316,7 @@ impl Page {
         // new logs. That way, users know logs are trimmed the "regular" way.
         let pending_io = self.file.pending();
         if pending_io.reset || state.resetting {
-            buf.clear();
-            tx.send_buf(buf, Ok(()));
+            tx.send_clear_buf(buf, Ok(()));
             return;
         }
 
@@ -342,8 +330,7 @@ impl Page {
 
         // Return early if there are no bytes to read.
         if remaining == 0 || buf.capacity() == 0 {
-            buf.clear(); // Make sure to reflect no read.
-            tx.send_buf(buf, Ok(()));
+            tx.send_clear_buf(buf, Ok(()));
             return;
         }
 
@@ -397,7 +384,7 @@ impl Page {
         queue.issue(PageIo {
             id: self.id,
             ctx: ActionCtx::Reset,
-            action: self.file.reset(),
+            action: self.file.clear(),
         });
     }
 
@@ -409,7 +396,7 @@ impl Page {
     /// * `action` - I/O action completed.
     /// * `ctx` - Context associated with the action.
     /// * `queue` - Queue to append I/O actions.
-    pub(super) fn commit(&mut self, result: u32, mut action: IoAction, ctx: ActionCtx, queue: &mut IoQueue) {
+    pub(super) fn apply(&mut self, result: u32, mut action: IoAction, ctx: ActionCtx, queue: &mut IoQueue) {
         // Read latest state of the page.
         let_assert!(Some(state) = self.state.as_mut());
 
@@ -440,7 +427,7 @@ impl Page {
             ActionCtx::Query { tx, .. } => {
                 let_assert!(Some(buf) = action.take_buf());
                 if let Err(error) = file_result {
-                    tx.send_buf(buf, Err(error.into()));
+                    tx.send_clear_buf(buf, Err(error.into()));
                 } else {
                     tx.send_buf(buf, Ok(()));
                 }
@@ -495,7 +482,7 @@ impl Page {
 
             ActionCtx::Query { tx, .. } => {
                 let_assert!(Some(buf) = action.take_buf());
-                tx.send_buf(buf, Err(error.into()));
+                tx.send_clear_buf(buf, Err(error.into()));
             }
 
             ActionCtx::Append { tx, .. } => {
@@ -505,19 +492,37 @@ impl Page {
         }
     }
 
-    /// Gracefully close the page.
+    /// Reset page.
+    ///
+    /// Note that this method executes blocking I/O synchronously.
+    pub(super) fn clear(&mut self) -> io::Result<()> {
+        // If the page is not currently cleared, nothing else to do.
+        if self.state.is_some() {
+            return Ok(());
+        }
+
+        // Truncate file and reset underlying state.
+        self.file.truncate(0)?;
+        self.index.clear();
+        self.state = None;
+        Ok(())
+    }
+
+    /// Initiate graceful shutdown of this page.
     pub(super) fn close(self) -> io::Result<()> {
         self.file.close()
     }
 }
 
-/// State of a storage page.
+/// Metadata associated with a page.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) struct PageMetadata {
     pub(super) count: u64,
+    pub(super) index_count: u64,
     pub(super) prev_seq_no: u64,
     pub(super) after_seq_no: u64,
     pub(super) file_size: u64,
+    pub(super) index_size: u64,
 }
 
 /// State of a storage page.

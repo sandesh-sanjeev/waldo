@@ -286,6 +286,19 @@ impl<T, E> FateSender<BufResult<T, E>> {
             drop(buf); // Explicitly return to pool, just cause.
         }
     }
+
+    /// Send fate of an async operation.
+    ///
+    /// This variant clear accumulated bytes in buffer before publishing result.
+    ///
+    /// # Arguments
+    ///
+    /// * `buf` - Buffer shared storage.
+    /// * `value` - Result of the storage action.
+    pub(super) fn send_clear_buf(self, mut buf: IoBuf, value: Result<T, E>) {
+        buf.clear();
+        self.send_buf(buf, value);
+    }
 }
 
 /// Receiver for fate of a storage action.

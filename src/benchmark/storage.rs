@@ -132,6 +132,7 @@ async fn main() -> anyhow::Result<()> {
         prev_seq_no: prev,
         disk_size: size,
         log_count: count,
+        ..
     }) = &state
     {
         let size = (*size as f64) / (1024.0 * 1024.0 * 1024.0);

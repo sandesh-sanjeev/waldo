@@ -38,6 +38,9 @@ pub(super) struct PageIndex {
 }
 
 impl PageIndex {
+    /// Size of a single entry stored in a page index.
+    pub(super) const ENTRY_SIZE: usize = size_of::<IndexEntry>();
+
     /// Create a new sparse index.
     ///
     /// # Arguments
@@ -50,7 +53,7 @@ impl PageIndex {
         }
     }
 
-    /// Return current state of the index.
+    /// Current state of the index.
     pub(super) fn state(&self) -> IndexState {
         self.state
     }
@@ -58,9 +61,7 @@ impl PageIndex {
     /// Best offset to begin query.
     ///
     /// Note that even though this method always returns an offset,
-    /// associated range of sequence numbers might or might not exist.
-    /// Unless you have page metadata, the only way to say for sure is
-    /// to read from file.
+    /// associated range of sequence numbers might or might not exist.xw
     ///
     /// # Arguments
     ///
