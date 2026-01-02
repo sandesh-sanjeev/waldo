@@ -11,7 +11,7 @@ use io_uring::{
     squeue::{self, Flags},
     types,
 };
-use std::{collections::HashMap, fs::File, io, os::fd::AsRawFd};
+use std::{collections::HashMap, io, os::fd::RawFd};
 use thiserror::Error;
 
 /// Error result from an async I/O operation.
@@ -24,6 +24,7 @@ pub struct IoError<A> {
 }
 
 /// Successful result from an async I/O operation.
+#[derive(Debug)]
 pub struct IoResponse<A> {
     pub result: u32,
     pub attachment: A,
@@ -49,9 +50,8 @@ impl<A> IoRuntime<A> {
     /// Create a new async I/O runtime.
     pub fn new(queue_depth: u32) -> io::Result<Self> {
         let io_ring = IoUring::builder()
-            // FIXME: Runtime must be created in the worker.
-            //.setup_single_issuer()
-            //.setup_coop_taskrun()
+            .setup_single_issuer()
+            .setup_coop_taskrun()
             .build(queue_depth)?;
 
         // Our limit on maximum pending I/O.
@@ -76,9 +76,8 @@ impl<A> IoRuntime<A> {
     /// # Arguments
     ///
     /// * `files` - Files to register with the runtime.
-    pub fn register_files(&mut self, files: &[File]) -> io::Result<Vec<IoFixedFd>> {
-        let fds: Vec<_> = files.iter().map(File::as_raw_fd).collect();
-        self.io_ring.submitter().register_files(&fds)?;
+    pub fn register_files(&mut self, files: &[RawFd]) -> io::Result<Vec<IoFixedFd>> {
+        self.io_ring.submitter().register_files(files)?;
         Ok(files.iter().enumerate().map(|(i, _)| IoFixedFd(i as _)).collect())
     }
 
@@ -218,9 +217,6 @@ pub enum IoAction {
     /// Flush contents of a file to disk.
     Fsync { file: IoFile },
 
-    /// Flush data changes to range of bytes in file.
-    DSyncRange { file: IoFile, offset: u64, len: u32 },
-
     /// Resize a file to new length.
     Resize { file: IoFile, len: u64 },
 
@@ -243,14 +239,6 @@ impl IoAction {
     /// * `file` - File to read from.
     pub fn fsync<F: Into<IoFile>>(file: F) -> Self {
         Self::Fsync { file: file.into() }
-    }
-
-    pub fn dsync_range<F: Into<IoFile>>(file: F, offset: u64, len: u32) -> Self {
-        Self::DSyncRange {
-            file: file.into(),
-            offset,
-            len,
-        }
     }
 
     /// Resize file to a new length.
@@ -317,16 +305,6 @@ impl IoAction {
             Self::Fsync { file } => match file {
                 IoFile::Fd(fd) => opcode::Fsync::new(types::Fd(fd.0)).build(),
                 IoFile::Fixed(fd) => opcode::Fsync::new(types::Fixed(fd.0)).build(),
-            },
-
-            Self::DSyncRange { file, offset, len } => match file {
-                IoFile::Fd(fd) => opcode::SyncFileRange::new(types::Fd(fd.0), *len)
-                    .offset(*offset)
-                    .build(),
-
-                IoFile::Fixed(fd) => opcode::SyncFileRange::new(types::Fixed(fd.0), *len)
-                    .offset(*offset)
-                    .build(),
             },
 
             Self::Resize { file, len } => match file {

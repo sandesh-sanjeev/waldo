@@ -12,7 +12,7 @@ use std::{
 use tokio::fs::create_dir_all;
 use waldo::{
     log::Log,
-    storage::{Options, PageOptions, PoolOptions, Storage, StorageState},
+    storage::{FileOpts, IndexOpts, Options, PageOptions, PoolOptions, Storage, StorageState},
 };
 
 /// Arguments for the I/O runtime benchmark.
@@ -83,11 +83,16 @@ impl From<&Arguments> for Options {
                 buf_capacity: 2 * 1024 * 1024,
             },
             page: PageOptions {
-                page_capacity: value.page_capacity,
-                index_capacity: value.page_index_capacity,
-                index_sparse_count: value.index_sparse_count,
-                index_sparse_bytes: value.index_sparse_bytes,
-                file_capacity: value.page_file_capacity_gb * 1024 * 1024 * 1024,
+                capacity: value.page_capacity,
+                index_opts: IndexOpts {
+                    capacity: value.page_index_capacity,
+                    sparse_count: value.index_sparse_count,
+                    sparse_bytes: value.index_sparse_bytes,
+                },
+                file_opts: FileOpts {
+                    o_dsync: false,
+                    capacity: value.page_file_capacity_gb * 1024 * 1024 * 1024,
+                },
             },
         }
     }
@@ -117,7 +122,7 @@ async fn main() -> anyhow::Result<()> {
 
     // Open storage at the given path.
     let start = Instant::now();
-    let storage = Storage::open(&args.path, Options::from(&args))?;
+    let storage = Storage::open(&args.path, Options::from(&args)).await?;
     let state = storage.state().await;
     let init_time = start.elapsed().as_secs_f64();
 

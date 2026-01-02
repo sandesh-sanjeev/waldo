@@ -1,16 +1,17 @@
 //! Worker executing all storage actions.
 
 use crate::{
-    runtime::IoRuntime,
+    runtime::{BufPool, IoRuntime, RawBytes},
     storage::{
-        Action, Page, StorageState,
-        action::{ActionCtx, Append, IoQueue, LoadState, PageIo, Query},
-        page::ActionIo,
+        Action, Options, Page, Storage, StorageState,
+        action::{ActionCtx, Append, AsyncFate, IoQueue, LoadState, PageIo, Query},
         session::QueryError,
     },
 };
+use assert2::let_assert;
 use std::{
     io,
+    path::Path,
     sync::{
         Arc,
         atomic::{AtomicBool, Ordering},
@@ -23,7 +24,162 @@ use std::{
 #[derive(Debug)]
 pub(super) struct Worker {
     closing: Arc<AtomicBool>,
-    handle: Option<JoinHandle<io::Result<()>>>,
+    handle: Option<JoinHandle<()>>,
+}
+
+impl Worker {
+    pub(super) async fn spawn<P: AsRef<Path>>(path: P, opts: Options) -> io::Result<Storage> {
+        let closing = Arc::new(AtomicBool::new(false));
+        let (fate_tx, fate_rx) = AsyncFate::channel::<io::Result<BufPool>>();
+
+        let queue_depth = usize::from(opts.queue_depth);
+        let (tx, rx) = flume::bounded(queue_depth);
+
+        // Spawn worker thread.
+        let worker_close = closing.clone();
+        let path = path.as_ref().to_path_buf();
+        let handle = std::thread::spawn(move || {
+            // Perform all the blocking I/O actions necessary to initialize storage and worker.
+            let init_result = || {
+                // First open all the pages of storage.
+                let (next, mut pages) = Self::open_pages(path.as_ref(), opts)?;
+
+                // Create I/O runtime for storage.
+                let mut runtime = IoRuntime::new(opts.queue_depth.into())?;
+
+                // Allocate all memory for buffer pool.
+                let pool_size = usize::from(opts.pool.pool_size);
+                let mut buffers = (0..pool_size)
+                    .map(|_| RawBytes::allocate(opts.pool.buf_capacity, opts.pool.huge_buf))
+                    .collect::<io::Result<Vec<_>>>()?;
+
+                // Register buffers and files with the runtime.
+                let files: Vec<_> = pages.iter().map(Page::raw_fd).collect();
+                let files = runtime.register_files(&files)?;
+                for (file, page) in files.into_iter().zip(pages.iter_mut()) {
+                    page.set_io_file(file);
+                }
+
+                // Register allocated memory with io uring runtime and create buffer pool.
+                unsafe { runtime.register_bufs(&mut buffers)? };
+                let pool = BufPool::new(buffers);
+
+                // Return initialized components.
+                Ok((runtime, pool, pages, next))
+            };
+
+            // Do stuff depending on the results of initialization.
+            match init_result() {
+                Err(error) => {
+                    fate_tx.send(Err(error));
+                }
+
+                Ok((runtime, pool, pages, next)) => {
+                    if !fate_tx.send(Ok(pool)) {
+                        eprintln!("Worker stopping cause fate receiver dropped");
+                        return;
+                    }
+
+                    let io_queue = IoQueue::with_capacity(queue_depth);
+                    let worker = WorkerState {
+                        next,
+                        pages,
+                        rx,
+                        runtime,
+                        io_queue,
+                    };
+
+                    worker.process(worker_close);
+                }
+            };
+        });
+
+        // Handle to worker.
+        let _worker = Arc::new(Worker {
+            closing,
+            handle: Some(handle),
+        });
+
+        // Wait till we hear about initialization result.
+        let buf_pool = fate_rx.recv_async().await??;
+        Ok(Storage { buf_pool, _worker, tx })
+    }
+
+    fn open_pages(path: &Path, opts: Options) -> io::Result<(usize, Vec<Page>)> {
+        use rayon::prelude::*;
+
+        // Initialize all the pages in parallel.
+        let mut pages: Vec<_> = (0..opts.ring_size)
+            .into_par_iter()
+            .map(|id| {
+                let file_name = format!("{id:0>10}.page");
+                let file_path = path.join(file_name);
+                Page::open(id, file_path, opts.page)
+            })
+            .collect::<io::Result<_>>()?;
+
+        // Find latest page in storage.
+        // That's the page with largest sequence number.
+        let mut max = 0;
+        let mut next = 0;
+        for (i, page) in pages.iter().enumerate() {
+            if let Some(state) = page.metadata()
+                && state.prev_seq_no > max
+            {
+                next = i;
+                max = state.prev_seq_no;
+            }
+        }
+
+        // Figure out all the pages that can be preserved.
+        let latest = &mut pages[next];
+        if let Some(state) = latest.metadata() {
+            let mut prev = next;
+            let mut is_reset = false;
+            let mut after_seq_no = state.after_seq_no;
+            loop {
+                // Next of the next page to check.
+                let index = if prev == 0 { pages.len() - 1 } else { prev - 1 };
+                if index == next {
+                    break;
+                }
+
+                // Previous page in the ring buffer.
+                let page = &mut pages[index];
+
+                // An unconditional reset if a previous page was reset.
+                if is_reset {
+                    page.clear()?;
+                } else if let Some(state) = page.metadata() {
+                    // Make sure sequences match up with the earlier page.
+                    if state.prev_seq_no != after_seq_no {
+                        is_reset = true;
+                        page.clear()?;
+                    }
+
+                    // Nice, everything checks out.
+                    // We can use this page as is in storage.
+                    after_seq_no = state.after_seq_no;
+                } else {
+                    // If this page is uninitialized, none of the pages
+                    // before (in ring buffer) should be initialized either.
+                    is_reset = true;
+                    page.clear()?;
+                }
+
+                // For next iteration.
+                prev = index;
+            }
+        } else {
+            // In theory this is not necessary, for completeness.
+            for page in pages.iter_mut() {
+                page.clear()?;
+            }
+        }
+
+        // Return parsed pages along with starting index.
+        Ok((next, pages))
+    }
 }
 
 impl Drop for Worker {
@@ -53,25 +209,7 @@ impl WorkerState {
     /// will be dropped during graceful shutdown.
     const ACTION_AWAIT_TIMEOUT: Duration = Duration::from_secs(1);
 
-    /// Spawn a single threaded worker with this state.
-    pub(super) fn spawn(self) -> Worker {
-        // Flag to communicate intent to shutdown.
-        let closing = Arc::new(AtomicBool::new(false));
-
-        // Spawn the worker thread.
-        let handle = {
-            let closing = closing.clone();
-            std::thread::spawn(|| self.process(closing))
-        };
-
-        // Return guard for the worker.
-        Worker {
-            closing,
-            handle: Some(handle),
-        }
-    }
-
-    fn process(mut self, closing: Arc<AtomicBool>) -> io::Result<()> {
+    fn process(mut self, closing: Arc<AtomicBool>) {
         use rayon::prelude::*;
 
         loop {
@@ -126,7 +264,6 @@ impl WorkerState {
                 eprintln!("Error during graceful close of page: {e}");
             }
         });
-        Ok(())
     }
 
     fn process_completions(&mut self) {
@@ -173,7 +310,7 @@ impl WorkerState {
 
         // Return early if storage has not been initialized.
         let page = &mut self.pages[self.next];
-        let Some(state) = page.state() else {
+        let Some(state) = page.metadata() else {
             tx.send(None);
             return;
         };
@@ -183,8 +320,8 @@ impl WorkerState {
         let mut state = StorageState {
             prev_seq_no: state.prev_seq_no,
             after_seq_no: state.after_seq_no,
-            disk_size: state.offset,
             log_count: state.count,
+            disk_size: state.file_size,
         };
 
         let mut prev = self.next;
@@ -198,17 +335,14 @@ impl WorkerState {
             }
 
             // Break if we can out of initialized pages.
-            let Some(page_state) = &self.pages[index].state() else {
+            let Some(page_state) = &self.pages[index].metadata() else {
                 break;
             };
 
             // Consume the page.
-            state.after_seq_no = page_state.after_seq_no;
-            state.disk_size += page_state.offset;
-            state.log_count += page_state.count;
-
-            // For next iteration.
             prev = index;
+            state.after_seq_no = page_state.after_seq_no;
+            state.log_count += page_state.count;
         }
 
         // Return the fully populated state.
@@ -230,14 +364,14 @@ impl WorkerState {
             };
 
             // Logs in storage will be after this sequence number.
-            assert!(page.initialize(first.prev_seq_no()));
+            page.initialize(first.prev_seq_no());
         }
 
         // Attempt to append the buffer of logs into the latest page.
-        if let ActionIo::Overflow = page.append(append, &mut self.io_queue) {
+        if !page.append(append, &mut self.io_queue) {
             // Fetch the state of the previous page.
             // We need this to link the sequence numbers for the next page.
-            let state = page.state().expect("Latest page should be initialized");
+            let_assert!(Some(state) = page.metadata());
 
             // Fetch the next page in the ring buffer.
             let next = self.next + 1;
@@ -247,13 +381,12 @@ impl WorkerState {
             // The the page is currently initialized,
             // it needs to be wiped clean for the new buffer of logs.
             if next_page.is_initialized() {
-                let result = next_page.reset(&mut self.io_queue);
-                assert!(!matches!(result, ActionIo::Overflow));
+                next_page.reset(&mut self.io_queue);
                 return;
             }
 
             // Otherwise the next page needs to be initialized before use.
-            assert!(next_page.initialize(state.prev_seq_no));
+            next_page.initialize(state.prev_seq_no);
             self.next = next;
         }
     }
@@ -289,7 +422,7 @@ impl WorkerState {
 
             // Get the next page to check.
             let page = &mut self.pages[index];
-            let Some(state) = page.state() else {
+            let Some(state) = page.metadata() else {
                 // There is no page that contains the requested range of logs.
                 tx.send_buf(buf, Err(QueryError::Trimmed(after_seq_no)));
                 break;
@@ -297,8 +430,7 @@ impl WorkerState {
 
             // If the page could contain requested logs, we attempt to read it.
             if state.after_seq_no <= after_seq_no {
-                let result = page.query(Query { buf, after_seq_no, tx }, &mut self.io_queue);
-                assert!(!matches!(result, ActionIo::Overflow));
+                page.query(Query { buf, after_seq_no, tx }, &mut self.io_queue);
                 break;
             }
 

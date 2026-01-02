@@ -9,11 +9,10 @@ use std::{
 
 /// A simple buffer pool of fixed size pre-allocated memory.
 ///
-/// Once constructed this allocator does no allocation. So given enough concurrency,
-/// pre-allocated memory can get exhausted and new allocations must wait for memory
-/// to be returned back.
-///
-/// Internally this allocator maintains a buffer pool to reuse memory, via mpmc channels.
+/// This buffer pool does not allocations. Once constructed more allocated buffers
+/// cannot be merged into this pool. So, given enough concurrency, this pool can get
+/// exhausted. Borrow from pool is quite cheap, for most workloads the recommendation
+/// is to release borrowed memory (via drop) when no longer necessary.
 #[derive(Debug, Clone)]
 pub struct BufPool {
     tx: flume::Sender<RawBytes>,

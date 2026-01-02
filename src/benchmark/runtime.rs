@@ -5,7 +5,7 @@ use std::{
     fs::{File, OpenOptions},
     io::Result,
     marker::PhantomData,
-    os::unix::fs::OpenOptionsExt,
+    os::{fd::AsRawFd, unix::fs::OpenOptionsExt},
     time::Instant,
 };
 use waldo::runtime::{BufPool, IoAction, IoBuf, IoFile, IoResponse, IoRuntime, RawBytes};
@@ -67,12 +67,12 @@ fn main() -> Result<()> {
 
     // Register file with runtime, if we have to.
     let (_file, io_file) = if args.register_file {
-        let mut files = vec![file];
+        let mut files = vec![file.as_raw_fd()];
         let f_files = runtime.register_files(&files)?;
         (files.pop().expect("File should be present"), IoFile::from(f_files[0]))
     } else {
         let io_file = IoFile::from(&file);
-        (file, io_file)
+        (file.as_raw_fd(), io_file)
     };
 
     // Allocate memory required.

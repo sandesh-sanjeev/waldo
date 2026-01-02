@@ -7,7 +7,7 @@ use crate::{
         session::{AppendError, QueryError},
     },
 };
-use std::collections::VecDeque;
+use std::{collections::VecDeque, io};
 
 /// Type alias for sender of action result that have shared buffer(s).
 pub(super) type BufSender<T, E> = FateSender<BufResult<T, E>>;
@@ -240,6 +240,12 @@ impl ActionCtx {
 #[error("Fate of async operation was lost")]
 pub(super) struct FateError;
 
+impl From<FateError> for io::Error {
+    fn from(_value: FateError) -> Self {
+        io::Error::new(io::ErrorKind::ConnectionAborted, "Fate sender dropped")
+    }
+}
+
 /// A oneshot channel to notify fate of a storage action.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) struct AsyncFate;
@@ -262,8 +268,8 @@ impl<T> FateSender<T> {
     /// # Arguments
     ///
     /// * `value` - Result of the storage action.
-    pub(super) fn send(self, value: T) {
-        let _ = self.0.send(value);
+    pub(super) fn send(self, value: T) -> bool {
+        self.0.send(value).is_ok()
     }
 }
 
