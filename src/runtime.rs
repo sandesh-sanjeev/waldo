@@ -3,14 +3,11 @@
 mod alloc;
 mod file;
 
-pub use alloc::{BufPool, Bytes, IoBuf, RawBytes};
+pub use alloc::{BufPool, Bytes, IoBuf, PoolOptions, RawBytes};
 pub use file::{IoFile, IoFileFd, IoFixedFd};
 
-use io_uring::{
-    IoUring, opcode,
-    squeue::{self, Flags},
-    types,
-};
+use io_uring::squeue::{self, Flags};
+use io_uring::{IoUring, opcode, types};
 use std::{collections::HashMap, io, os::fd::RawFd};
 use thiserror::Error;
 
@@ -49,11 +46,14 @@ pub struct IoRuntime<A> {
 impl<A> IoRuntime<A> {
     /// Create a new async I/O runtime.
     pub fn new(queue_depth: u32) -> io::Result<Self> {
-        let io_ring = IoUring::builder().build(queue_depth)?;
+        let mut io_ring = IoUring::builder()
+            .setup_single_issuer()
+            .setup_coop_taskrun()
+            .build(queue_depth)?;
 
         // Our limit on maximum pending I/O.
         // To protect against completion queue overflow.
-        let cq_capacity = io_ring.params().cq_entries() as usize;
+        let cq_capacity = io_ring.completion().capacity();
 
         Ok(Self {
             io_ring,
@@ -105,10 +105,26 @@ impl<A> IoRuntime<A> {
         Ok(())
     }
 
+    /// Maximum number of entries that can be fit into submission queue.
+    pub fn sq_capacity(&mut self) -> usize {
+        self.io_ring.submission().capacity()
+    }
+
+    /// Maximum number of entries that can be fit into completion queue.
+    pub fn cq_capacity(&mut self) -> usize {
+        self.io_ring.completion().capacity()
+    }
+
     /// Number of I/O actions runtime can submitted without sq overflow.
     pub fn sq_remaining(&mut self) -> usize {
         let sq = self.io_ring.submission();
         sq.capacity().saturating_sub(sq.len())
+    }
+
+    /// Number of I/O actions runtime can submitted without cq overflow.
+    pub fn cq_remaining(&mut self) -> usize {
+        let cq = self.io_ring.completion();
+        cq.capacity().saturating_sub(cq.len())
     }
 
     /// Number of I/O actions more that can be completed without cq overflow.
@@ -132,8 +148,7 @@ impl<A> IoRuntime<A> {
         let epoch = self.io_clock_tick();
 
         // Take care to not overflow the completion queue.
-        let cqe_capacity = self.io_ring.params().cq_entries() as usize;
-        if self.io_futures.len() >= cqe_capacity {
+        if self.io_futures.len() >= self.cq_capacity() {
             return Err((attachment, action));
         }
 

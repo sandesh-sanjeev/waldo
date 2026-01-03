@@ -1,14 +1,12 @@
 //! Definition of benchmarks for I/O uring runtime.
 
 use clap::Parser;
-use std::{
-    fs::{File, OpenOptions},
-    io::Result,
-    marker::PhantomData,
-    os::{fd::AsRawFd, unix::fs::OpenOptionsExt},
-    time::Instant,
-};
-use waldo::runtime::{BufPool, IoAction, IoBuf, IoFile, IoResponse, IoRuntime, RawBytes};
+use std::fs::{File, OpenOptions};
+use std::io::Result;
+use std::marker::PhantomData;
+use std::os::{fd::AsRawFd, unix::fs::OpenOptionsExt};
+use std::time::Instant;
+use waldo::{BufPool, IoAction, IoBuf, IoFile, IoResponse, IoRuntime, PoolOptions};
 
 /// Arguments for the I/O runtime benchmark.
 #[derive(Parser, Clone)]
@@ -75,16 +73,18 @@ fn main() -> Result<()> {
         (file.as_raw_fd(), io_file)
     };
 
-    // Allocate memory required.
-    let mut bufs = Vec::with_capacity(queue_depth as _);
-    for _ in 0..queue_depth {
-        bufs.push(RawBytes::allocate(args.buffer_size as _, args.huge_pages)?);
-    }
+    let opts = PoolOptions {
+        pool_size: queue_depth as _,
+        buf_capacity: args.buffer_size as _,
+        huge_buf: args.huge_pages,
+    };
 
-    // Register allocated buffers with the I/O runtime.
-    // Safety: Registered pointers, length and index are immutable.
-    unsafe { runtime.register_bufs(&mut bufs)? };
-    let buffer_pool = BufPool::new(bufs);
+    // Create buffer pool for the test.
+    let buffer_pool = if args.register_buf {
+        BufPool::registered(opts, &mut runtime)?
+    } else {
+        BufPool::unregistered(opts)?
+    };
 
     // Define the writer, if required.
     let mut writer = None;

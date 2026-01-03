@@ -1,9 +1,7 @@
 //! Reference to an open file descriptor used with I/O runtime.
 
-use std::{
-    fs::File,
-    os::fd::{AsRawFd, RawFd},
-};
+use std::fs::File;
+use std::os::fd::{AsRawFd, RawFd};
 
 /// References to different types of files that can participate in I/O.
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]

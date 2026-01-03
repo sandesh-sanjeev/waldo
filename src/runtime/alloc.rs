@@ -1,11 +1,23 @@
 //! A pre-allocated pool of buffers for I/O operations.
 
+use crate::runtime::IoRuntime;
 use memmap2::{MmapMut, MmapOptions};
-use std::{
-    ffi::c_void,
-    io::Result,
-    ops::{Deref, DerefMut},
-};
+use std::ffi::c_void;
+use std::io::{self, Result};
+use std::ops::{Deref, DerefMut};
+
+/// Options to customize the behavior of buffer pool.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PoolOptions {
+    /// Maximum number of pre-allocated buffers in the pool.
+    pub pool_size: u16,
+
+    /// Size of buffers used to perform I/O.
+    pub buf_capacity: usize,
+
+    /// Enable huge pages when allocating buffers.
+    pub huge_buf: bool,
+}
 
 /// A simple buffer pool of fixed size pre-allocated memory.
 ///
@@ -20,20 +32,55 @@ pub struct BufPool {
 }
 
 impl BufPool {
-    /// Create a new allocator.
+    /// Create a new buffer pool that is registered to an I/O runtime.
     ///
     /// # Arguments
     ///
-    /// * `bufs` - Buffers to populate the pool.
-    pub fn new(bufs: Vec<RawBytes>) -> Self {
-        let (tx, rx) = flume::bounded(bufs.len());
-        for buf in bufs {
+    /// * `opts` - Options to use when creating buffer pool.
+    /// * `runtime` - I/O runtime to register allocated buffers.
+    pub fn registered<A>(opts: PoolOptions, runtime: &mut IoRuntime<A>) -> io::Result<Self> {
+        // Allocate all memory for buffer pool.
+        let pool_size = usize::from(opts.pool_size);
+        let mut buffers = (0..pool_size)
+            .map(|_| RawBytes::allocate(opts.buf_capacity, opts.huge_buf))
+            .collect::<io::Result<Vec<_>>>()?;
+
+        // Register allocated memory with io uring runtime.
+        unsafe { runtime.register_bufs(&mut buffers)? };
+
+        // Populate internal buffers and return.
+        let (tx, rx) = flume::bounded(buffers.len());
+        for buf in buffers {
             if tx.try_send(buf).is_err() {
                 unreachable!("Should have enough space and receivers");
             }
         }
 
-        Self { tx, rx }
+        Ok(Self { tx, rx })
+    }
+
+    /// Create a new buffer pool that is not registered to a I/O runtime.
+    ///
+    /// # Arguments
+    ///
+    /// * `opts` - Options to use when creating buffer pool.
+    /// * `runtime` - I/O runtime to register allocated buffers.
+    pub fn unregistered(opts: PoolOptions) -> io::Result<Self> {
+        // Allocate all memory for buffer pool.
+        let pool_size = usize::from(opts.pool_size);
+        let buffers = (0..pool_size)
+            .map(|_| RawBytes::allocate(opts.buf_capacity, opts.huge_buf))
+            .collect::<io::Result<Vec<_>>>()?;
+
+        // Populate internal buffers and return.
+        let (tx, rx) = flume::bounded(buffers.len());
+        for buf in buffers {
+            if tx.try_send(buf).is_err() {
+                unreachable!("Should have enough space and receivers");
+            }
+        }
+
+        Ok(Self { tx, rx })
     }
 
     /// Take a block of pre-allocated memory from the pool.

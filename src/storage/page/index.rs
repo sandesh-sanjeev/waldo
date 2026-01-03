@@ -2,7 +2,7 @@
 
 use crate::log::Log;
 
-/// Options to influence working of sparse index backing a page.
+/// Options for sparse index backing a page.
 ///
 /// Sparser the index more number of bytes will be discarded during queries
 /// Denser the index, more memory is required for the index. Choose a value

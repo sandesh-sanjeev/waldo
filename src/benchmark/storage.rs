@@ -2,18 +2,11 @@
 
 use clap::Parser;
 use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
-use std::{
-    sync::{
-        Arc,
-        atomic::{AtomicU64, Ordering},
-    },
-    time::{Duration, Instant},
-};
-use tokio::fs::create_dir_all;
-use waldo::{
-    log::Log,
-    storage::{FileOpts, IndexOpts, Options, PageOptions, PoolOptions, Storage, StorageState},
-};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{Duration, Instant};
+use tokio::{fs::create_dir_all, time::MissedTickBehavior};
+use waldo::{FileOpts, IndexOpts, Log, Metadata, Options, PageOptions, PoolOptions, Storage};
 
 /// Arguments for the I/O runtime benchmark.
 #[derive(Parser, Clone)]
@@ -22,6 +15,10 @@ struct Arguments {
     /// Path to the test file on disk.
     #[arg(long, default_value = "bench")]
     path: String,
+
+    /// Enable data sync to disk with every write.
+    #[arg(long, action)]
+    o_dsync: bool,
 
     /// Maximum number of pages in storage.
     #[arg(long, default_value = "4")]
@@ -90,7 +87,7 @@ impl From<&Arguments> for Options {
                     sparse_bytes: value.index_sparse_bytes,
                 },
                 file_opts: FileOpts {
-                    o_dsync: false,
+                    o_dsync: value.o_dsync,
                     capacity: value.page_file_capacity_gb * 1024 * 1024 * 1024,
                 },
             },
@@ -123,11 +120,11 @@ async fn main() -> anyhow::Result<()> {
     // Open storage at the given path.
     let start = Instant::now();
     let storage = Storage::open(&args.path, Options::from(&args)).await?;
-    let state = storage.state().await;
+    let state = storage.metadata().await;
     let init_time = start.elapsed().as_secs_f64();
 
     // Print starting state of storage.
-    if let Some(StorageState {
+    if let Some(Metadata {
         after_seq_no: after,
         prev_seq_no: prev,
         disk_size: size,
@@ -219,6 +216,7 @@ async fn main() -> anyhow::Result<()> {
         workers.push(tokio::spawn(async move {
             let mut prev_seq_no = prev;
             let mut interval = tokio::time::interval(delay);
+            interval.set_missed_tick_behavior(MissedTickBehavior::Delay);
             while prev_seq_no < end {
                 // Wait for enough time to have passed.
                 interval.tick().await;
@@ -245,6 +243,7 @@ async fn main() -> anyhow::Result<()> {
         workers.push(tokio::spawn(async move {
             let mut prev_seq_no = prev;
             let mut interval = tokio::time::interval(delay);
+            interval.set_missed_tick_behavior(MissedTickBehavior::Skip);
             let mut logs = Vec::with_capacity(batch_size);
             while prev_seq_no < end {
                 // Wait for enough time to have passed.

@@ -2,17 +2,13 @@
 
 use crate::runtime::{IoAction, IoBuf, IoFile, IoFixedFd};
 use memmap2::{Advice, Mmap, MmapOptions};
-use std::{
-    fs::{File, OpenOptions},
-    io::{Error, ErrorKind, Result},
-    os::{
-        fd::{AsRawFd, RawFd},
-        unix::fs::OpenOptionsExt,
-    },
-    path::Path,
-};
+use std::fs::{File, OpenOptions};
+use std::io::{Error, ErrorKind, Result};
+use std::os::fd::{AsRawFd, RawFd};
+use std::os::unix::fs::OpenOptionsExt;
+use std::path::Path;
 
-/// Options to influence working of file backing a page.
+/// Options for file backing a page.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct FileOpts {
     /// Maximum size of a page file.

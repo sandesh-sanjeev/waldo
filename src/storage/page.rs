@@ -5,23 +5,14 @@ mod index;
 
 pub use {file::FileOpts, index::IndexOpts};
 
-use crate::{
-    log::LogIter,
-    runtime::{IoAction, IoFixedFd},
-    storage::{
-        action::{Action, ActionCtx, Append, IoQueue, PageIo, Query},
-        page::{file::PageFile, index::PageIndex},
-        session::{AppendError, QueryError},
-    },
-};
+use crate::storage::action::{Action, ActionCtx, Append, AsyncIo, Query};
+use crate::storage::page::{file::PageFile, index::PageIndex};
+use crate::storage::queue::IoQueue;
+use crate::{AppendError, IoAction, IoFixedFd, LogIter, QueryError};
 use assert2::let_assert;
-use std::{
-    io::{self},
-    os::fd::RawFd,
-    path::Path,
-};
+use std::{io, os::fd::RawFd, path::Path};
 
-/// Options to customize the behavior of a page.
+/// Options for a page.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PageOptions {
     /// Maximum number of log records in a page.
@@ -265,7 +256,7 @@ impl Page {
         }
 
         // Enqueue I/O action for execution asynchronously.
-        queue.issue(PageIo {
+        queue.issue(AsyncIo {
             id: self.id,
             ctx: ActionCtx::append(tx),
             action: self.file.append(buf),
@@ -339,7 +330,7 @@ impl Page {
         buf.set_len(len);
 
         // Enqueue I/O action for execution asynchronously.
-        queue.issue(PageIo {
+        queue.issue(AsyncIo {
             id: self.id,
             ctx: ActionCtx::query(tx),
             action: self.file.query(offset, buf),
@@ -381,7 +372,7 @@ impl Page {
         }
 
         // Enqueue I/O action for execution asynchronously.
-        queue.issue(PageIo {
+        queue.issue(AsyncIo {
             id: self.id,
             ctx: ActionCtx::Reset,
             action: self.file.clear(),
@@ -417,7 +408,7 @@ impl Page {
 
                 // Initiate a sync to disk.
                 // Makes sure page reset is durably stored to disk.
-                queue.issue(PageIo {
+                queue.issue(AsyncIo {
                     id: self.id,
                     ctx: ActionCtx::Fsync,
                     action: self.file.fsync(),
