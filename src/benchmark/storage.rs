@@ -218,15 +218,12 @@ async fn main() -> anyhow::Result<()> {
             let mut interval = tokio::time::interval(delay);
             interval.set_missed_tick_behavior(MissedTickBehavior::Delay);
             while prev_seq_no < end {
-                // Wait for enough time to have passed.
+                // Make sure enough time has passed.
                 interval.tick().await;
 
-                // Attempt to fetch the next set of logs.
-                let mut session = storage.session().await;
-                let logs = session.query(prev_seq_no).await?;
-
-                // Consume logs queried from storage.
-                for log in logs {
+                // Fetch and process next set of logs.
+                let logs = storage.query(prev_seq_no).await?;
+                for log in &logs {
                     prev_seq_no = log?.seq_no();
                 }
             }
@@ -242,11 +239,12 @@ async fn main() -> anyhow::Result<()> {
         let storage = storage.clone();
         workers.push(tokio::spawn(async move {
             let mut prev_seq_no = prev;
+            let mut logs = Vec::with_capacity(batch_size);
+
             let mut interval = tokio::time::interval(delay);
             interval.set_missed_tick_behavior(MissedTickBehavior::Skip);
-            let mut logs = Vec::with_capacity(batch_size);
             while prev_seq_no < end {
-                // Wait for enough time to have passed.
+                // Make sure enough time has passed.
                 interval.tick().await;
 
                 // Logs to write to page.
@@ -258,8 +256,7 @@ async fn main() -> anyhow::Result<()> {
                 }
 
                 // Append the next set of bytes.
-                let mut session = storage.session().await;
-                session.append(&logs).await?;
+                storage.append(&logs).await?;
                 latest_seq_no.store(prev_seq_no, Ordering::Relaxed);
             }
 

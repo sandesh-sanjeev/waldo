@@ -8,11 +8,10 @@ mod worker;
 
 pub use self::page::{FileOpts, IndexOpts, PageOptions};
 
-use crate::log::{Log, SequencedLogIter};
-use crate::runtime::{BufPool, IoBuf, PoolOptions};
 use crate::storage::action::{Action, FateError};
 use crate::storage::page::{Page, PageMetadata};
 use crate::storage::worker::Worker;
+use crate::{BufPool, IoBuf, Log, LogError, PoolOptions, SequencedLogIter};
 use std::ops::AddAssign;
 use std::{io, path::Path, sync::Arc};
 
@@ -134,39 +133,6 @@ impl Storage {
         rx.recv_async().await.ok()?
     }
 
-    /// A new session to perform operations against storage.
-    pub async fn session(&self) -> Session<'_> {
-        let buf = self.buf_pool.take_async().await;
-        Session::new(buf, &self.tx)
-    }
-}
-
-/// A long lived connection to storage.
-///
-/// A session allows one to append and query log records from storage.
-///
-/// Note that a session borrows limited resources, you limit creation of new
-/// sessions by holding on to a session. So depending on how to you plan to use
-/// the session, you might want to release it (by dropping) when not being used.
-pub struct Session<'a> {
-    buf: Option<IoBuf>,
-    action_tx: &'a flume::Sender<Action>,
-}
-
-impl Session<'_> {
-    /// Create a new session.
-    ///
-    /// # Arguments
-    ///
-    /// * `buf` - Buffer to back this session.
-    /// * `action_tx` - Sender to send actions to storage.
-    fn new(buf: IoBuf, action_tx: &flume::Sender<Action>) -> Session<'_> {
-        Session {
-            action_tx,
-            buf: Some(buf),
-        }
-    }
-
     /// Append logs to storage.
     ///
     /// # Atomicity
@@ -187,22 +153,29 @@ impl Session<'_> {
     /// across threads, always operate against latest state of storage. If storage processes
     /// two concurrent appends, one of them will be rejected with conflict.
     ///
+    /// # Cancel safety
+    ///
+    /// If this method is cancelled between an append, any number of logs might be durably
+    /// appended into storage. Use [`Self::metadata`] to know the latest state of storage.
+    ///
     /// # Arguments
     ///
     /// * `logs` - Log records to append into storage.
-    pub async fn append(&mut self, mut logs: &[Log<'_>]) -> Result<(), AppendError> {
+    pub async fn append(&self, mut logs: &[Log<'_>]) -> Result<(), AppendError> {
         // Return early if there is nothing to append.
         if logs.is_empty() {
             return Ok(());
         }
 
-        // Process the list of provided log records.
+        // Make sure a valid range of logs were provided.
         Self::assert_logs(logs)?;
+
+        // Borrow buffer from pool for this operation.
+        let mut buf = self.buf_pool.take_async().await;
+
+        // Process the list of provided log records.
         while !logs.is_empty() {
-            // Take ownership of the buffer to share with storage.
-            let mut buf = self
-                .take_buf()
-                .ok_or(AppendError::Fault("Buffer does not exist in a session"))?;
+            buf.clear();
 
             // Populate buffer with serialized log bytes.
             // Keep track of logs that couldn't be fit into buffer.
@@ -211,11 +184,11 @@ impl Session<'_> {
 
             // Wait for a slot in the queue and submit append action.
             let (append, rx) = Action::append(buf);
-            self.action_tx.send_async(append).await?;
+            self.tx.send_async(append).await?;
 
-            // Await and return result from storage.
-            let (buf, result) = rx.recv_async().await?;
-            self.buf.replace(buf);
+            // Consume results from storage.
+            let (r_buf, result) = rx.recv_async().await?;
+            buf = r_buf;
             result?;
         }
 
@@ -228,8 +201,7 @@ impl Session<'_> {
     /// chunk of sequential log records in ascending order of sequence numbers.
     ///
     /// You cannot specify limits, this method will query for as many log records
-    /// as efficiently possible. You can discard the log you don't want, it's free.
-    /// Or query for more if you need more logs.
+    /// as efficiently possible. You can discard logs you don't want, it's free.
     ///
     /// # Isolation
     ///
@@ -239,48 +211,20 @@ impl Session<'_> {
     /// # Arguments
     ///
     /// * `after_seq_no` - Query for logs after this sequence number.
-    pub async fn query(&mut self, after_seq_no: u64) -> Result<SequencedLogIter<'_>, QueryError> {
-        // Take ownership of the buffer to share with storage.
-        let buf = self
-            .take_buf()
-            .ok_or(QueryError::Fault("Buffer does not exist in a session"))?;
+    pub async fn query(&self, after_seq_no: u64) -> Result<QueryLogs, QueryError> {
+        // Borrow buffer from pool for this operation.
+        let buf = self.buf_pool.take_async().await;
 
         // Submit action to append bytes into storage.
         let (query, rx) = Action::query(after_seq_no, buf);
-        self.action_tx.send_async(query).await?;
+        self.tx.send_async(query).await?;
 
         // Await and return result from storage.
         let (buf, result) = rx.recv_async().await?;
-        self.buf.replace(buf);
         result?;
 
-        // Return reference to all the log records read from query.
-        let buf = unsafe { self.buf.as_ref().unwrap_unchecked() };
-
-        // Figure out offset to the starting seq_no.
-        // For performance reasons storage might return a few extra logs
-        // at the beginning of the buffer. We have to skip past those.
-        let mut offset = 0;
-        for log in buf {
-            // We've reached the target offset in the underlying buffer.
-            if log.seq_no() > after_seq_no {
-                break;
-            }
-
-            offset += log.size();
-        }
-
-        // Range of log bytes to return.
-        let bytes = unsafe { buf.split_at_unchecked(offset).1 };
-
         // Return iterator for the rest of the log records.
-        Ok(SequencedLogIter::new(bytes, after_seq_no))
-    }
-
-    fn take_buf(&mut self) -> Option<IoBuf> {
-        let mut buf = self.buf.take()?;
-        buf.clear(); // Clear prior state.
-        Some(buf)
+        Ok(QueryLogs::new(buf, after_seq_no))
     }
 
     fn assert_logs(logs: &[Log<'_>]) -> Result<(), AppendError> {
@@ -316,6 +260,45 @@ impl Session<'_> {
 
         // Return unconsumed log records.
         unsafe { logs.split_at_unchecked(consumed).1 }
+    }
+}
+
+/// A contiguous chunk of logs queried from storage.
+#[derive(Debug)]
+pub struct QueryLogs {
+    buf: IoBuf,
+    offset: usize,
+    prev_seq_no: u64,
+}
+
+impl QueryLogs {
+    fn new(buf: IoBuf, prev_seq_no: u64) -> Self {
+        // Figure out offset to the starting seq_no.
+        // For performance reasons storage might return a few extra logs
+        // at the beginning of the buffer. We have to skip past those.
+        let mut offset = 0;
+        for log in &buf {
+            if log.seq_no() > prev_seq_no {
+                break;
+            }
+
+            offset += log.size();
+        }
+
+        Self {
+            buf,
+            offset,
+            prev_seq_no,
+        }
+    }
+}
+
+impl<'a> IntoIterator for &'a QueryLogs {
+    type IntoIter = SequencedLogIter<'a>;
+    type Item = Result<Log<'a>, LogError>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        SequencedLogIter::new(&self.buf[self.offset..], self.prev_seq_no)
     }
 }
 
