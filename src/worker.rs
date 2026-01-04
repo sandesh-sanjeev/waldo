@@ -1,17 +1,17 @@
 //! Worker executing all storage actions.
 
-use crate::storage::action::{ActionCtx, AsyncFate, AsyncIo};
-use crate::storage::queue::IoQueue;
-use crate::storage::ring::PageRing;
-use crate::storage::{Action, Options};
-use crate::{BufPool, IoError, IoResponse, IoRuntime};
+use crate::Options;
+use crate::action::{Action, ActionCtx, AsyncFate, AsyncIo};
+use crate::queue::IoQueue;
+use crate::ring::PageRing;
+use crate::runtime::{BufPool, IoError, IoResponse, IoRuntime};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::{io, path::Path, thread::JoinHandle, time::Duration};
 
 /// A single threaded worker coordinating all storage actions.
 #[derive(Debug)]
-pub(super) struct Worker {
+pub(crate) struct Worker {
     closing: Arc<AtomicBool>,
     handle: Option<JoinHandle<()>>,
 }
@@ -25,7 +25,7 @@ impl Worker {
     ///
     /// * `path` - Path to the home directory of storage instance.
     /// * `opts` - Options to open storage.
-    pub(super) async fn spawn(path: &Path, opts: Options) -> io::Result<(BufPool, flume::Sender<Action>, Self)> {
+    pub(crate) async fn spawn(path: &Path, opts: Options) -> io::Result<(BufPool, flume::Sender<Action>, Self)> {
         // Channel to return result of spawn.
         let (fate_tx, fate_rx) = AsyncFate::channel();
 

@@ -1,11 +1,11 @@
 //! A queue to buffer and schedule user/system actions.
 
-use crate::storage::{Action, action::AsyncIo};
+use crate::action::{Action, AsyncIo};
 use std::collections::VecDeque;
 
 /// A queue of asynchronous actions tracked in storage.
 #[derive(Debug)]
-pub(super) struct IoQueue {
+pub(crate) struct IoQueue {
     // Async actions initiated by one or more pages.
     issued: VecDeque<AsyncIo>,
 
@@ -24,7 +24,7 @@ impl IoQueue {
     /// # Arguments
     ///
     /// * `capacity` - Initially allocated capacity of the queue.
-    pub(super) fn with_capacity(capacity: usize) -> Self {
+    pub(crate) fn with_capacity(capacity: usize) -> Self {
         Self {
             queued: VecDeque::with_capacity(capacity),
             issued: VecDeque::with_capacity(capacity),
@@ -33,17 +33,17 @@ impl IoQueue {
     }
 
     /// Total number of I/O actions currently queued.
-    pub(super) fn len(&self) -> usize {
+    pub(crate) fn len(&self) -> usize {
         self.queued.len() + self.issued.len() + self.reprocess.len()
     }
 
     /// True if there is nothing queued, false otherwise.
-    pub(super) fn is_empty(&self) -> bool {
+    pub(crate) fn is_empty(&self) -> bool {
         self.len() == 0
     }
 
     /// True if there are issued io actions.
-    pub(super) fn is_empty_issued(&self) -> bool {
+    pub(crate) fn is_empty_issued(&self) -> bool {
         self.issued.is_empty()
     }
 
@@ -52,7 +52,7 @@ impl IoQueue {
     /// # Arguments
     ///
     /// * `action` - Action to issue.
-    pub(super) fn issue(&mut self, action: AsyncIo) {
+    pub(crate) fn issue(&mut self, action: AsyncIo) {
         self.issued.push_back(action);
     }
 
@@ -63,12 +63,12 @@ impl IoQueue {
     /// # Arguments
     ///
     /// * `action` - Action to re-issue.
-    pub(super) fn reissue(&mut self, action: AsyncIo) {
+    pub(crate) fn reissue(&mut self, action: AsyncIo) {
         self.issued.push_front(action);
     }
 
     /// Dequeue an issued page action.
-    pub(super) fn pop_issued(&mut self) -> Option<AsyncIo> {
+    pub(crate) fn pop_issued(&mut self) -> Option<AsyncIo> {
         self.issued.pop_front()
     }
 
@@ -77,12 +77,12 @@ impl IoQueue {
     /// # Arguments
     ///
     /// * `action` - Action to enqueue for processing.
-    pub(super) fn queue(&mut self, action: Action) {
+    pub(crate) fn queue(&mut self, action: Action) {
         self.queued.push_back(action);
     }
 
     /// Dequeue an action for processing.
-    pub(super) fn pop_queued(&mut self) -> Option<Action> {
+    pub(crate) fn pop_queued(&mut self) -> Option<Action> {
         self.queued.pop_front()
     }
 
@@ -91,12 +91,12 @@ impl IoQueue {
     /// # Arguments
     ///
     /// * `action` - Action to enqueue.
-    pub(super) fn reprocess(&mut self, action: Action) {
+    pub(crate) fn reprocess(&mut self, action: Action) {
         self.reprocess.push_back(action);
     }
 
     /// Dequeue a pending storage action for reprocessing.
-    pub(super) fn pop_reprocess(&mut self) -> Option<Action> {
+    pub(crate) fn pop_reprocess(&mut self) -> Option<Action> {
         self.reprocess.pop_front()
     }
 }

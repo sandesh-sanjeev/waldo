@@ -1,9 +1,12 @@
 # Waldo
 
 Waldo is an asynchronous storage engine to hold sequential log records. It is a lock-free, append-only, on-disk 
-ring buffer with excellent performance characteristics. It provides a minimal set of APIs to append new log records 
-and query arbitrary log ranges. It was initially developed to store write ahead logs for an MVCC aware datastore, 
-hence the name.
+ring buffer. It was initially developed to store write ahead logs for an MVCC aware datastore, hence the name.
+
+Waldo resides in your process (embedded), requires no maintenance and has excellent performance characteristics.
+It provides an intentionally minimal set of APIs to interact with it, primarily conditional appends of a batch of 
+records and query an arbitrary range of records. The only expected extension to this API is addition of a stream
+style interface.
 
 Waldo uses io-uring APIs in linux for batching and asynchronous execution of disk I/O. Consequently linux is
 the only supported OS, and requires a relatively recent kernel version (6.8+).
@@ -20,7 +23,7 @@ the only supported OS, and requires a relatively recent kernel version (6.8+).
 ## Design
 
 Storage is organized into pages where every page holds a contiguous chunk of log records. Only one page is ever
-active for writes. When this page runs out of capacity, it is rotated away with another page. This might be an
+active for writes. When this page runs out of capacity, it is rotated away with another page. This is either an
 empty page, or a page that contains oldest log records. If it's the latter, the page is truncated prior to use.
 
 A page is physically backed by a file on disk and an in-memory index. Backing file is a flat file of serialized
@@ -31,18 +34,45 @@ A single threaded worker coordinates all reads and writes from storage. Rest of 
 using queues (io-uring) and channels (your application). All memory, except those necessary to create oneshot channels
 is allocated once during initialization and reused.
 
-Storage does no caching, it is entirely the responsibility of the OS and file system caches. While user space cache
-with direct I/O seems attractive at first, alignment rules make it harder to implement correctly and more importantly
-hurts performance with a single threaded writer.
+Every log record must contain a monotonically increasing sequence number to uniquely identify the record, sequence
+number of previous log record and an associated payload. Logs must be appended in order and without gaps where current
+and previous sequence numbers create an implicit "append iff previous == last committed record in storage" condition.
+Conversely queried logs are always returned in order and without gaps.
 
 When appending a batch of log records, atomicity is only guaranteed for a single log record, not for the entire batch.
 For durability guarantees, enable `o_dsync` flag in `FileOptions`. This should be a great choice for most applications,
 unless you really don't care about losing some logs from the tip of storage.
 
-Finally, every open of storage results in parsing and validation of all storage files. Additionally any corruption is
+Finally, every `open` of Waldo results in parsing and validation of all storage files. Importantly any corruption is
 automatically truncated away so that storage always holds a contiguous sequence of valid log records. There is
-support to validate integrity of log records when iterating through queried logs. However recommendation is instead
-having your own integrity checking mechanism or even better encrypt your logs - whatever makes sense for your use case.
+support to additionally validate integrity of log records when iterating through queried logs. However recommendation 
+is instead having your own integrity checking mechanism or even better encrypt your logs - whatever makes sense for
+your use case.
+
+## Caching
+
+Waldo does no caching, it is entirely the responsibility of the OS and file system caches. It makes no assumptions
+around the append or access patterns. Every workload is different, it is important to benchmark and establish ideal
+waldo parameters such as queue-depth and buffer pool size.
+
+## Unsafe
+
+io-uring requires asynchronously sharing memory with the kernel. This is inherently an unsafe operation, i.e, buffers
+must remain valid and untouched while kernel has a reference to the buffer. There is only one (safe) interface to
+achieve this in async rust (futures can be cancelled), taking ownership of buffer and stashing it away while kernel
+holds a reference, that's what this crate does.
+
+There are unsafe uses in few other places to remove unnecessary bounds checking in hot code path, where Rust/LLVM do
+not automatically elide bounds checking. They are trivially provable correct with manual inspection and specialized 
+tools like Miri and Kani.
+
+## Unsupported
+
+These are non-goals and will probably never be supported.
+
+* Non-Linux OS, or linux with kernel < 6.8.
+* Concurrent access from multiple processes.
+* Direct I/O, DMA, SPDK, etc.
 
 ## Gotchas
 
@@ -51,7 +81,8 @@ having your own integrity checking mechanism or even better encrypt your logs - 
 For best performance enable buffer pool allocation using huge pages. Note that when huge pages is enabled,
 buffer capacity must be non-zero multiples of system huge page size, which is usually 2 MB. 
 
-Configuration updates (and reboot) maybe necessary to make sure OS has enough huge pages available. On most distributions this can be done via sysctl, for example `sudo sysctl -w vm.nr_hugepages=256`.
+Configuration updates (and reboot) maybe necessary to make sure OS has enough huge pages available. On most 
+distributions this can be done via sysctl, for example `sudo sysctl -w vm.nr_hugepages=256`.
 
 ### Memlock
 
@@ -65,11 +96,11 @@ Benchmarks must be performed on your machine with your workload, otherwise it is
 
 ### Steady state
 
-In this test all the readers are caught up to the tip of storage. They continue to query from storage at
-the same rate as the writer. This is the best case scenario that is likely to result in high rate of file 
-system cache hits, meaning most queries are really memcpy.
+In this test all the readers are caught up to the tip of storage. They continue to query from storage at the same rate 
+as appends from writer. This is the best case scenario that is likely to result in high rate of file system cache hits, 
+meaning most queries are really memcpy.
 
-Linux VM (4 cores, 8 GB RAM) running on my M1 Mac Pro.
+* Linux VM (4 cores, 8 GB RAM) running on my M1 Mac Pro.
 
 ```text
 Storage | InitTime: 0.56 s  | Logs: 3141632 in (21987328, 25128960]     | Size: 3.00 GB
@@ -100,7 +131,8 @@ Use [`perf`](https://www.brendangregg.com/perf.html), [`cargo flamegraph`](https
 etc to run profiler with benchmarks. Benchmark binaries must be built/executed with `--profile bench` to include 
 debug symbols in benchmark binaries.
 
-Note that to capture kernel events without using sudo, some updates maybe necessary. Remember to revert back when no longer necessary.
+Note that to capture kernel events without using sudo, some updates maybe necessary. Remember to revert back when 
+no longer necessary.
 
 ```bash
 $ echo 0 | sudo tee /proc/sys/kernel/kptr_restrict

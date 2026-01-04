@@ -1,6 +1,6 @@
 //! A pre-allocated pool of buffers for I/O operations.
 
-use crate::runtime::IoRuntime;
+use super::IoRuntime;
 use memmap2::{MmapMut, MmapOptions};
 use std::ffi::c_void;
 use std::io::{self, Result};
@@ -64,7 +64,7 @@ impl BufPool {
     /// # Arguments
     ///
     /// * `opts` - Options to use when creating buffer pool.
-    /// * `runtime` - I/O runtime to register allocated buffers.
+    #[allow(dead_code)]
     pub fn unregistered(opts: PoolOptions) -> io::Result<Self> {
         // Allocate all memory for buffer pool.
         let pool_size = usize::from(opts.pool_size);
@@ -87,6 +87,7 @@ impl BufPool {
     ///
     /// Note that this operation blocks till memory is available in the pool.
     /// For a non-blocking variant use [`BufPool::try_take`] or [`BufPool::take_async`] for async.
+    #[allow(dead_code)]
     pub fn take(&self) -> IoBuf {
         match self.rx.recv() {
             Ok(bytes) => Bytes::new(bytes, &self.tx).into(),
@@ -98,6 +99,7 @@ impl BufPool {
     ///
     /// Note that this operation does not block waiting for memory to be available from the pool.
     /// For a blocking variant use [`BufPool::take`] or [`BufPool::take_async`] for async.
+    #[allow(dead_code)]
     pub fn try_take(&self) -> Option<IoBuf> {
         match self.rx.try_recv() {
             Err(flume::TryRecvError::Empty) => None,
@@ -115,7 +117,7 @@ impl BufPool {
     }
 }
 
-/// A [`Vec`] like growable array of bytes with a fixed maximum size.
+/// A Vec like growable array of bytes with a fixed maximum size.
 #[derive(Debug)]
 pub struct IoBuf {
     // Page aligned memory that backs this buffer.

@@ -3,8 +3,17 @@
 mod alloc;
 mod file;
 
-pub use alloc::{BufPool, Bytes, IoBuf, PoolOptions, RawBytes};
+pub use alloc::PoolOptions;
+
+#[cfg(feature = "benchmark")]
+pub use alloc::{BufPool, Bytes, IoBuf, RawBytes};
+#[cfg(feature = "benchmark")]
 pub use file::{IoFile, IoFileFd, IoFixedFd};
+
+#[cfg(not(feature = "benchmark"))]
+pub(crate) use alloc::{BufPool, IoBuf, RawBytes};
+#[cfg(not(feature = "benchmark"))]
+pub(crate) use file::{IoFile, IoFixedFd};
 
 use io_uring::squeue::{self, Flags};
 use io_uring::{IoUring, opcode, types};
@@ -106,6 +115,7 @@ impl<A> IoRuntime<A> {
     }
 
     /// Maximum number of entries that can be fit into submission queue.
+    #[allow(dead_code)]
     pub fn sq_capacity(&mut self) -> usize {
         self.io_ring.submission().capacity()
     }

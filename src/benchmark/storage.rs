@@ -6,7 +6,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 use tokio::{fs::create_dir_all, time::MissedTickBehavior};
-use waldo::{FileOpts, IndexOpts, Log, Metadata, Options, PageOptions, PoolOptions, Storage};
+use waldo::{FileOpts, IndexOpts, Log, Metadata, Options, PageOptions, PoolOptions, Waldo};
 
 /// Arguments for the I/O runtime benchmark.
 #[derive(Parser, Clone)]
@@ -119,7 +119,7 @@ async fn main() -> anyhow::Result<()> {
 
     // Open storage at the given path.
     let start = Instant::now();
-    let storage = Storage::open(&args.path, Options::from(&args)).await?;
+    let storage = Waldo::open(&args.path, Options::from(&args)).await?;
     let state = storage.metadata().await;
     let init_time = start.elapsed().as_secs_f64();
 

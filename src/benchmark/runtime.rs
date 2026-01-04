@@ -6,7 +6,7 @@ use std::io::Result;
 use std::marker::PhantomData;
 use std::os::{fd::AsRawFd, unix::fs::OpenOptionsExt};
 use std::time::Instant;
-use waldo::{BufPool, IoAction, IoBuf, IoFile, IoResponse, IoRuntime, PoolOptions};
+use waldo::runtime::{BufPool, IoAction, IoBuf, IoFile, IoResponse, IoRuntime, PoolOptions};
 
 /// Arguments for the I/O runtime benchmark.
 #[derive(Parser, Clone)]
