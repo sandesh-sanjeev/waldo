@@ -90,15 +90,9 @@ impl Log<'_> {
 
     /// Serialized size of the log record.
     pub fn size(&self) -> usize {
-        let size = self.true_size();
-
-        // Additional padding to add to a log record so that address of starting
-        // offset of the log record is aligned to 8 byte boundaries. This makes
-        // deserialization of the header a pure pointer cast, i.e, fast.
-        let extra = size & 7; // Equivalent to "size % 8"
-        let padding = if extra > 0 { 8 - extra } else { 0 };
-
-        size + padding
+        // This rounds up the size so that it is aligned to 8 byte boundaries.
+        // This makes deserialization of the header a pure pointer cast, i.e, fast.
+        (self.true_size() + 7) & !7
     }
 
     /// True size of the log record, excluding padding.
@@ -144,7 +138,7 @@ impl Log<'_> {
 
         // Fetch payload associated with the log record.
         let data_size = header.data_size as usize;
-        let (data, _) = rest.split_at_checked(data_size)?;
+        let data = unsafe { rest.get_unchecked(..data_size) };
 
         // Return fully deserialized log record.
         Some(Log {
@@ -190,7 +184,7 @@ impl<'a> Iterator for LogIter<'a> {
 
         // Safety: We just read enough bytes for the parsed log record.
         // Compiler/LLVM is not smart enough to know this and remove bounds check.
-        self.0 = unsafe { self.0.split_at_unchecked(log.size()).1 };
+        self.0 = unsafe { self.0.get_unchecked(log.size()..) };
 
         // Return fully parsed record.
         Some(log)
@@ -214,7 +208,6 @@ pub enum Error {
 pub struct SequencedLogIter<'a> {
     bytes: &'a [u8],
     prev_seq_no: u64,
-    is_error: bool,
 }
 
 impl SequencedLogIter<'_> {
@@ -225,11 +218,7 @@ impl SequencedLogIter<'_> {
     /// * `bytes` - Bytes to iterate through.
     /// * `prev_seq_no` - Sequence number of the immediately previous log.
     pub(crate) fn new(bytes: &[u8], prev_seq_no: u64) -> SequencedLogIter<'_> {
-        SequencedLogIter {
-            bytes,
-            prev_seq_no,
-            is_error: false,
-        }
+        SequencedLogIter { bytes, prev_seq_no }
     }
 }
 
@@ -237,21 +226,15 @@ impl<'a> Iterator for SequencedLogIter<'a> {
     type Item = Result<Log<'a>, Error>;
 
     fn next(&mut self) -> Option<Self::Item> {
-        // Return early if this iterator already completed with an error.
-        if self.is_error {
-            return None;
-        }
-
         // Attempt to deserialize the next set of bytes into log.
         let log = Log::read(self.bytes)?;
 
         // Safety: We just read enough bytes for the parsed log record.
         // Compiler/LLVM is not smart enough to know this and remove bounds check.
-        self.bytes = unsafe { self.bytes.split_at_unchecked(log.size()).1 };
+        self.bytes = unsafe { self.bytes.get_unchecked(log.size()..) };
 
         // Make sure unbroken sequence of logs.
         if self.prev_seq_no != log.prev_seq_no() {
-            self.is_error = true;
             return Some(Err(Error::Sequence(log.seq_no(), log.prev_seq_no(), self.prev_seq_no)));
         }
 

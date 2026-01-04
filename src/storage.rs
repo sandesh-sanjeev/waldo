@@ -276,14 +276,11 @@ impl QueryLogs {
         // Figure out offset to the starting seq_no.
         // For performance reasons storage might return a few extra logs
         // at the beginning of the buffer. We have to skip past those.
-        let mut offset = 0;
-        for log in &buf {
-            if log.seq_no() > prev_seq_no {
-                break;
-            }
-
-            offset += log.size();
-        }
+        let offset = buf
+            .into_iter()
+            .take_while(|log| log.seq_no() <= prev_seq_no)
+            .map(|log| log.size())
+            .sum();
 
         Self {
             buf,

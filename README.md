@@ -46,7 +46,7 @@ Run benchmark with profiler.
 <https://crates.io/crates/flamegraph>
 
 ```bash
-$ cargo flamegraph --bin bench_runtime --features benchmark --profile bench -- --register-file --register-buf --huge-pages --readers 31
+$ cargo flamegraph --bin runtime --features benchmark --profile bench -- --register-file --register-buf --huge-pages --readers 31
 ```
 
 To capture kernel events without using sudo, something like this is required:
