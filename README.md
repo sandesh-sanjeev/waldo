@@ -96,18 +96,39 @@ Benchmarks must be performed on your machine with your workload, otherwise it is
 
 ### Steady state
 
-In this test all the readers are caught up to the tip of storage. They continue to query from storage at the same rate 
-as appends from writer. This is the best case scenario that is likely to result in high rate of file system cache hits, 
-meaning most queries are really memcpy.
+In this test all the readers are caught up to the tip of storage. They continue to query from storage with the same rate 
+as appends from writer. This is the best case scenario where high file cache hit rate is likely, meaning most queries are 
+really memcpy (rather than read from disk).
 
-* Linux VM (4 cores, 8 GB RAM) running on my M1 Mac Pro.
+An example result with Waldo on a Linux VM (4 cores, 8 GB RAM) running on my M1 Mac Pro. Upto 30 GB/s worth of log records
+queried and upto 1 GB/s worth of log records appended. Number of readers that can be supported is inversely proportional to
+rate that which logs are appended. 
+
+Low append rate (10 MB/s) with 3000 concurrent readers.
 
 ```text
-Storage | InitTime: 0.56 s  | Logs: 3141632 in (21987328, 25128960]     | Size: 3.00 GB
-Bench   | BufPoolSize: 256  | QueueDepth: 256       | Readers: 3200     | Delay: 200ms
+Bench   | BufPoolSize: 256  | QueueDepth: 256       | Readers: 3000     | Delay: 200ms
 Worker  | Logs: 1000000     | LogSize: 1024 B       | BatchSize: 2048   | Total: 0.95 GB
-Writer  | 99.44s            | 10055.99 Logs/s       | 9.82 MB/s
-Readers | 99.44s            | 32179177.69 Logs/s    | 31424.98 MB/s
+Writer  | 99.46s            | 10054.35 Logs/s       | 9.82 MB/s
+Readers | 99.46s            | 30163040.31 Logs/s    | 29456.09 MB/s
+```
+
+Medium append rate (100 MB/s) with 300 concurrent readers.
+
+```text
+Bench   | BufPoolSize: 256  | QueueDepth: 256       | Readers: 300      | Delay: 20ms
+Worker  | Logs: 5000000     | LogSize: 1024 B       | BatchSize: 2048   | Total: 4.77 GB
+Writer  | 50.72s            | 98572.63 Logs/s       | 96.26 MB/s
+Readers | 50.72s            | 29571789.64 Logs/s    | 28878.70 MB/s
+```
+
+High appended rate (1 GB/s) with 1 concurrent reader.
+
+```text
+Bench   | BufPoolSize: 256  | QueueDepth: 256       | Readers: 1        | Delay: 1ms
+Worker  | Logs: 50000000    | LogSize: 1024 B       | BatchSize: 2048   | Total: 47.68 GB
+Writer  | 43.63s            | 1146052.75 Logs/s     | 1119.19 MB/s
+Readers | 43.63s            | 1146052.75 Logs/s     | 1119.19 MB/s
 ```
 
 ### Run benchmarks

@@ -61,7 +61,7 @@ struct Arguments {
     log_size: usize,
 
     /// Numbers of readers in benchmark.
-    #[arg(long, default_value = "3200")]
+    #[arg(long, default_value = "3000")]
     readers: u32,
 
     /// Delay between storage actions in milliseconds.

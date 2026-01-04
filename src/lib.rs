@@ -1,4 +1,4 @@
-//! Waldo
+//! # Waldo
 //!
 //! Waldo is an embedded lock-free, on-disk, ring buffer of sequential records. README on the
 //! [repository](https://github.com/sandesh-sanjeev/waldo#) provides an overview of the high

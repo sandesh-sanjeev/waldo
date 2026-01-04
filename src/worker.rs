@@ -155,8 +155,15 @@ impl WorkerState {
             // Submit queued up actions to the runtime.
             self.submit_actions();
 
-            // Wait for at least one pending I/O action to complete.
-            if let Err(e) = self.runtime.submit_and_wait(1) {
+            // If the runtime is fully saturated, we have to wait for at least
+            // one pending I/O action to complete. We could make no progress
+            // without it. Otherwise, we just submit I/O for kernel to execute
+            // while we try to queue up more work.
+            let pending_io = self.runtime.pending_io();
+            let cq_capacity = self.runtime.cq_capacity();
+            let remaining = cq_capacity.saturating_sub(pending_io);
+            let want = if remaining == 0 { 0 } else { 1 };
+            if let Err(e) = self.runtime.submit_and_wait(want) {
                 eprintln!("Error from I/O uring runtime: {e}");
             }
 
