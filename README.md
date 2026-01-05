@@ -1,11 +1,8 @@
 # Waldo
 
 Waldo is an asynchronous storage engine to hold sequential log records. It is a lock-free, append-only, on-disk 
-ring buffer. It is being developed to store write ahead logs, hence the name.
-
-Waldo resides in your process (embedded), requires no maintenance and has excellent performance characteristics.
-It provides an intentionally minimal set of APIs, primarily, conditional appends of a batch of records and query
-an arbitrary range of records.
+ring buffer. Waldo resides in your process (embedded), requires no maintenance and has excellent performance 
+characteristics. It is being developed to store write ahead logs, hence the name.
 
 Waldo uses io-uring APIs in linux for batching and asynchronous execution of disk I/O. Consequently linux is
 the only supported OS, and requires a relatively recent kernel version (6.8+).
@@ -42,11 +39,14 @@ When appending a batch of log records, atomicity is only guaranteed for a single
 For durability guarantees, enable `o_dsync` flag in `FileOptions`. This should be a great choice for most applications,
 unless you really don't care about losing some logs from the tip of storage.
 
-Finally, every `open` of Waldo results in parsing and validation of all storage files. Importantly any corruption is
+Every `open` of Waldo results in parsing and validation of all storage files. Importantly any corruption is
 automatically truncated away so that storage always holds a contiguous sequence of valid log records. There is
 support to additionally validate integrity of log records when iterating through queried logs. However recommendation 
 is instead having your own integrity checking mechanism or even better encrypt your logs - whatever makes sense for
 your use case.
+
+Finally Waldo provides a streaming style APIs. The two halves of the stream are a `sink` and a `stream`. A Sink is a
+buffered log writer and a Stream is well a stream that starts from a provided sequence number.
 
 ## Caching
 

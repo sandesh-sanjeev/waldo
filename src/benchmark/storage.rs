@@ -64,7 +64,7 @@ struct Arguments {
     #[arg(long, default_value = "3000")]
     readers: u32,
 
-    /// Delay between storage actions in milliseconds.
+    /// Delay in milliseconds between appends to storage.
     #[arg(long, default_value = "200")]
     delay: u64,
 }
@@ -212,14 +212,17 @@ async fn main() -> anyhow::Result<()> {
 
     // Define all the readers.
     for _ in 0..args.readers {
-        let storage = storage.clone();
+        let mut prev_seq_no = prev;
+        let mut stream = storage.stream(prev);
         workers.push(tokio::spawn(async move {
-            let mut prev_seq_no = prev;
-            let mut stream = storage.stream(prev_seq_no);
             while prev_seq_no < end {
                 let logs = stream.next().await?;
+
+                // Just so that we parse log!
+                // Otherwise we would have nothing to do.
+                // Importantly, stream wouldn't make progress.
                 for log in &logs {
-                    prev_seq_no = log?.seq_no();
+                    prev_seq_no = log.seq_no();
                 }
             }
 
@@ -227,31 +230,26 @@ async fn main() -> anyhow::Result<()> {
         }));
     }
 
-    // Define writer.
-    // Write hangs on to the session for the entire duration of benchmark.
-    // This makes sure writer makes progress and is not subject to scheduling delays (most part).
+    // A single writer.
     {
-        let storage = storage.clone();
+        let mut sink = storage.try_sink().expect("No buffer for sink");
+        let mut interval = tokio::time::interval(delay);
+        interval.set_missed_tick_behavior(MissedTickBehavior::Skip);
         workers.push(tokio::spawn(async move {
-            let mut prev_seq_no = prev;
-            let mut logs = Vec::with_capacity(batch_size);
-
-            let mut interval = tokio::time::interval(delay);
-            interval.set_missed_tick_behavior(MissedTickBehavior::Skip);
-            while prev_seq_no < end {
+            while sink.prev_seq_no().unwrap_or(prev) < end {
                 // Make sure enough time has passed.
                 interval.tick().await;
 
                 // Logs to write to page.
-                logs.clear();
+                let mut prev_seq_no = sink.prev_seq_no().unwrap_or(prev);
                 for _ in 0..batch_size {
                     let seq_no = prev_seq_no + 1;
-                    logs.push(Log::new_borrowed(seq_no, prev_seq_no, &log_data));
+                    sink.push(Log::new_borrowed(seq_no, prev_seq_no, &log_data)).await?;
                     prev_seq_no = seq_no;
                 }
 
-                // Append the next set of bytes.
-                storage.append(&logs).await?;
+                // Flush logs into storage.
+                sink.flush().await?;
                 latest_seq_no.store(prev_seq_no, Ordering::Relaxed);
             }
 

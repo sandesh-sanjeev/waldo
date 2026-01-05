@@ -2,7 +2,7 @@
 
 use crate::runtime::IoBuf;
 use bytemuck::{Pod, Zeroable};
-use std::{borrow::Cow, cell::Cell};
+use std::borrow::Cow;
 use xxhash_rust::xxh3;
 
 /// A sequenced log record that can be appended into Journal.
@@ -201,48 +201,6 @@ pub enum Error {
     /// Error when a corrupted log record is detected.
     #[error("Log record: {0} has hash: {1}, but expected hash: {2}")]
     Corruption(u64, u32, u32),
-}
-
-/// An iterator that validates log sequence before handing them out.
-#[derive(Debug, PartialEq, Eq)]
-pub struct SequencedLogIter<'a> {
-    bytes: &'a [u8],
-    prev_seq_no: &'a Cell<u64>,
-}
-
-impl<'a> SequencedLogIter<'a> {
-    /// Create a new checked iterator.
-    ///
-    /// # Arguments
-    ///
-    /// * `bytes` - Bytes to iterate through.
-    /// * `prev_seq_no` - Sequence number of the immediately previous log.
-    pub(crate) fn new(bytes: &'a [u8], prev_seq_no: &'a Cell<u64>) -> SequencedLogIter<'a> {
-        SequencedLogIter { bytes, prev_seq_no }
-    }
-}
-
-impl<'a> Iterator for SequencedLogIter<'a> {
-    type Item = Result<Log<'a>, Error>;
-
-    fn next(&mut self) -> Option<Self::Item> {
-        // Attempt to deserialize the next set of bytes into log.
-        let log = Log::read(self.bytes)?;
-
-        // Safety: We just read enough bytes for the parsed log record.
-        // Compiler/LLVM is not smart enough to know this and remove bounds check.
-        self.bytes = unsafe { self.bytes.get_unchecked(log.size()..) };
-
-        // Make sure unbroken sequence of logs.
-        let prev_seq_no = self.prev_seq_no.get();
-        if prev_seq_no != log.prev_seq_no() {
-            return Some(Err(Error::Sequence(log.seq_no(), log.prev_seq_no(), prev_seq_no)));
-        }
-
-        // Alright, everything looks good!
-        self.prev_seq_no.set(log.seq_no());
-        Some(Ok(log))
-    }
 }
 
 /// Header of a log record.
