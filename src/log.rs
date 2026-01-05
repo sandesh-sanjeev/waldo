@@ -2,7 +2,7 @@
 
 use crate::runtime::IoBuf;
 use bytemuck::{Pod, Zeroable};
-use std::borrow::Cow;
+use std::{borrow::Cow, cell::Cell};
 use xxhash_rust::xxh3;
 
 /// A sequenced log record that can be appended into Journal.
@@ -204,20 +204,20 @@ pub enum Error {
 }
 
 /// An iterator that validates log sequence before handing them out.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, PartialEq, Eq)]
 pub struct SequencedLogIter<'a> {
     bytes: &'a [u8],
-    prev_seq_no: u64,
+    prev_seq_no: &'a Cell<u64>,
 }
 
-impl SequencedLogIter<'_> {
+impl<'a> SequencedLogIter<'a> {
     /// Create a new checked iterator.
     ///
     /// # Arguments
     ///
     /// * `bytes` - Bytes to iterate through.
     /// * `prev_seq_no` - Sequence number of the immediately previous log.
-    pub(crate) fn new(bytes: &[u8], prev_seq_no: u64) -> SequencedLogIter<'_> {
+    pub(crate) fn new(bytes: &'a [u8], prev_seq_no: &'a Cell<u64>) -> SequencedLogIter<'a> {
         SequencedLogIter { bytes, prev_seq_no }
     }
 }
@@ -234,12 +234,13 @@ impl<'a> Iterator for SequencedLogIter<'a> {
         self.bytes = unsafe { self.bytes.get_unchecked(log.size()..) };
 
         // Make sure unbroken sequence of logs.
-        if self.prev_seq_no != log.prev_seq_no() {
-            return Some(Err(Error::Sequence(log.seq_no(), log.prev_seq_no(), self.prev_seq_no)));
+        let prev_seq_no = self.prev_seq_no.get();
+        if prev_seq_no != log.prev_seq_no() {
+            return Some(Err(Error::Sequence(log.seq_no(), log.prev_seq_no(), prev_seq_no)));
         }
 
         // Alright, everything looks good!
-        self.prev_seq_no = log.seq_no();
+        self.prev_seq_no.set(log.seq_no());
         Some(Ok(log))
     }
 }

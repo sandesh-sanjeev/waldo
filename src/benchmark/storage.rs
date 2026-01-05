@@ -215,14 +215,9 @@ async fn main() -> anyhow::Result<()> {
         let storage = storage.clone();
         workers.push(tokio::spawn(async move {
             let mut prev_seq_no = prev;
-            let mut interval = tokio::time::interval(delay);
-            interval.set_missed_tick_behavior(MissedTickBehavior::Delay);
+            let mut stream = storage.stream(prev_seq_no);
             while prev_seq_no < end {
-                // Make sure enough time has passed.
-                interval.tick().await;
-
-                // Fetch and process next set of logs.
-                let logs = storage.query(prev_seq_no).await?;
+                let logs = stream.next().await?;
                 for log in &logs {
                     prev_seq_no = log?.seq_no();
                 }

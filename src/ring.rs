@@ -7,6 +7,7 @@ use crate::{Metadata, Options, Page, QueryError};
 use assert2::let_assert;
 use rayon::iter::{IntoParallelIterator, ParallelIterator};
 use std::{io, path::Path};
+use tokio::sync::watch;
 
 /// A ring buffer of storage pages.
 pub(crate) struct PageRing {
@@ -21,14 +22,14 @@ impl PageRing {
     ///
     /// * `path` - Path to the home directory of storage instance.
     /// * `opts` - Options to open storage.
-    pub(crate) fn open(path: &Path, opts: Options) -> io::Result<Self> {
+    pub(crate) fn open(path: &Path, opts: Options, watch_tx: watch::Sender<Option<u64>>) -> io::Result<Self> {
         // Initialize all the pages in parallel.
         let mut pages: Vec<_> = (0..opts.ring_size)
             .into_par_iter()
             .map(|id| {
                 let file_name = format!("{id:0>10}.page");
                 let file_path = path.join(file_name);
-                Page::open(id, file_path, opts.page)
+                Page::open(id, file_path, opts.page, watch_tx.clone())
             })
             .collect::<io::Result<_>>()?;
 

@@ -1,12 +1,11 @@
 # Waldo
 
 Waldo is an asynchronous storage engine to hold sequential log records. It is a lock-free, append-only, on-disk 
-ring buffer. It was initially developed to store write ahead logs for an MVCC aware datastore, hence the name.
+ring buffer. It is being developed to store write ahead logs, hence the name.
 
 Waldo resides in your process (embedded), requires no maintenance and has excellent performance characteristics.
-It provides an intentionally minimal set of APIs to interact with it, primarily conditional appends of a batch of 
-records and query an arbitrary range of records. The only expected extension to this API is addition of a stream
-style interface.
+It provides an intentionally minimal set of APIs, primarily, conditional appends of a batch of records and query
+an arbitrary range of records.
 
 Waldo uses io-uring APIs in linux for batching and asynchronous execution of disk I/O. Consequently linux is
 the only supported OS, and requires a relatively recent kernel version (6.8+).

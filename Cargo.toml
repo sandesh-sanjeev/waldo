@@ -4,7 +4,8 @@ version = "0.1.0"
 edition = "2024"
 
 [features]
-benchmark = ["dep:clap", "dep:anyhow", "dep:indicatif", "dep:tokio"]
+default = ["tokio/sync"]
+benchmark = ["clap", "anyhow", "indicatif", "tokio"]
 
 [[bin]]
 name = "runtime"

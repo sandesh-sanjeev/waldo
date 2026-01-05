@@ -1,5 +1,7 @@
 //! Worker executing all storage actions.
 
+use tokio::sync::watch;
+
 use crate::Options;
 use crate::action::{Action, ActionCtx, AsyncFate, AsyncIo};
 use crate::queue::IoQueue;
@@ -25,9 +27,15 @@ impl Worker {
     ///
     /// * `path` - Path to the home directory of storage instance.
     /// * `opts` - Options to open storage.
-    pub(crate) async fn spawn(path: &Path, opts: Options) -> io::Result<(BufPool, flume::Sender<Action>, Self)> {
+    pub(crate) async fn spawn(
+        path: &Path,
+        opts: Options,
+    ) -> io::Result<(BufPool, flume::Sender<Action>, watch::Receiver<Option<u64>>, Self)> {
         // Channel to return result of spawn.
         let (fate_tx, fate_rx) = AsyncFate::channel();
+
+        // Channel to be notified when new logs are appended to storage.
+        let (watch_tx, watch_rx) = watch::channel(None);
 
         // Flag to communicate intent to shutdown.
         let closing = Arc::new(AtomicBool::new(false));
@@ -36,7 +44,7 @@ impl Worker {
         let handle = {
             let closing = closing.clone();
             let path = path.to_path_buf();
-            std::thread::spawn(move || match WorkerState::new(&path, opts) {
+            std::thread::spawn(move || match WorkerState::new(&path, opts, watch_tx) {
                 Err(error) => {
                     let _ = fate_tx.send(Err(error));
                 }
@@ -59,7 +67,7 @@ impl Worker {
         };
 
         // Return results from initialization.
-        Ok((pool, tx, worker))
+        Ok((pool, tx, watch_rx, worker))
     }
 }
 
@@ -89,12 +97,16 @@ impl WorkerState {
     /// will be dropped during graceful shutdown.
     const ACTION_AWAIT_TIMEOUT: Duration = Duration::from_secs(1);
 
-    fn new(path: &Path, opts: Options) -> io::Result<(BufPool, flume::Sender<Action>, Self)> {
+    fn new(
+        path: &Path,
+        opts: Options,
+        watch_tx: watch::Sender<Option<u64>>,
+    ) -> io::Result<(BufPool, flume::Sender<Action>, Self)> {
         // Create I/O runtime for storage.
         let mut runtime = IoRuntime::new(opts.queue_depth.into())?;
 
         // Open storage files, parse pages and initialize backing ring buffer.
-        let mut ring = PageRing::open(path, opts)?;
+        let mut ring = PageRing::open(path, opts, watch_tx)?;
         ring.register(&mut runtime)?;
 
         // Create buffer pool to use with storage.

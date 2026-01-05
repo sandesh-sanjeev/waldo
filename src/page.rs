@@ -13,6 +13,7 @@ use crate::runtime::{IoAction, IoFixedFd};
 use crate::{AppendError, QueryError};
 use assert2::let_assert;
 use std::{io, os::fd::RawFd, path::Path};
+use tokio::sync::watch;
 
 /// Options for a page.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -44,6 +45,7 @@ pub(crate) struct Page {
     file: PageFile,
     index: PageIndex,
     state: Option<PageState>,
+    watch_tx: watch::Sender<Option<u64>>,
 }
 
 impl Page {
@@ -57,7 +59,12 @@ impl Page {
     /// * `id` - Unique identity of the page.
     /// * `path` - Path to the home directory.
     /// * `opts` - Options for the page.
-    pub(crate) fn open<P: AsRef<Path>>(id: u32, path: P, opts: PageOptions) -> io::Result<Self> {
+    pub(crate) fn open<P: AsRef<Path>>(
+        id: u32,
+        path: P,
+        opts: PageOptions,
+        watch_tx: watch::Sender<Option<u64>>,
+    ) -> io::Result<Self> {
         let mut file = PageFile::open(path, opts.file_opts)?;
         let mut index = PageIndex::new(opts.index_opts);
 
@@ -116,6 +123,7 @@ impl Page {
             file,
             index,
             state,
+            watch_tx,
             capacity: opts.capacity,
         })
     }
@@ -439,6 +447,11 @@ impl Page {
                     state.count += 1;
                     state.prev_seq_no = log.seq_no();
                     self.index.apply(&log, offset);
+                }
+
+                // Broadcast log append to all listeners.
+                if let Err(e) = self.watch_tx.send(Some(state.prev_seq_no)) {
+                    eprintln!("Error broadcasting append: {e}");
                 }
 
                 // Return result of the action.

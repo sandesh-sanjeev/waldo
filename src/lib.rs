@@ -22,11 +22,14 @@ mod runtime;
 pub use crate::page::{FileOpts, IndexOpts, PageOptions};
 pub use crate::runtime::PoolOptions;
 pub use log::{Error as LogError, Log, LogIter, SequencedLogIter};
+use tokio::sync::watch;
 
 use crate::action::{Action, FateError};
 use crate::page::{Page, PageMetadata};
 use crate::runtime::{BufPool, IoBuf};
 use crate::worker::Worker;
+use std::borrow::Cow;
+use std::cell::Cell;
 use std::ops::AddAssign;
 use std::{io, path::Path, sync::Arc};
 
@@ -119,6 +122,7 @@ pub struct Options {
 pub struct Waldo {
     buf_pool: BufPool,
     tx: flume::Sender<Action>,
+    watch_rx: watch::Receiver<Option<u64>>,
     _worker: Arc<Worker>,
 }
 
@@ -130,10 +134,11 @@ impl Waldo {
     /// * `path` - Path to the directory on disk.
     /// * `opts` - Options used to create storage.
     pub async fn open<P: AsRef<Path>>(path: P, opts: Options) -> io::Result<Self> {
-        let (buf_pool, tx, worker) = Worker::spawn(path.as_ref(), opts).await?;
+        let (buf_pool, tx, watch_rx, worker) = Worker::spawn(path.as_ref(), opts).await?;
         Ok(Self {
             tx,
             buf_pool,
+            watch_rx,
             _worker: Arc::new(worker),
         })
     }
@@ -223,7 +228,7 @@ impl Waldo {
     /// # Arguments
     ///
     /// * `after_seq_no` - Query for logs after this sequence number.
-    pub async fn query(&self, after_seq_no: u64) -> Result<QueryLogs, QueryError> {
+    pub async fn query(&self, after_seq_no: u64) -> Result<QueryLogs<'static>, QueryError> {
         // Borrow buffer from pool for this operation.
         let buf = self.buf_pool.take_async().await;
 
@@ -237,6 +242,14 @@ impl Waldo {
 
         // Return iterator for the rest of the log records.
         Ok(QueryLogs::new(buf, after_seq_no))
+    }
+
+    pub fn stream(&self, after_seq_no: u64) -> LogStream<'_> {
+        LogStream {
+            storage: self,
+            rx: self.watch_rx.clone(),
+            prev_seq_no: Cell::new(after_seq_no),
+        }
     }
 
     fn assert_logs(logs: &[Log<'_>]) -> Result<(), AppendError> {
@@ -275,16 +288,49 @@ impl Waldo {
     }
 }
 
-/// A contiguous chunk of logs queried from storage.
 #[derive(Debug)]
-pub struct QueryLogs {
-    buf: IoBuf,
-    offset: usize,
-    prev_seq_no: u64,
+pub struct LogStream<'a> {
+    storage: &'a Waldo,
+    prev_seq_no: Cell<u64>,
+    rx: watch::Receiver<Option<u64>>,
 }
 
-impl QueryLogs {
-    fn new(buf: IoBuf, prev_seq_no: u64) -> Self {
+impl LogStream<'_> {
+    pub async fn next(&mut self) -> Result<QueryLogs<'_>, QueryError> {
+        loop {
+            // Check if storage has the requested range of logs.
+            if let Some(storage_prev) = *self.rx.borrow_and_update()
+                && storage_prev > self.prev_seq_no.get()
+            {
+                break;
+            };
+
+            // Otherwise wait for storage updates.
+            if self.rx.changed().await.is_err() {
+                return Err(QueryError::Fault("Storage is closed"));
+            }
+        }
+
+        // Get next set of log records.
+        let logs = self.storage.query(self.prev_seq_no.get()).await?;
+        Ok(QueryLogs {
+            buf: logs.buf,
+            offset: logs.offset,
+            prev_seq_no: Cow::Borrowed(&self.prev_seq_no),
+        })
+    }
+}
+
+/// A contiguous chunk of logs queried from storage.
+#[derive(Debug)]
+pub struct QueryLogs<'a> {
+    buf: IoBuf,
+    offset: usize,
+    prev_seq_no: Cow<'a, Cell<u64>>,
+}
+
+impl QueryLogs<'_> {
+    fn new(buf: IoBuf, prev_seq_no: u64) -> QueryLogs<'static> {
         // Figure out offset to the starting seq_no.
         // For performance reasons storage might return a few extra logs
         // at the beginning of the buffer. We have to skip past those.
@@ -294,20 +340,20 @@ impl QueryLogs {
             .map(|log| log.size())
             .sum();
 
-        Self {
+        QueryLogs {
             buf,
             offset,
-            prev_seq_no,
+            prev_seq_no: Cow::Owned(Cell::new(prev_seq_no)),
         }
     }
 }
 
-impl<'a> IntoIterator for &'a QueryLogs {
+impl<'a> IntoIterator for &'a QueryLogs<'a> {
     type IntoIter = SequencedLogIter<'a>;
     type Item = Result<Log<'a>, LogError>;
 
     fn into_iter(self) -> Self::IntoIter {
-        SequencedLogIter::new(&self.buf[self.offset..], self.prev_seq_no)
+        SequencedLogIter::new(&self.buf[self.offset..], &self.prev_seq_no)
     }
 }
 
