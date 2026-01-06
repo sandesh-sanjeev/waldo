@@ -2,13 +2,14 @@
 
 Waldo is an asynchronous storage engine to hold sequential log records. It is a lock-free, append-only, on-disk 
 ring buffer that is optimized for high throughput (in GB/s) writes and large read fanout (in 10,000s of concurrent
-read stream). Waldo resides in your process (embedded), requires no maintenance and has excellent performance 
-characteristics. It is being developed to store write ahead logs, hence the name.
+read streams). Waldo resides in your process (embedded), requires no maintenance and has excellent performance 
+characteristics. It is being developed to store write ahead logs, hence the name. It can spot arbitrary log records 
+pretty darn fast too.
 
 Waldo uses io-uring APIs in linux for batching and asynchronous execution of disk I/O. Consequently linux is
 the only supported OS, and requires a relatively recent kernel version (6.8+).
 
-Look at [crate docs](https://sandesh-sanjeev.github.io/waldo/waldo/index.html) to get started.
+If that sounds good, look at [crate docs](https://sandesh-sanjeev.github.io/waldo/waldo/index.html) to get started.
 
 [![Build Status][build-img]][build-url]
 [![Documentation][doc-img]][doc-url]
@@ -113,17 +114,17 @@ Low append rate (10 MB/s) with 3000 concurrent readers.
 ```text
 Bench   | BufPoolSize: 256  | QueueDepth: 256       | Readers: 3000     | Delay: 200ms
 Worker  | Logs: 1000000     | LogSize: 1024 B       | BatchSize: 2048   | Total: 0.95 GB
-Writer  | 99.46s            | 10054.35 Logs/s       | 9.82 MB/s
-Readers | 99.46s            | 30163040.31 Logs/s    | 29456.09 MB/s
+Writer  | 97.76s            | 10229.61 Logs/s       | 9.99 MB/s
+Readers | 97.76s            | 30688838.40 Logs/s    | 29969.57 MB/s
 ```
 
 Medium append rate (100 MB/s) with 300 concurrent readers.
 
 ```text
 Bench   | BufPoolSize: 256  | QueueDepth: 256       | Readers: 300      | Delay: 20ms
-Worker  | Logs: 5000000     | LogSize: 1024 B       | BatchSize: 2048   | Total: 4.77 GB
-Writer  | 50.72s            | 98572.63 Logs/s       | 96.26 MB/s
-Readers | 50.72s            | 29571789.64 Logs/s    | 28878.70 MB/s
+Worker  | Logs: 1000000     | LogSize: 1024 B       | BatchSize: 2048   | Total: 0.95 GB
+Writer  | 9.84s             | 101628.45 Logs/s      | 99.25 MB/s
+Readers | 9.84s             | 30488535.87 Logs/s    | 29773.96 MB/s
 ```
 
 High appended rate (1 GB/s) with 1 concurrent reader.

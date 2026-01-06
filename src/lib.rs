@@ -16,8 +16,7 @@
 //!
 //! Open [`Waldo`] with path to home directory and open [`Options`].
 //!
-//! Options allows you to tailor Waldo to your throughput, latency, concurrency and memory
-//! usage goals:
+//! You can tailor Waldo to your throughput, latency, concurrency and memory usage goals:
 //!
 //! * [`PoolOptions`] - Defines amount to memory to allocate.
 //! * [`PageOptions`] - Defines disk and memory footprint of individual pages.
@@ -61,6 +60,10 @@
 //!     }
 //! }
 //! ```
+//!
+//! ## Next steps
+//!
+//! It's that simple! Run benchmarks and spot your perfect Waldo today.
 
 mod action;
 mod log;
@@ -196,19 +199,19 @@ pub struct Options {
 ///
 /// Waldo exposes a `stream` interface with two parts, a sink and a stream.
 ///
-/// # [`Sink`]
+/// ## [`Sink`]
 ///
 /// A sink is an interface to push new logs to storage. Under the hood it is a
 /// buffered writer that flushes buffered logs to storage when buffer is full.
 /// Optionally one can flush without waiting for the buffer to fill up.
 ///
-/// # [`Stream`]
+/// ## [`Stream`]
 ///
 /// A stream is an interface to discovered new logs appended to storage. One creates
 /// a stream subscription with a starting sequence number. This stream can be used
 /// indefinitely to repeatedly discover new logs.
 ///
-/// # Warning
+/// ## Warning
 ///
 /// Waldo attempts to perform graceful shutdown when dropped. Unfortunately there
 /// is no support for drop in async. If [`Waldo::close`] is not explicitly invoked
@@ -243,14 +246,18 @@ impl Waldo {
 
     /// Sequence number of the last log record in storage.
     ///
-    /// Note that this is just an efficient way to know progress made in storage. For
-    /// more detailed metadata from storage use [`Waldo::metadata`]. Both methods return
-    /// None when storage is not initialized.
+    /// Note that this is just an efficient way to know progress made in storage.
+    /// Use [`Waldo::metadata`] for more detailed info about current state. Both
+    /// methods return None when storage is not initialized.
     pub fn prev_seq_no(&self) -> Option<u64> {
         *self.rx.borrow()
     }
 
     /// Latest metadata for storage, if storage is initialized.
+    ///
+    /// Note this gets a rich summary of the current state. It's great for initialization,
+    /// periodic scans for telemetry, etc. Use [`Waldo::prev_seq_no`] if all you want is
+    /// sequence number of the last appended log.
     pub async fn metadata(&self) -> Option<Metadata> {
         let (action, rx) = Action::metadata();
         self.tx.send_async(action).await.ok()?;
@@ -260,7 +267,7 @@ impl Waldo {
     /// Create a new sink to publish log records to storage.
     ///
     /// Note that this method waits for a free buffer in buffer pool before
-    /// completing. For a non-blocking variant, use [`Waldo::try_sink`].
+    /// completing. Use [`Waldo::try_sink`] for a non-blocking variant.
     pub async fn sink(&self) -> Sink {
         Sink {
             tx: self.tx.clone(),
@@ -284,7 +291,7 @@ impl Waldo {
     ///
     /// Note that this is a cold stream, i.e, it is a passive future that makes
     /// progress when you await for more logs similar to regular futures. Use
-    /// [`Stream::next`] or [`Stream::try_next`] to await for logs.
+    /// [`Stream::next`] or [`Stream::try_next`] to discover new logs.
     ///
     /// # Arguments
     ///
@@ -325,10 +332,11 @@ impl Waldo {
 /// You cannot specify limits, this method will query for as many log records
 /// as efficiently possible. You can discard logs you don't want, it's free.
 ///
-/// # Isolation
+/// ## Isolation
 ///
 /// Only logs that have been successfully committed against storage are visible
-/// to queries against storage. However note that they might not be durably committed.
+/// to queries against storage. However note that they might not be durably stored
+/// on disk.
 #[derive(Debug)]
 pub struct Stream {
     pool: BufPool,
@@ -480,37 +488,37 @@ impl<'a> Iterator for StreamLogIter<'a> {
 
 /// A sink is buffered log writer.
 ///
-/// # Atomicity
+/// ## Atomicity
 ///
 /// Atomicity is only guaranteed for a single log record. Now (and probably never)
 /// will we provide atomicity guarantees for an entire batch. While this is doable,
 /// it's more code and more importantly, I have no need for it.
 ///
-/// # Durability
+/// ## Durability
 ///
 /// Durability guarantees depend on the options used open storage. Specifically, if
-/// you want guarantee that bytes are flushed to disk when this method successfully
-/// completes, enable `o_dsync` option in `FileOptions`.
+/// you want guarantee that bytes are durably flushed to disk when [`Sink::push`] or
+/// [`Sink::flush`] successfully completes, enable [`FileOpts::o_dsync`].
 ///
-/// # Isolation
+/// ## Isolation
 ///
-/// This operation is executed with sequential consistency, i.e, all appends, even
+/// [`Sink::push`] is executed with sequential consistency, i.e, all appends, even
 /// across threads, always operate against latest state of storage. If storage processes
 /// two concurrent appends, one of them will be rejected with conflict.
 ///
-/// # Flush
+/// ## Flush
 ///
 /// A sink writes to storage only when backing buffer is full, which could take arbitrary
 /// time or never. Use [`Sink::flush`] to make sure all accumulated logs have been dispatched
 /// to storage. Importantly, if the sink is dropped without a flush, any accumulated logs
 /// will be lost.
 ///
-/// # Cancel safety
+/// ## Cancel safety
 ///
-/// If this method is cancelled between an append, any number of logs might be durably
-/// appended into storage, but without incomplete logs and never out of order. Use
-/// [`Waldo::metadata`] detailed info about current state of storage, or [`Waldo::prev_seq_no`]
-/// to just know sequence number of the last append log record.
+/// If [`Sink::push`] is cancelled between an append, any number of logs might be durably
+/// appended into storage. Use [`Waldo::metadata`] for detailed info about current state
+/// of storage, or [`Waldo::prev_seq_no`] to just know sequence number of the last append
+/// log record.
 #[derive(Debug)]
 pub struct Sink {
     prev: Option<u64>,
