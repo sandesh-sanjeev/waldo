@@ -63,7 +63,7 @@
 //!
 //! ## Next steps
 //!
-//! It's that simple! Run benchmarks and find idea Waldo configuration for your workload.
+//! It's that simple! Run benchmarks and find the idea configuration for your workload.
 
 mod action;
 mod log;

@@ -1,13 +1,13 @@
 # Waldo
 
 Waldo is an asynchronous storage engine to hold sequential log records. It is a lock-free, append-only, on-disk 
-ring buffer that is optimized for high throughput (in GB/s) writes and large read fanout (in 10,000s of concurrent
-read streams). Waldo resides in your process (embedded), requires no maintenance and has excellent performance 
+ring buffer that is optimized for high throughput (in GB/s) writes and massive read fanout (in 10,000s of concurrent
+readers). Waldo resides in your process (embedded), requires no maintenance and has excellent performance 
 characteristics. It is being developed to store write ahead logs, hence the name. It can spot arbitrary log records 
 pretty darn fast too.
 
 Waldo uses io-uring APIs in linux for batching and asynchronous execution of disk I/O. Consequently linux is
-the only supported OS. It requires a relatively recent kernel version 6.8+. While this crate will happily 
+the only supported OS and requires a relatively recent kernel version 6.8+. While this crate will happily 
 compile with any 5.10+ kernel, you will certainly see runtime failures. Some of the io-uring opcodes used in 
 this crate do not exist prior to version 6.8.
 
@@ -25,28 +25,31 @@ Waldo today.
 
 ## Design
 
-Storage is organized into pages where every page holds a contiguous chunk of log records. Only one page is ever
-active for writes. When this page runs out of capacity, it is rotated away with another page. This is either an
-empty page, or a page that contains oldest log records. If it's the latter, the page is truncated prior to use.
+A page is an append only data structure that holds a contiguous chunk of log records. User defined options influence
+it's disk and memory footprint, ultimately limiting the maximum size of a page. Storage is organized into a ring buffer
+of such pages. One (and only one) page is active for both reads and writes, this is where newly appended log records go.
+Other pages are read-only, oldest of them will eventually be truncated and reused when the read-write page runs out
+of capacity.
 
-A page is physically backed by a file on disk and an in-memory index. Backing file is a flat file of serialized
-log records. Index contains offsets to logs on file. It is generally not useful to index every log record and might
-require significant memory depending on the workload. The index can be made sparse, trading memory for some small
-penalty during random seeks.
+A page is physically backed by a file on disk and an in-memory index. Backing file is a flat file of serialized log 
+records. Index contains offsets to logs on file. It is generally not useful to index every log record, requiring 
+significant memory depending on the workload. The index can be made sparse, trading memory for some small penalty 
+during random seeks. User defined options allow for fine grained control of this trade off.
 
 A single threaded worker coordinates all write into and reads from storage. Rest of the world interacts with this 
 worker using queues (io-uring) and channels (your application). Waldo purely shares state via message passing not
-locks/futex, importantly this allows the worker to optimally schedule reads/write for maximum throughput. Pinning
-this worker to a single high performance/priority core might allow better latency, more experiments are necessary.
+locks/futex. This allows the worker to optimally schedule reads/write for maximum throughput. Pinning this worker 
+to a single high priority core might allow better latency, more experiments are necessary.
 
 Every log record must contain a monotonically increasing sequence number to uniquely identify the record, sequence
-number of previous log record and an associated payload. Logs must be appended in order and without gaps where
-the previous sequence number create an implicit "append iff previous == last committed record in storage" condition.
-Conversely queried logs are always returned in order and without gaps.
+number of previous log record and an associated payload. Logs must be appended in order and without gaps where the 
+previous sequence number creates an implicit "append iff previous == last committed record in storage" condition. 
+Conversely queried logs are always returned in order and without gaps. Log payload can be any arbitrary blob of bytes.
+There is currently a maximum size limit of 1 MB per log, but that's really only to have some realistic practical limit.
 
 When appending a batch of log records, atomicity is only guaranteed for a single log record, not for the entire batch.
 For durability guarantees, enable `o_dsync` flag. This should be a great choice for most applications. It only 
-meaningfully impacts performance when appending in the order of GB/s, otherwise it makes little difference because
+meaningfully impacts performance when appending in the order of GB/s, otherwise it makes little to no difference because
 everything is non-blocking and lock-free.
 
 Every `open` of Waldo results in parsing and validation of all storage files. Importantly any corruption is
@@ -55,10 +58,10 @@ support to optionally validate integrity of log records when iterating through q
 is instead having your own integrity checking mechanism or even better encrypt your logs - whatever makes sense for
 your use case.
 
-Waldo eagerly allocates most memory it requires when opened for the first time. The aim is to allocate all memory
-upfront and prevent repeated malloc/free in hot code paths, which typically is expensive. There is some minimal 
-amounts of heap allocations during runtime, primarily for creation of oneshot channels. However they are relatively
-infrequent and barely show up in profiler.
+Waldo eagerly allocates most memory it requires when opened for the first time. This memory is reused across read/write
+actions, page rotations, etc. User defined options dictate the amount of memory allocated for the buffer pool. One exception 
+currently is heap allocations during construction of oneshot channels. They are relatively infrequent and barely show up 
+on profiler, I haven't been motivated enough to optimize it away.
 
 Finally Waldo provides a streaming style API. The two halves of the stream are `sink` and `stream`. A Sink is a
 buffered log writer to append new logs to storage. A Stream is well, a stream that starts delivering log records
@@ -68,7 +71,7 @@ using a provided starting seed sequence number.
 
 Waldo does no caching, it is entirely the responsibility of the OS and file system caches. Waldo makes no assumptions
 around the append or access patterns. Every workload is different, it is important to benchmark and establish ideal
-waldo parameters such as queue depth and buffer pool size. Lots of free RAM definitely helps and is automatically used!
+waldo parameters such as queue depth and buffer pool size. Lots of free RAM definitely helps and is automatically used! 
 
 ## Unsafe
 
@@ -88,6 +91,12 @@ These are non-goals and will probably never be supported.
 * Non-Linux OS, or linux with kernel < 6.8.
 * Concurrent access from multiple processes.
 * Direct I/O, DMA, SPDK, etc.
+
+## Future Work
+
+Waldo does most of what I want it to do already. The only other planned feature addition is the ability to assign
+priority to different streams. Otherwise only expect bug fixes, scheduling improvements and better test coverage, 
+just polishing around the edges.
 
 ## Gotchas
 
