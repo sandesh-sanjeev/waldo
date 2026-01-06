@@ -1,15 +1,14 @@
 //! Worker executing all storage actions.
 
-use tokio::sync::watch;
-
-use crate::Options;
 use crate::action::{Action, ActionCtx, AsyncFate, AsyncIo};
 use crate::queue::IoQueue;
 use crate::ring::PageRing;
 use crate::runtime::{BufPool, IoError, IoResponse, IoRuntime};
+use crate::{ActionRx, ActionTx, Options, WatchTx};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::{io, path::Path, thread::JoinHandle, time::Duration};
+use tokio::sync::watch;
 
 /// A single threaded worker coordinating all storage actions.
 #[derive(Debug)]
@@ -87,7 +86,7 @@ impl Drop for Worker {
 struct WorkerState {
     ring: PageRing,
     io_queue: IoQueue,
-    rx: flume::Receiver<Action>,
+    rx: ActionRx,
     runtime: IoRuntime<(u32, ActionCtx)>,
 }
 
@@ -97,11 +96,7 @@ impl WorkerState {
     /// will be dropped during graceful shutdown.
     const ACTION_AWAIT_TIMEOUT: Duration = Duration::from_secs(1);
 
-    fn new(
-        path: &Path,
-        opts: Options,
-        watch_tx: watch::Sender<Option<u64>>,
-    ) -> io::Result<(BufPool, flume::Sender<Action>, Self)> {
+    fn new(path: &Path, opts: Options, watch_tx: WatchTx) -> io::Result<(BufPool, ActionTx, Self)> {
         // Create I/O runtime for storage.
         let mut runtime = IoRuntime::new(opts.queue_depth.into())?;
 

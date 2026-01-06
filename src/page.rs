@@ -10,10 +10,9 @@ use crate::log::LogIter;
 use crate::page::{file::PageFile, index::PageIndex};
 use crate::queue::IoQueue;
 use crate::runtime::{IoAction, IoFixedFd};
-use crate::{AppendError, QueryError};
+use crate::{AppendError, QueryError, WatchTx};
 use assert2::let_assert;
 use std::{io, os::fd::RawFd, path::Path};
-use tokio::sync::watch;
 
 /// Options for a page.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -45,7 +44,7 @@ pub(crate) struct Page {
     file: PageFile,
     index: PageIndex,
     state: Option<PageState>,
-    watch_tx: watch::Sender<Option<u64>>,
+    tx: WatchTx,
 }
 
 impl Page {
@@ -59,12 +58,7 @@ impl Page {
     /// * `id` - Unique identity of the page.
     /// * `path` - Path to the home directory.
     /// * `opts` - Options for the page.
-    pub(crate) fn open<P: AsRef<Path>>(
-        id: u32,
-        path: P,
-        opts: PageOptions,
-        watch_tx: watch::Sender<Option<u64>>,
-    ) -> io::Result<Self> {
+    pub(crate) fn open<P: AsRef<Path>>(id: u32, path: P, opts: PageOptions, tx: WatchTx) -> io::Result<Self> {
         let mut file = PageFile::open(path, opts.file_opts)?;
         let mut index = PageIndex::new(opts.index_opts);
 
@@ -123,7 +117,7 @@ impl Page {
             file,
             index,
             state,
-            watch_tx,
+            tx,
             capacity: opts.capacity,
         })
     }
@@ -215,7 +209,7 @@ impl Page {
         // Re-queue the action if the page is currently being reset.
         // Once reset and initialization is complete, this page can accept logs.
         if pending_io.reset || state.resetting {
-            queue.reprocess(Action::Append(Append { buf, tx }));
+            queue.reprocess(Action::Append(Append::new(buf, tx)));
             return true;
         }
 
@@ -261,7 +255,7 @@ impl Page {
 
         // Re-queue the action and indicate that page does not have enough capacity.
         if is_overflow {
-            queue.reprocess(Action::Append(Append { buf, tx }));
+            queue.reprocess(Action::Append(Append::new(buf, tx)));
             return false;
         }
 
@@ -405,7 +399,7 @@ impl Page {
         let mut offset = self.file.state().offset;
         let file_result = self.file.apply(result, &mut action);
 
-        // Handle commit for different types of actions.
+        // Do different things based on the action.
         match ctx {
             ActionCtx::Fsync => {
                 let_assert!(Ok(_) = file_result);
@@ -425,7 +419,7 @@ impl Page {
                 });
             }
 
-            ActionCtx::Query { tx, .. } => {
+            ActionCtx::Query(tx) => {
                 let_assert!(Some(buf) = action.take_buf());
                 if let Err(error) = file_result {
                     tx.send_clear_buf(buf, Err(error.into()));
@@ -434,7 +428,7 @@ impl Page {
                 }
             }
 
-            ActionCtx::Append { tx } => {
+            ActionCtx::Append(tx) => {
                 let_assert!(Some(buf) = action.take_buf());
                 if let Err(error) = file_result {
                     tx.send_buf(buf, Err(error.into()));
@@ -450,7 +444,7 @@ impl Page {
                 }
 
                 // Broadcast log append to all listeners.
-                if let Err(e) = self.watch_tx.send(Some(state.prev_seq_no)) {
+                if let Err(e) = self.tx.send(Some(state.prev_seq_no)) {
                     eprintln!("Error broadcasting append: {e}");
                 }
 
@@ -475,7 +469,7 @@ impl Page {
         // First complete the pending file I/O.
         self.file.abort(&mut action);
 
-        // Handle abort for different types of actions.
+        // Do different things based on the action.
         match ctx {
             ActionCtx::Fsync => {
                 eprintln!("Page fsync aborted with error: {error:?}");
@@ -486,12 +480,12 @@ impl Page {
                 eprintln!("Page reset aborted with error: {error:?}");
             }
 
-            ActionCtx::Query { tx, .. } => {
+            ActionCtx::Query(tx) => {
                 let_assert!(Some(buf) = action.take_buf());
                 tx.send_clear_buf(buf, Err(error.into()));
             }
 
-            ActionCtx::Append { tx, .. } => {
+            ActionCtx::Append(tx) => {
                 let_assert!(Some(buf) = action.take_buf());
                 tx.send_buf(buf, Err(error.into()));
             }

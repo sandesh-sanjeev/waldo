@@ -3,13 +3,15 @@
 use crate::action::{Append, AsyncIo, GetMetadata, Query};
 use crate::queue::IoQueue;
 use crate::runtime::IoRuntime;
-use crate::{Metadata, Options, Page, QueryError};
+use crate::{Metadata, Options, Page, QueryError, WatchTx};
 use assert2::let_assert;
 use rayon::iter::{IntoParallelIterator, ParallelIterator};
 use std::{io, path::Path};
-use tokio::sync::watch;
 
 /// A ring buffer of storage pages.
+///
+/// It is responsible for routing storage actions to the right
+/// page that can execute and complete the action.
 pub(crate) struct PageRing {
     pub(crate) next: usize,
     pub(crate) pages: Vec<Page>,
@@ -22,14 +24,15 @@ impl PageRing {
     ///
     /// * `path` - Path to the home directory of storage instance.
     /// * `opts` - Options to open storage.
-    pub(crate) fn open(path: &Path, opts: Options, watch_tx: watch::Sender<Option<u64>>) -> io::Result<Self> {
+    /// * `tx` - Sender of progress updates.
+    pub(crate) fn open(path: &Path, opts: Options, tx: WatchTx) -> io::Result<Self> {
         // Initialize all the pages in parallel.
         let mut pages: Vec<_> = (0..opts.ring_size)
             .into_par_iter()
             .map(|id| {
                 let file_name = format!("{id:0>10}.page");
                 let file_path = path.join(file_name);
-                Page::open(id, file_path, opts.page, watch_tx.clone())
+                Page::open(id, file_path, opts.page, tx.clone())
             })
             .collect::<io::Result<_>>()?;
 
@@ -247,7 +250,7 @@ impl PageRing {
 
             // If the page could contain requested logs, we attempt to read it.
             if state.after_seq_no <= after_seq_no {
-                page.query(Query { buf, after_seq_no, tx }, queue);
+                page.query(Query::new(buf, after_seq_no, tx), queue);
                 break;
             }
 

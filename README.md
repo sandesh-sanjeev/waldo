@@ -45,14 +45,15 @@ support to additionally validate integrity of log records when iterating through
 is instead having your own integrity checking mechanism or even better encrypt your logs - whatever makes sense for
 your use case.
 
-Finally Waldo provides a streaming style APIs. The two halves of the stream are a `sink` and a `stream`. A Sink is a
-buffered log writer and a Stream is well a stream that starts from a provided sequence number.
+Finally Waldo provides a streaming style API. The two halves of the stream are a `sink` and a `stream`. A Sink is a
+buffered log writer to append new logs to storage. A Stream is well, a stream, that starts delivering log records
+using a provided starting sequence number.
 
 ## Caching
 
-Waldo does no caching, it is entirely the responsibility of the OS and file system caches. It makes no assumptions
+Waldo does no caching, it is entirely the responsibility of the OS and file system caches. Waldo makes no assumptions
 around the append or access patterns. Every workload is different, it is important to benchmark and establish ideal
-waldo parameters such as queue-depth and buffer pool size.
+waldo parameters such as queue depth and buffer pool size. Lots of free RAM definitely helps and is automatically used!
 
 ## Unsafe
 

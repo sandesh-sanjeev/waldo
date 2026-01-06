@@ -56,7 +56,7 @@ impl Action {
     /// * `buf` - Buffer to append log bytes read from storage.
     pub(crate) fn query(after_seq_no: u64, buf: IoBuf) -> (Self, BufReceiver<(), QueryError>) {
         let (tx, rx) = AsyncFate::channel();
-        (Action::Query(Query { buf, tx, after_seq_no }), rx)
+        (Action::Query(Query::new(buf, after_seq_no, tx)), rx)
     }
 
     /// Create an append action.
@@ -66,13 +66,13 @@ impl Action {
     /// * `buf` - Buffer of logs to append to storage.
     pub(crate) fn append(buf: IoBuf) -> (Self, BufReceiver<(), AppendError>) {
         let (tx, rx) = AsyncFate::channel();
-        (Action::Append(Append { buf, tx }), rx)
+        (Action::Append(Append::new(buf, tx)), rx)
     }
 
     /// Create an action to get latest state.
     pub(crate) fn metadata() -> (Self, FateReceiver<Option<Metadata>>) {
         let (tx, rx) = AsyncFate::channel();
-        (Action::Metadata(GetMetadata { tx }), rx)
+        (Action::Metadata(GetMetadata::new(tx)), rx)
     }
 }
 
@@ -81,6 +81,17 @@ impl Action {
 pub(crate) struct GetMetadata {
     /// Sender to send action result asynchronously.
     pub(crate) tx: FateSender<Option<Metadata>>,
+}
+
+impl GetMetadata {
+    /// Create a new get metadata action.
+    ///
+    /// # Arguments
+    ///
+    /// * `tx` - Sender to send fate of an action.
+    pub(crate) fn new(tx: FateSender<Option<Metadata>>) -> Self {
+        Self { tx }
+    }
 }
 
 /// A request to query for some bytes from page.
@@ -96,6 +107,19 @@ pub(crate) struct Query {
     pub(crate) tx: BufSender<(), QueryError>,
 }
 
+impl Query {
+    /// Create a new query action.
+    ///
+    /// # Arguments
+    ///
+    /// * `buf` - Buffer to populate with log record.
+    /// * `after_seq_no` - Logs will be queried after this sequence number.
+    /// * `tx` - Sender to send fate of an action.
+    pub(crate) fn new(buf: IoBuf, after_seq_no: u64, tx: BufSender<(), QueryError>) -> Self {
+        Self { buf, after_seq_no, tx }
+    }
+}
+
 /// A request to append some bytes into page.
 #[derive(Debug)]
 pub(crate) struct Append {
@@ -106,20 +130,26 @@ pub(crate) struct Append {
     pub(crate) tx: BufSender<(), AppendError>,
 }
 
+impl Append {
+    /// Create a new append action.
+    ///
+    /// # Arguments
+    ///
+    /// * `buf` - A buffer of logs to append into storage.
+    /// * `tx` - Sender to send fate of an action.
+    pub(crate) fn new(buf: IoBuf, tx: BufSender<(), AppendError>) -> Self {
+        Self { buf, tx }
+    }
+}
+
 /// Context associated with a pending storage action.
 #[derive(Debug)]
 pub(crate) enum ActionCtx {
     /// Context associated with a query action.
-    Query {
-        /// Sender to send action result asynchronously.
-        tx: BufSender<(), QueryError>,
-    },
+    Query(BufSender<(), QueryError>),
 
     /// Context associated with a append action.
-    Append {
-        /// Sender to send action result asynchronously.
-        tx: BufSender<(), AppendError>,
-    },
+    Append(BufSender<(), AppendError>),
 
     /// System action to clear a page.
     Reset,
@@ -135,7 +165,7 @@ impl ActionCtx {
     ///
     /// * `tx` - Sender for result of the action.
     pub(crate) fn query(tx: BufSender<(), QueryError>) -> ActionCtx {
-        ActionCtx::Query { tx }
+        ActionCtx::Query(tx)
     }
 
     /// Create context for an append action.
@@ -144,7 +174,7 @@ impl ActionCtx {
     ///
     /// * `tx` - Sender for result of the action.
     pub(crate) fn append(tx: BufSender<(), AppendError>) -> ActionCtx {
-        ActionCtx::Append { tx }
+        ActionCtx::Append(tx)
     }
 }
 
