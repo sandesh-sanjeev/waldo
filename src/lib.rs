@@ -6,21 +6,19 @@
 //!
 //! ## Getting Started
 //!
-//! ```rust,no_run
+//! Open [`Waldo`] with path to home directory and open options.
+//!
+//! ```rust,ignore
 //! // Open storage with specific set of options.
 //! let opts: Options = ..;
 //! let storage = Waldo::open("test", opts).await?;
 //! ```
 //!
-//! Notes
-//!
-//! * `queue_depth` and `pool_size` control concurrency allowed in storage.
-//! * `pool_size` and `buf_capacity` control amount of pre-allocated memory for buffer pool.
-//! * `file_capacity`, `index_capacity` and `page_capacity` control amount of disk space reclaimed at once.
-//!
 //! ### Sink
 //!
-//! ```rust,no_run
+//! Use a [`Sink`] to push new log records into storage.
+//!
+//! ```rust,ignore
 //! // Create a new sink into storage.
 //! let mut sink = storage.sink().await;
 //!
@@ -34,7 +32,9 @@
 //!
 //! ### Stream
 //!
-//! ```rust,no_run
+//! Use a [`Stream`] to discover new log records from storage.
+//!
+//! ```rust,ignore
 //! // Create a new stream from storage.
 //! let prev_seq_no = 0;
 //! let mut stream = storage.stream(prev_seq_no);
@@ -455,7 +455,9 @@ impl<'a> Iterator for StreamLogIter<'a> {
 /// # Cancel safety
 ///
 /// If this method is cancelled between an append, any number of logs might be durably
-/// appended into storage. Use [`Self::metadata`] to know the latest state of storage.
+/// appended into storage, but without incomplete logs and never out of order. Use
+/// [`Waldo::metadata`] detailed info about current state of storage, or [`Waldo::prev_seq_no`]
+/// to just know sequence number of the last append log record.
 #[derive(Debug)]
 pub struct Sink {
     prev: Option<u64>,
