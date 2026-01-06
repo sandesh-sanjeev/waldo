@@ -7,11 +7,11 @@ characteristics. It is being developed to store write ahead logs, hence the name
 pretty darn fast too.
 
 Waldo uses io-uring APIs in linux for batching and asynchronous execution of disk I/O. Consequently linux is
-the only supported OS. Additionally it requires a relatively recent kernel version (6.8+). This crate will compile
-with any 5.10+ kernel, however you will certainly see runtime failures. Some of the io-uring opcodes used in this 
-crate do not exist prior to version 6.8.
+the only supported OS. It requires a relatively recent kernel version 6.8+. While this crate will happily 
+compile with any 5.10+ kernel, you will certainly see runtime failures. Some of the io-uring opcodes used in 
+this crate do not exist prior to version 6.8.
 
-If that sounds good, look at [crate docs](https://sandesh-sanjeev.github.io/waldo/waldo/index.html) and find your
+Sounds good? Check out [crate docs](https://sandesh-sanjeev.github.io/waldo/waldo/index.html) and find your
 Waldo today.
 
 [![Build Status][build-img]][build-url]
@@ -32,7 +32,7 @@ empty page, or a page that contains oldest log records. If it's the latter, the 
 A page is physically backed by a file on disk and an in-memory index. Backing file is a flat file of serialized
 log records. Index contains offsets to logs on file. It is generally not useful to index every log record and might
 require significant memory depending on the workload. The index can be made sparse, trading memory for some small
-penalty during log queries.
+penalty during random seeks.
 
 A single threaded worker coordinates all write into and reads from storage. Rest of the world interacts with this 
 worker using queues (io-uring) and channels (your application). Waldo purely shares state via message passing not
@@ -40,25 +40,25 @@ locks/futex, importantly this allows the worker to optimally schedule reads/writ
 this worker to a single high performance/priority core might allow better latency, more experiments are necessary.
 
 Every log record must contain a monotonically increasing sequence number to uniquely identify the record, sequence
-number of previous log record and an associated payload. Logs must be appended in order and without gaps where current
-and previous sequence numbers create an implicit "append iff previous == last committed record in storage" condition.
+number of previous log record and an associated payload. Logs must be appended in order and without gaps where
+the previous sequence number create an implicit "append iff previous == last committed record in storage" condition.
 Conversely queried logs are always returned in order and without gaps.
 
 When appending a batch of log records, atomicity is only guaranteed for a single log record, not for the entire batch.
-For durability guarantees, enable `o_dsync` flag. This should be a great choice for most applications. It only only 
+For durability guarantees, enable `o_dsync` flag. This should be a great choice for most applications. It only 
 meaningfully impacts performance when appending in the order of GB/s, otherwise it makes little difference because
-everything is async, non-blocking and lock-free.
+everything is non-blocking and lock-free.
 
 Every `open` of Waldo results in parsing and validation of all storage files. Importantly any corruption is
 automatically truncated away so that storage always holds a contiguous sequence of valid log records. There is
-support to additionally validate integrity of log records when iterating through queried logs. However recommendation 
+support to optionally validate integrity of log records when iterating through queried logs. However recommendation 
 is instead having your own integrity checking mechanism or even better encrypt your logs - whatever makes sense for
 your use case.
 
 Waldo eagerly allocates most memory it requires when opened for the first time. The aim is to allocate all memory
 upfront and prevent repeated malloc/free in hot code paths, which typically is expensive. There is some minimal 
-amounts of heap allocations during runtime, primarily for creation of oneshot channels. However they are cheap and 
-barely show up in profiler. Regardless, this crate will never support `no_std`.
+amounts of heap allocations during runtime, primarily for creation of oneshot channels. However they are relatively
+infrequent and barely show up in profiler.
 
 Finally Waldo provides a streaming style API. The two halves of the stream are `sink` and `stream`. A Sink is a
 buffered log writer to append new logs to storage. A Stream is well, a stream that starts delivering log records
