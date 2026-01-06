@@ -213,16 +213,17 @@ async fn main() -> anyhow::Result<()> {
     // Define all the readers.
     for _ in 0..args.readers {
         let mut prev_seq_no = prev;
-        let mut stream = storage.stream(prev);
+        let mut stream = storage.stream_after(prev);
         workers.push(tokio::spawn(async move {
-            while prev_seq_no < end {
-                let logs = stream.next().await?;
-
-                // Just so that we parse log!
-                // Otherwise we would have nothing to do.
-                // Importantly, stream wouldn't make progress.
+            while let Ok(logs) = stream.next().await {
+                // Consume new log records discovered in stream.
                 for log in &logs {
                     prev_seq_no = log.seq_no();
+                }
+
+                // Break once we have completed all log records.
+                if prev_seq_no >= end {
+                    break;
                 }
             }
 
@@ -285,6 +286,7 @@ async fn main() -> anyhow::Result<()> {
     let r_mbps = r_bytes as f64 / per_mb_s;
 
     // Wait for the progress bar thread to complete.
+    storage.close().await; // Initiate graceful shutdown.
     progress.join().expect("Progress bar thread completed in error")?;
     println!("Writer | {seconds:.2}s | {w_tps:.2} Logs/s | {w_mbps:.2} MB/s");
     println!("Readers | {seconds:.2}s | {r_tps:.2} Logs/s | {r_mbps:.2} MB/s");

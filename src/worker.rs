@@ -8,13 +8,14 @@ use crate::{ActionRx, ActionTx, Options, WatchTx};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::{io, path::Path, thread::JoinHandle, time::Duration};
-use tokio::sync::watch;
+use tokio::sync::{Notify, watch};
 
 /// A single threaded worker coordinating all storage actions.
 #[derive(Debug)]
 pub(crate) struct Worker {
     closing: Arc<AtomicBool>,
     handle: Option<JoinHandle<()>>,
+    notify: Arc<Notify>,
 }
 
 impl Worker {
@@ -39,8 +40,12 @@ impl Worker {
         // Flag to communicate intent to shutdown.
         let closing = Arc::new(AtomicBool::new(false));
 
+        // Notification when worker has gracefully completed.
+        let notify = Arc::new(Notify::new());
+
         // Spawn the worker thread.
         let handle = {
+            let notify = notify.clone();
             let closing = closing.clone();
             let path = path.to_path_buf();
             std::thread::spawn(move || match WorkerState::new(&path, opts, watch_tx) {
@@ -53,7 +58,7 @@ impl Worker {
                         return;
                     }
 
-                    state.process(closing);
+                    state.process(closing, notify);
                 }
             })
         };
@@ -62,11 +67,25 @@ impl Worker {
         let (pool, tx) = fate_rx.recv_async().await??;
         let worker = Worker {
             closing,
+            notify,
             handle: Some(handle),
         };
 
         // Return results from initialization.
         Ok((pool, tx, watch_rx, worker))
+    }
+
+    /// Start graceful shutdown of worker.
+    pub(crate) async fn close(mut self) {
+        if let Some(handle) = self.handle.take() {
+            self.closing.store(true, Ordering::Relaxed);
+            self.notify.notified().await;
+
+            // Handle should complete immediately, since the work as finished.
+            if let Err(e) = handle.join() {
+                eprintln!("Error dropping worker: {e:?}");
+            }
+        };
     }
 }
 
@@ -75,7 +94,6 @@ impl Drop for Worker {
         if let Some(handle) = self.handle.take() {
             self.closing.store(true, Ordering::Relaxed);
             if let Err(e) = handle.join() {
-                // TODO: Tracing, log, etc.
                 eprintln!("Error dropping worker: {e:?}");
             }
         };
@@ -124,7 +142,7 @@ impl WorkerState {
         Ok((buf_pool, tx, state))
     }
 
-    fn process(mut self, closing: Arc<AtomicBool>) {
+    fn process(mut self, closing: Arc<AtomicBool>, notify: Arc<Notify>) {
         loop {
             // Check if graceful shutdown has begun.
             // We'll continue to complete all pending work.
@@ -132,7 +150,8 @@ impl WorkerState {
 
             // If not closing, await for an action, i.e, blocking wait for a processable
             // action to be available. If closing, we just want to flush all the pending
-            // work and shutdown, so no blocking wait.
+            // work and shutdown, so no blocking wait. However we probably want a timeout
+            // in here so that we complete in deterministic amount of time.
             if !is_closing {
                 self.await_action();
             }
@@ -160,19 +179,11 @@ impl WorkerState {
             }
 
             // Submit queued up actions to the runtime.
+            // Note that this method optionally waits for for a pending
+            // action to complete if the runtime is fully saturated. This
+            // makes sure we apply back-pressure to users when runtime is
+            // saturated.
             self.submit_actions();
-
-            // If the runtime is fully saturated, we have to wait for at least
-            // one pending I/O action to complete. We could make no progress
-            // without it. Otherwise, we just submit I/O for kernel to execute
-            // while we try to queue up more work.
-            let pending_io = self.runtime.pending_io();
-            let cq_capacity = self.runtime.cq_capacity();
-            let remaining = cq_capacity.saturating_sub(pending_io);
-            let want = if remaining == 0 { 0 } else { 1 };
-            if let Err(e) = self.runtime.submit_and_wait(want) {
-                eprintln!("Error from I/O uring runtime: {e}");
-            }
 
             // Process all the completed actions.
             self.complete_actions();
@@ -182,6 +193,9 @@ impl WorkerState {
         if let Err(e) = self.ring.close() {
             eprintln!("Error closing storage ring buffer: {e}");
         }
+
+        // Nice, notify any listeners that graceful shutdown is complete.
+        notify.notify_one();
     }
 
     fn await_action(&mut self) {
@@ -254,6 +268,18 @@ impl WorkerState {
                 self.io_queue.reissue(AsyncIo { id, ctx, action });
                 break;
             }
+        }
+
+        // If the runtime is fully saturated, we have to wait for at least
+        // one pending I/O action to complete. We could make no progress
+        // without it. Otherwise, we just submit I/O for kernel to execute
+        // while we try to queue up more work.
+        let pending_io = self.runtime.pending_io();
+        let cq_capacity = self.runtime.cq_capacity();
+        let remaining = cq_capacity.saturating_sub(pending_io);
+        let want = if remaining == 0 { 0 } else { 1 };
+        if let Err(e) = self.runtime.submit_and_wait(want) {
+            eprintln!("Error from I/O uring runtime: {e}");
         }
     }
 

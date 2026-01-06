@@ -1,11 +1,14 @@
 # Waldo
 
 Waldo is an asynchronous storage engine to hold sequential log records. It is a lock-free, append-only, on-disk 
-ring buffer. Waldo resides in your process (embedded), requires no maintenance and has excellent performance 
+ring buffer that is optimized for high throughput (in GB/s) writes and large read fanout (in 10,000s of concurrent
+read stream). Waldo resides in your process (embedded), requires no maintenance and has excellent performance 
 characteristics. It is being developed to store write ahead logs, hence the name.
 
 Waldo uses io-uring APIs in linux for batching and asynchronous execution of disk I/O. Consequently linux is
 the only supported OS, and requires a relatively recent kernel version (6.8+).
+
+Look at [crate docs](https://sandesh-sanjeev.github.io/waldo/waldo/index.html) to get started.
 
 [![Build Status][build-img]][build-url]
 [![Documentation][doc-img]][doc-url]
@@ -23,8 +26,9 @@ active for writes. When this page runs out of capacity, it is rotated away with 
 empty page, or a page that contains oldest log records. If it's the latter, the page is truncated prior to use.
 
 A page is physically backed by a file on disk and an in-memory index. Backing file is a flat file of serialized
-log records. Index contains offsets to logs on file. Memory is precious and it is generally not useful to index 
-every log record. The index can be made sparse, trading memory for some small penalty during log queries.
+log records. Index contains offsets to logs on file. It is generally not useful to index every log record and might
+require significant memory depending on the workload. The index can be made sparse, trading memory for some small
+penalty during log queries.
 
 A single threaded worker coordinates all reads and writes from storage. Rest of the world interacts with this worker
 using queues (io-uring) and channels (your application). All memory, except those necessary to create oneshot channels
@@ -45,9 +49,9 @@ support to additionally validate integrity of log records when iterating through
 is instead having your own integrity checking mechanism or even better encrypt your logs - whatever makes sense for
 your use case.
 
-Finally Waldo provides a streaming style API. The two halves of the stream are a `sink` and a `stream`. A Sink is a
-buffered log writer to append new logs to storage. A Stream is well, a stream, that starts delivering log records
-using a provided starting sequence number.
+Finally Waldo provides a streaming style API. The two halves of the stream are `sink` and `stream`. A Sink is a
+buffered log writer to append new logs to storage. A Stream is well, a stream that starts delivering log records
+using a provided starting seed sequence number.
 
 ## Caching
 
@@ -59,8 +63,8 @@ waldo parameters such as queue depth and buffer pool size. Lots of free RAM defi
 
 io-uring requires asynchronously sharing memory with the kernel. This is inherently an unsafe operation, i.e, buffers
 must remain valid and untouched while kernel has a reference to the buffer. There is only one (safe) interface to
-achieve this in async rust (futures can be cancelled), taking ownership of buffer and stashing it away while kernel
-holds a reference, that's what this crate does.
+achieve this in async rust where futures can be cancelled. And that is taking ownership of buffer and stashing it away
+in a place where the sun don't shine while kernel holds a reference, that's what this crate does.
 
 There are unsafe uses in few other places to remove unnecessary bounds checking in hot code path, where Rust/LLVM do
 not automatically elide bounds checking. They are trivially provable correct with manual inspection and specialized 
@@ -96,13 +100,13 @@ Benchmarks must be performed on your machine with your workload, otherwise it is
 
 ### Steady state
 
-In this test all the readers are caught up to the tip of storage. They continue to query from storage with the same rate 
-as appends from writer. This is the best case scenario where high file cache hit rate is likely, meaning most queries are 
-really memcpy (rather than read from disk).
+In this test all the readers are caught up to the tip of storage. They continue to stream from storage with the same 
+rate as appends from writer. This is the best case scenario where high file cache hit rate is likely, meaning most 
+queries are really memcpy (rather than read from disk).
 
-An example result with Waldo on a Linux VM (4 cores, 8 GB RAM) running on my M1 Mac Pro. Upto 30 GB/s worth of log records
-queried and upto 1 GB/s worth of log records appended. Number of readers that can be supported is inversely proportional to
-rate that which logs are appended. 
+An example result with Waldo on a Linux VM (4 cores, 8 GB RAM) running on my M1 Mac Pro. Upto 30 GB/s worth of log 
+records queried and upto 1 GB/s worth of log records appended. Number of readers that can be supported is inversely 
+proportional to rate with which logs are appended. 
 
 Low append rate (10 MB/s) with 3000 concurrent readers.
 
@@ -167,7 +171,7 @@ Check `--help` for available options and defaults, but here are examples.
 $ cargo build --profile bench --features benchmark
 
 # Execute benchmarks with profiler.
-$ perf record -g --call-graph dwarf -F 999 ./target/release/storage
+$ perf record -g -F 999 ./target/release/storage
 
 # Flamegraphs are easy too.
 $ cargo flamegraph --bin storage --features benchmark --profile bench -- --count 10000000

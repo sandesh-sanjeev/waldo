@@ -1,12 +1,28 @@
 //! # Waldo
 //!
-//! Waldo is an embedded lock-free, on-disk, ring buffer of sequential records. README on the
-//! [repository](https://github.com/sandesh-sanjeev/waldo#) provides an overview of the high
-//! level design and capabilities.
+//! Waldo is an embedded, on-disk, ring buffer of sequential log records.
+//!
+//! Waldo provides a streaming style interface that is optimized for high throughput
+//! writes (in GB/s of logs) and large read fanout (in 10,000s of readers). README in
+//! [repository](https://github.com/sandesh-sanjeev/waldo#) provides an overview of the
+//! high level design, capabilities and limitations.
+//!
+//! Note that this crate uses it's own bespoke io-uring based async runtime to drive
+//! asynchronous disk I/O. It is exposed publicly when compiled with `benchmark` feature
+//! enabled. It's just that, for benchmarks. Should probably go without saying, do not
+//! compile with `benchmark` feature flag and take a dependency on the async runtime.
 //!
 //! ## Getting Started
 //!
-//! Open [`Waldo`] with path to home directory and open options.
+//! Open [`Waldo`] with path to home directory and open [`Options`].
+//!
+//! Options allows you to tailor Waldo to your throughput, latency, concurrency and memory
+//! usage goals:
+//!
+//! * [`PoolOptions`] - Defines amount to memory to allocate.
+//! * [`PageOptions`] - Defines disk and memory footprint of individual pages.
+//! * [`Options::queue_depth`] - Defines concurrency (readers + writers) allowed.
+//! * [`Options::ring_size`] - Defines total number of pages.
 //!
 //! ```rust,ignore
 //! // Open storage with specific set of options.
@@ -36,13 +52,10 @@
 //!
 //! ```rust,ignore
 //! // Create a new stream from storage.
-//! let prev_seq_no = 0;
-//! let mut stream = storage.stream(prev_seq_no);
+//! let mut stream = storage.stream_after(0);
 //!
 //! // Wait for new batch of log records.
-//! while !is_closing {
-//!     // Wait for more log records from storage and process them.
-//!     let logs = stream.next().await?;
+//! while let Ok(logs) = stream.next().await {
 //!     for log in &logs {
 //!         println!("{log:?}");
 //!     }
@@ -92,6 +105,10 @@ pub enum QueryError {
     #[error("Fault in storage: {0}")]
     Fault(&'static str),
 
+    /// Error when Waldo storage has been closed.
+    #[error("Underlying Waldo storage instance closed")]
+    Closed,
+
     /// Error when requested logs are trimmed from storage.
     #[error("Requested range of log after: {0} are trimmed")]
     Trimmed(u64),
@@ -103,13 +120,19 @@ pub enum QueryError {
 
 impl From<FateError> for QueryError {
     fn from(_value: FateError) -> Self {
-        QueryError::Fault("Fate sender drooped, worker unexpectedly closed")
+        QueryError::Closed
     }
 }
 
 impl<T> From<flume::SendError<T>> for QueryError {
     fn from(_value: flume::SendError<T>) -> Self {
-        QueryError::Fault("Action receiver drooped, worker unexpectedly closed")
+        QueryError::Closed
+    }
+}
+
+impl From<watch::error::RecvError> for QueryError {
+    fn from(_value: watch::error::RecvError) -> Self {
+        QueryError::Closed
     }
 }
 
@@ -123,6 +146,10 @@ pub enum AppendError {
     /// Error when unexpected things happen in storage.
     #[error("Fault in storage: {0}")]
     Fault(&'static str),
+
+    /// Error when Waldo storage has been closed.
+    #[error("Underlying Waldo storage instance closed")]
+    Closed,
 
     /// Error when conflicting appends are performed.
     #[error("A conflicting append is already in progress")]
@@ -139,13 +166,13 @@ pub enum AppendError {
 
 impl From<FateError> for AppendError {
     fn from(_value: FateError) -> Self {
-        AppendError::Fault("Fate sender drooped, worker unexpectedly closed")
+        AppendError::Closed
     }
 }
 
 impl<T> From<flume::SendError<T>> for AppendError {
     fn from(_value: flume::SendError<T>) -> Self {
-        AppendError::Fault("Action receiver drooped, worker unexpectedly closed")
+        AppendError::Closed
     }
 }
 
@@ -183,9 +210,12 @@ pub struct Options {
 ///
 /// # Warning
 ///
-/// As of now dropping an instance of Waldo can block the async runtime.
-/// This is to support graceful shutdown of internal state machines. Lack of an
-/// `async drop` makes this tricky, as of now we take the easy way out.
+/// Waldo attempts to perform graceful shutdown when dropped. Unfortunately there
+/// is no support for drop in async. If [`Waldo::close`] is not explicitly invoked
+/// and awaited to completion, Waldo will initiate graceful shutdown during drop
+/// which will block the async runtime. This is typically not a big deal, especially
+/// in multi-threaded runtimes. However it is recommended to asynchronously invoke close
+/// when possible.
 #[derive(Debug, Clone)]
 pub struct Waldo {
     rx: WatchRx,
@@ -258,13 +288,31 @@ impl Waldo {
     ///
     /// # Arguments
     ///
-    /// * `after_seq_no` - Log records after this sequence number will be delivered in stream.
-    pub fn stream(&self, after_seq_no: u64) -> Stream {
+    /// * `seq_no` - Log records after this sequence number will be delivered in stream.
+    pub fn stream_after(&self, seq_no: u64) -> Stream {
         Stream {
             pool: self.buf_pool.clone(),
-            prev: Cell::new(after_seq_no),
+            prev: Cell::new(seq_no),
             tx: self.tx.clone(),
             rx: self.rx.clone(),
+        }
+    }
+
+    /// Initiate graceful shutdown of storage.
+    ///
+    /// If there are no other references to Waldo and this method completes
+    /// successfully, you can be guaranteed that all logs appended to storage
+    /// have been durably stored on disk (unless they were trimmed away to reclaim
+    /// space for new logs).
+    pub async fn close(self) {
+        // Drop rid of any shared reference.
+        drop(self.tx);
+        drop(self.rx);
+        drop(self.buf_pool);
+
+        // If we have the last reference to worker, we'll close the worker now.
+        if let Ok(worker) = Arc::try_unwrap(self._worker) {
+            worker.close().await;
         }
     }
 }
@@ -312,9 +360,7 @@ impl Stream {
             };
 
             // Otherwise wait for new logs to get appended.
-            if self.rx.changed().await.is_err() {
-                return Err(QueryError::Fault("Storage is closed"));
-            }
+            self.rx.changed().await?;
         }
 
         // Attempt to fetch the next set of logs.
@@ -451,6 +497,13 @@ impl<'a> Iterator for StreamLogIter<'a> {
 /// This operation is executed with sequential consistency, i.e, all appends, even
 /// across threads, always operate against latest state of storage. If storage processes
 /// two concurrent appends, one of them will be rejected with conflict.
+///
+/// # Flush
+///
+/// A sink writes to storage only when backing buffer is full, which could take arbitrary
+/// time or never. Use [`Sink::flush`] to make sure all accumulated logs have been dispatched
+/// to storage. Importantly, if the sink is dropped without a flush, any accumulated logs
+/// will be lost.
 ///
 /// # Cancel safety
 ///
