@@ -10,7 +10,7 @@ use std::path::Path;
 
 /// Options for file backing a page.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct FileOpts {
+pub struct FileOptions {
     /// Maximum size of a page file.
     pub capacity: u64,
 
@@ -44,7 +44,7 @@ impl PageFile {
     ///
     /// * `path` - Path to the file on disk.
     /// * `opts` - Options for the file.
-    pub(super) fn open<P: AsRef<Path>>(path: P, opts: FileOpts) -> Result<Self> {
+    pub(super) fn open<P: AsRef<Path>>(path: P, opts: FileOptions) -> Result<Self> {
         // All the default options for a page fie.
         let mut options = OpenOptions::new();
         options.truncate(false);
@@ -251,11 +251,11 @@ impl PageFile {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) struct FileState {
     pub(super) offset: u64,
-    pub(super) opts: FileOpts,
+    pub(super) opts: FileOptions,
 }
 
 impl FileState {
-    fn new(offset: u64, opts: FileOpts) -> Self {
+    fn new(offset: u64, opts: FileOptions) -> Self {
         Self { opts, offset }
     }
 

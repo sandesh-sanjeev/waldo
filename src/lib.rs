@@ -63,7 +63,7 @@
 //!
 //! ## Next steps
 //!
-//! It's that simple! Run benchmarks and spot your perfect Waldo today.
+//! It's that simple! Run benchmarks and find idea Waldo configuration for your workload.
 
 mod action;
 mod log;
@@ -78,7 +78,7 @@ pub mod runtime;
 #[cfg(not(feature = "benchmark"))]
 mod runtime;
 
-pub use crate::page::{FileOpts, IndexOpts, PageOptions};
+pub use crate::page::{FileOptions, IndexOptions, PageOptions};
 pub use crate::runtime::PoolOptions;
 pub use log::{Error as LogError, Log, LogIter};
 
@@ -497,8 +497,9 @@ impl<'a> Iterator for StreamLogIter<'a> {
 /// ## Durability
 ///
 /// Durability guarantees depend on the options used open storage. Specifically, if
-/// you want guarantee that bytes are durably flushed to disk when [`Sink::push`] or
-/// [`Sink::flush`] successfully completes, enable [`FileOpts::o_dsync`].
+/// you want guarantee that bytes are durably flushed to disk when [`Sink::flush`]
+/// successfully completes, enable [`FileOptions::o_dsync`]. It's a great default to
+/// start off with.
 ///
 /// ## Isolation
 ///

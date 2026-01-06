@@ -6,7 +6,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 use tokio::{fs::create_dir_all, time::MissedTickBehavior};
-use waldo::{FileOpts, IndexOpts, Log, Metadata, Options, PageOptions, PoolOptions, Waldo};
+use waldo::{FileOptions, IndexOptions, Log, Metadata, Options, PageOptions, PoolOptions, Waldo};
 
 /// Arguments for the I/O runtime benchmark.
 #[derive(Parser, Clone)]
@@ -81,12 +81,12 @@ impl From<&Arguments> for Options {
             },
             page: PageOptions {
                 capacity: value.page_capacity,
-                index_opts: IndexOpts {
+                index_opts: IndexOptions {
                     capacity: value.page_index_capacity,
                     sparse_count: value.index_sparse_count,
                     sparse_bytes: value.index_sparse_bytes,
                 },
-                file_opts: FileOpts {
+                file_opts: FileOptions {
                     o_dsync: value.o_dsync,
                     capacity: value.page_file_capacity_gb * 1024 * 1024 * 1024,
                 },

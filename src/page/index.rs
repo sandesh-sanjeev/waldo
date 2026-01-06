@@ -8,7 +8,7 @@ use crate::log::Log;
 /// Denser the index, more memory is required for the index. Choose a value
 /// that works for your workload, 5% - 10% discard is probably okay.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct IndexOpts {
+pub struct IndexOptions {
     /// Maximum number of entries to index.
     pub capacity: usize,
 
@@ -46,7 +46,7 @@ impl PageIndex {
     /// # Arguments
     ///
     /// * `opts` - Options to customize the index.
-    pub(super) fn new(opts: IndexOpts) -> Self {
+    pub(super) fn new(opts: IndexOptions) -> Self {
         Self {
             state: IndexState::new(opts),
             entries: Vec::with_capacity(opts.capacity),
@@ -108,13 +108,13 @@ impl PageIndex {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) struct IndexState {
     pub(super) len: usize,
-    pub(super) opts: IndexOpts,
+    pub(super) opts: IndexOptions,
     pub(super) count_since: usize,
     pub(super) bytes_since: usize,
 }
 
 impl IndexState {
-    fn new(opts: IndexOpts) -> Self {
+    fn new(opts: IndexOptions) -> Self {
         Self {
             opts,
             len: 0,

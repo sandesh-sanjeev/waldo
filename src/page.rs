@@ -3,7 +3,7 @@
 mod file;
 mod index;
 
-pub use {file::FileOpts, index::IndexOpts};
+pub use {file::FileOptions, index::IndexOptions};
 
 use crate::action::{Action, ActionCtx, Append, AsyncIo, Query};
 use crate::log::LogIter;
@@ -21,10 +21,10 @@ pub struct PageOptions {
     pub capacity: u64,
 
     /// Options for file backing a page.
-    pub file_opts: FileOpts,
+    pub file_opts: FileOptions,
 
     /// Options for index backing a page.
-    pub index_opts: IndexOpts,
+    pub index_opts: IndexOptions,
 }
 
 /// A chunk of contiguous sequence of logs within storage.
