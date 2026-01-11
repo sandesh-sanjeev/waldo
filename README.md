@@ -118,6 +118,10 @@ Memlock limits for the user must be increased appropriately, for example via `/e
 
 Benchmarks must be performed on your machine with your workload, otherwise it is meaningless. 
 
+This crate provides benchmark binaries to benchmark Waldo on your hardware (or VM). These can be created by building
+the crate with `--features benchmark`. Alternatively they can be executed directly using `cargo run`. Check `--help` 
+for available options and defaults.
+
 ### Steady state
 
 In this test all the readers are caught up to the tip of storage. They continue to stream from storage with the same 
@@ -126,48 +130,29 @@ queries are really memcpy (rather than read from disk).
 
 An example result with Waldo on a Linux VM (4 cores, 8 GB RAM) running on my M1 Mac Pro. Upto 30 GB/s worth of log 
 records queried and upto 1 GB/s worth of log records appended. Number of readers that can be supported is inversely 
-proportional to rate with which logs are appended. 
-
-Low append rate (10 MB/s) with 3000 concurrent readers.
-
-```text
-Bench   | BufPoolSize: 256  | QueueDepth: 256       | Readers: 3000     | Delay: 200ms
-Worker  | Logs: 1000000     | LogSize: 1024 B       | BatchSize: 2048   | Total: 0.95 GB
-Writer  | 97.76s            | 10229.61 Logs/s       | 9.99 MB/s
-Readers | 97.76s            | 30688838.40 Logs/s    | 29969.57 MB/s
-```
-
-Medium append rate (100 MB/s) with 300 concurrent readers.
-
-```text
-Bench   | BufPoolSize: 256  | QueueDepth: 256       | Readers: 300      | Delay: 20ms
-Worker  | Logs: 1000000     | LogSize: 1024 B       | BatchSize: 2048   | Total: 0.95 GB
-Writer  | 9.84s             | 101628.45 Logs/s      | 99.25 MB/s
-Readers | 9.84s             | 30488535.87 Logs/s    | 29773.96 MB/s
-```
-
-High appended rate (1 GB/s) with 1 concurrent reader.
-
-```text
-Bench   | BufPoolSize: 256  | QueueDepth: 256       | Readers: 1        | Delay: 1ms
-Worker  | Logs: 50000000    | LogSize: 1024 B       | BatchSize: 2048   | Total: 47.68 GB
-Writer  | 43.63s            | 1146052.75 Logs/s     | 1119.19 MB/s
-Readers | 43.63s            | 1146052.75 Logs/s     | 1119.19 MB/s
-```
-
-### Run benchmarks
-
-This crate provides benchmark binaries to benchmark Waldo on your hardware (or VM). These can be created by building
-the crate with `--features benchmark`. Alternatively they can be executed directly using `cargo run`.
-
-Check `--help` for available options and defaults, but here are examples.
+proportional to rate with which logs are appended.
 
 ```bash
-# Generate benchmark binaries.
-$ cargo build --release --features benchmark
+# An example relatively low append rate and massive fanout.
+$ cargo run --release --bin storage --features benchmark -- \
+--ring-size 4 \
+--queue-depth 256 \
+--pool-size 256 \
+--page-capacity 1000000 \
+--page-file-capacity-gb 1 \
+--page-index-capacity 10000 \
+--index-sparse-count 100 \
+--index-sparse-bytes 131070 \
+--log-size 1000 \
+--readers 3000 \
+--count 1000000 \
+--delay 200 \
+--o-dsync
 
-# Execute benchmarks.
-$ cargo run --release --bin storage --features benchmark -- --readers 1024 --count 1000000 --delay 100
+State   | Pending:    0 | Disk: 3,692,768/3.52 GiB | Index: 36,559/571.23 KiB
+Writer  | [00:01:36] [10,485/10.24 MiB][###################################################] 1000000/1000000
+Readers | [00:01:36] [26,212,500/25.00 GiB][#########################################] 2500000000/2500000000
+cargo run --release --bin storage --features benchmark -- --ring-size 4  256   71.80s user 196.15s system 286% cpu 1:33.53 total
 ```
 
 ### Run benchmarks with profiler

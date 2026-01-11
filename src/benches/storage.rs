@@ -92,14 +92,11 @@ impl From<&Arguments> for Options {
 
 impl From<&Arguments> for BenchOptions {
     fn from(value: &Arguments) -> Self {
-        let batch_size = (2 * 1024 * 1024) / value.log_size;
-        let delay = value.delay.map(Duration::from_millis);
-
         Self {
+            count: value.count,
             log_size: value.log_size,
-            log_count: value.count,
-            batch_size,
-            delay,
+            delay: value.delay.map(Duration::from_millis),
+            batch_size: (2 * 1024 * 1024) / value.log_size,
         }
     }
 }
@@ -111,10 +108,9 @@ async fn main() -> anyhow::Result<()> {
     let opts = Options::from(&args);
     let b_opts = BenchOptions::from(&args);
 
-    // Random log data to use with log records.
+    // Some common configurations.
     let count = args.count;
-
-    // Size of a log record.
+    let readers = args.readers;
     let log_size = 24 + args.log_size;
 
     // Create directory to store benchmark files.
@@ -123,42 +119,33 @@ async fn main() -> anyhow::Result<()> {
     // Open storage at the given path.
     let storage = Waldo::open(&args.path, opts).await?;
 
-    // Range of log records to append into storage for this benchmark.
-    let prev = storage.prev_seq_no().unwrap_or(0);
-
     // To track progress.
-    let readers = args.readers;
-    let writer_progress = Arc::new(AtomicU64::new(0));
-    let readers_progress = Arc::new(AtomicU64::new(0));
-    let workers_progress = Arc::new(AtomicU32::new(readers + 1));
+    let counter = Arc::new(Counters::new());
 
     // Number of workers participating in the benchmark.
     let mut workers = JoinSet::new();
 
     // Spawn writer.
     let sink = storage.sink().await;
-    let writer = Writer::new(sink, b_opts, writer_progress.clone(), workers_progress.clone());
+    let writer = Writer::new(sink, b_opts, counter.clone());
     workers.spawn(writer.run());
 
     // Spawn readers.
     for _ in 0..args.readers {
+        let prev = storage.prev_seq_no().unwrap_or(0);
         let stream = storage.stream_after(prev);
-        let readers = Reader::new(stream, b_opts, readers_progress.clone(), workers_progress.clone());
+        let readers = Reader::new(stream, b_opts, counter.clone());
         workers.spawn(readers.run());
     }
 
     // Reporter prints to console that is blocking I/O.
     // So spawn a new thread to execute the async task.
     workers.spawn_blocking(move || {
-        let reporter = Reporter {
-            storage,
-            writer: writer_progress,
-            readers: readers_progress,
-            workers: workers_progress,
-        };
-
         let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build()?;
-        runtime.block_on(async { reporter.run(count, readers, log_size).await })
+        runtime.block_on(async {
+            let reporter = Reporter { storage, counter };
+            reporter.run(count, readers, log_size).await
+        })
     });
 
     // Wait for all workers to complete.
@@ -169,12 +156,111 @@ async fn main() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Options for a benchmark worker.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct BenchOptions {
+    log_size: usize,
+    count: u64,
+    batch_size: usize,
+    delay: Option<Duration>,
+}
+
+/// A writer that appends new log record into storage.
+struct Writer {
+    sink: Sink,
+    data: Vec<u8>,
+    opts: BenchOptions,
+    counter: Arc<Counters>,
+    delay: Option<Interval>,
+}
+
+impl Writer {
+    fn new(sink: Sink, opts: BenchOptions, counter: Arc<Counters>) -> Self {
+        let data = vec![69; opts.log_size];
+        let delay = opts.delay.map(|duration| {
+            let mut interval = tokio::time::interval(duration);
+            interval.set_missed_tick_behavior(MissedTickBehavior::Skip);
+            interval
+        });
+
+        Self {
+            opts,
+            sink,
+            delay,
+            data,
+            counter,
+        }
+    }
+
+    async fn run(mut self) -> Result<()> {
+        self.counter.start();
+
+        // Run the writer until complete.
+        let mut appended = 0;
+        let mut prev_seq_no = self.sink.prev_seq_no().unwrap_or(0);
+        while appended < self.opts.count {
+            // Self throttle if required.
+            if let Some(interval) = &mut self.delay {
+                interval.tick().await;
+            };
+
+            // Append the next batch of log records.
+            for _ in 0..self.opts.batch_size {
+                let seq_no = prev_seq_no + 1;
+                let log = Log::new_borrowed(seq_no, prev_seq_no, &self.data);
+                self.sink.push(log).await?;
+                prev_seq_no = seq_no;
+            }
+
+            // Make sure buffers logs are flushed to storage.
+            self.sink.flush().await?;
+
+            // Update for the next iteration.
+            appended += self.opts.batch_size as u64;
+            self.counter.add_count(self.opts.batch_size as _, Role::Writer);
+        }
+
+        // Tell the reporter that this worker is complete.
+        Ok(self.counter.complete())
+    }
+}
+
+/// A reader that streams new log record from storage.
+struct Reader {
+    stream: Stream,
+    opts: BenchOptions,
+    counter: Arc<Counters>,
+}
+
+impl Reader {
+    fn new(stream: Stream, opts: BenchOptions, counter: Arc<Counters>) -> Self {
+        Self { stream, opts, counter }
+    }
+
+    async fn run(mut self) -> Result<()> {
+        self.counter.start();
+
+        // Run the reader until complete.
+        let mut observed = 0;
+        while observed < self.opts.count {
+            // Get next set of log records.
+            let logs = self.stream.next().await?;
+            let count = logs.into_iter().count() as u64;
+
+            // Consume the next set of log records.
+            observed += count;
+            self.counter.add_count(count, Role::Reader);
+        }
+
+        // Tell the reporter that this worker is complete.
+        Ok(self.counter.complete())
+    }
+}
+
 /// A reporter to report on the progress of benchmark.
 struct Reporter {
     storage: Waldo,
-    writer: Arc<AtomicU64>,
-    readers: Arc<AtomicU64>,
-    workers: Arc<AtomicU32>,
+    counter: Arc<Counters>,
 }
 
 impl Reporter {
@@ -198,7 +284,7 @@ impl Reporter {
 
         let mut writer_prev = 0;
         let mut readers_prev = 0;
-        while self.workers.load(Ordering::Relaxed) > 0 {
+        while self.counter.workers() > 0 {
             let Some(metadata) = self.storage.metadata().await else {
                 std::thread::sleep(Duration::from_secs(1));
                 continue;
@@ -225,7 +311,7 @@ impl Reporter {
                 "Pending: {pending_io: >4} | Disk: {logs}/{disks} | Index: {entries}/{indexs}"
             ));
 
-            let current = self.writer.load(Ordering::Relaxed);
+            let current = self.counter.get_count(Role::Writer);
             let progress = current.saturating_sub(writer_prev);
             writer_prev = current;
 
@@ -234,7 +320,7 @@ impl Reporter {
             writer.set_message(format!("{lps}/{mbps}"));
             writer.set_position(current);
 
-            let current = self.readers.load(Ordering::Relaxed);
+            let current = self.counter.get_count(Role::Reader);
             let progress = current.saturating_sub(readers_prev);
             readers_prev = current;
 
@@ -257,109 +343,53 @@ impl Reporter {
     }
 }
 
-/// Options for a benchmark worker.
+/// Different types of workers running benchmarks.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct BenchOptions {
-    log_size: usize,
-    log_count: u64,
-    batch_size: usize,
-    delay: Option<Duration>,
+enum Role {
+    Writer,
+    Reader,
 }
 
-/// A writer that appends new log record into storage.
-struct Writer {
-    sink: Sink,
-    data: Vec<u8>,
-    opts: BenchOptions,
-    counter: Arc<AtomicU64>,
-    delay: Option<Interval>,
-    done: Arc<AtomicU32>,
+/// Counters that are shared across threads/tasks.
+#[derive(Debug)]
+struct Counters {
+    writer: AtomicU64,
+    workers: AtomicU32,
+    readers: AtomicU64,
 }
 
-impl Writer {
-    fn new(sink: Sink, opts: BenchOptions, counter: Arc<AtomicU64>, done: Arc<AtomicU32>) -> Self {
-        let data = vec![69; opts.log_size];
-        let delay = opts.delay.map(|duration| {
-            let mut interval = tokio::time::interval(duration);
-            interval.set_missed_tick_behavior(MissedTickBehavior::Skip);
-            interval
-        });
-
+impl Counters {
+    fn new() -> Self {
         Self {
-            opts,
-            sink,
-            delay,
-            data,
-            counter,
-            done,
+            writer: AtomicU64::new(0),
+            readers: AtomicU64::new(0),
+            workers: AtomicU32::new(0),
         }
     }
 
-    async fn run(mut self) -> Result<()> {
-        let mut appended = 0;
-        let mut prev_seq_no = self.sink.prev_seq_no().unwrap_or(0);
-        while appended < self.opts.log_count {
-            // Self throttle if required.
-            if let Some(interval) = &mut self.delay {
-                interval.tick().await;
-            };
-
-            for _ in 0..self.opts.batch_size {
-                // Write next log record into sink.
-                let seq_no = prev_seq_no + 1;
-                let log = Log::new_borrowed(seq_no, prev_seq_no, &self.data);
-                self.sink.push(log).await?;
-
-                appended += 1;
-                prev_seq_no = seq_no;
-            }
-
-            // Make sure buffers logs are flushed to storage.
-            self.sink.flush().await?;
-            self.counter.fetch_add(self.opts.batch_size as _, Ordering::Relaxed);
-        }
-
-        self.done.fetch_sub(1, Ordering::Relaxed);
-        Ok(())
-    }
-}
-
-/// A reader that streams new log record from storage.
-struct Reader {
-    stream: Stream,
-    opts: BenchOptions,
-    counter: Arc<AtomicU64>,
-    done: Arc<AtomicU32>,
-}
-
-impl Reader {
-    fn new(stream: Stream, opts: BenchOptions, counter: Arc<AtomicU64>, done: Arc<AtomicU32>) -> Self {
-        Self {
-            stream,
-            opts,
-            counter,
-            done,
-        }
+    fn workers(&self) -> u32 {
+        self.workers.load(Ordering::Relaxed)
     }
 
-    async fn run(mut self) -> Result<()> {
-        let mut observed = 0;
-        while let Ok(logs) = self.stream.next().await {
-            // Consume new log records discovered in stream.
-            let mut count = 0;
-            for _log in &logs {
-                observed += 1;
-                count += 1;
-            }
+    fn start(&self) {
+        self.workers.fetch_add(1, Ordering::Relaxed);
+    }
 
-            // Break once we have completed all log records.
-            self.counter.fetch_add(count, Ordering::Relaxed);
-            if observed >= self.opts.log_count {
-                break;
-            }
+    fn complete(&self) {
+        self.workers.fetch_sub(1, Ordering::Relaxed);
+    }
+
+    fn add_count(&self, count: u64, role: Role) {
+        match role {
+            Role::Writer => self.writer.fetch_add(count, Ordering::Relaxed),
+            Role::Reader => self.readers.fetch_add(count, Ordering::Relaxed),
+        };
+    }
+
+    fn get_count(&self, role: Role) -> u64 {
+        match role {
+            Role::Writer => self.writer.load(Ordering::Relaxed),
+            Role::Reader => self.readers.load(Ordering::Relaxed),
         }
-
-        self.done.fetch_sub(1, Ordering::Relaxed);
-        Ok(())
     }
 }

@@ -9,12 +9,12 @@ benchmark = ["clap", "anyhow", "indicatif", "tokio"]
 
 [[bin]]
 name = "runtime"
-path = "src/benchmark/runtime.rs"
+path = "src/benches/runtime.rs"
 required-features = ["benchmark"]
 
 [[bin]]
 name = "storage"
-path = "src/benchmark/storage.rs"
+path = "src/benches/storage.rs"
 required-features = ["benchmark"]
 
 [dependencies]
