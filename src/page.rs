@@ -3,29 +3,15 @@
 mod file;
 mod index;
 
-pub use {file::FileOptions, index::IndexOptions};
-
 use crate::action::{Action, ActionCtx, Append, AsyncIo, Query};
 use crate::log::LogIter;
-use crate::page::{file::PageFile, index::PageIndex};
+use crate::page::file::{FileOptions, PageFile};
+use crate::page::index::{IndexOptions, PageIndex};
 use crate::queue::IoQueue;
 use crate::runtime::{IoAction, IoFixedFd};
 use crate::{AppendError, QueryError, WatchTx};
 use assert2::let_assert;
 use std::{io, os::fd::RawFd, path::Path};
-
-/// Options for a page.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct PageOptions {
-    /// Maximum number of log records in a page.
-    pub capacity: u64,
-
-    /// Options for file backing a page.
-    pub file_opts: FileOptions,
-
-    /// Options for index backing a page.
-    pub index_opts: IndexOptions,
-}
 
 /// A chunk of contiguous sequence of logs within storage.
 ///
@@ -59,8 +45,8 @@ impl Page {
     /// * `path` - Path to the home directory.
     /// * `opts` - Options for the page.
     pub(crate) fn open<P: AsRef<Path>>(id: u32, path: P, opts: PageOptions, tx: WatchTx) -> io::Result<Self> {
-        let mut file = PageFile::open(path, opts.file_opts)?;
-        let mut index = PageIndex::new(opts.index_opts);
+        let mut file = PageFile::open(path, opts.into())?;
+        let mut index = PageIndex::new(opts.into());
 
         // Read from disk and build state.
         let mut count = 0;
@@ -541,6 +527,47 @@ impl PageState {
             after_seq_no,
             resetting: false,
             prev_seq_no: after_seq_no,
+        }
+    }
+}
+
+/// Options for a page.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct PageOptions {
+    /// Maximum number of log records in a page.
+    pub(crate) capacity: u64,
+
+    /// Maximum number of index entries in a page.
+    pub(crate) index_capacity: usize,
+
+    /// Maximum number of bytes between indexed entries.
+    pub(crate) index_sparse_bytes: usize,
+
+    /// Maximum number of logs between indexed entries.
+    pub(crate) index_sparse_count: usize,
+
+    /// true to enable `O_DSYNC` for log appends, false otherwise.
+    pub(crate) file_o_dsync: bool,
+
+    /// Maximum size of the file backing a file.
+    pub(crate) file_capacity: u64,
+}
+
+impl From<PageOptions> for FileOptions {
+    fn from(value: PageOptions) -> Self {
+        Self {
+            capacity: value.file_capacity,
+            o_dsync: value.file_o_dsync,
+        }
+    }
+}
+
+impl From<PageOptions> for IndexOptions {
+    fn from(value: PageOptions) -> Self {
+        Self {
+            capacity: value.index_capacity,
+            sparse_count: value.index_sparse_count,
+            sparse_bytes: value.index_sparse_bytes,
         }
     }
 }

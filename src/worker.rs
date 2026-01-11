@@ -116,17 +116,17 @@ impl WorkerState {
 
     fn new(path: &Path, opts: Options, watch_tx: WatchTx) -> io::Result<(BufPool, ActionTx, Self)> {
         // Create I/O runtime for storage.
-        let mut runtime = IoRuntime::new(opts.queue_depth.into())?;
+        let mut runtime = IoRuntime::new(opts.queue_depth)?;
 
         // Open storage files, parse pages and initialize backing ring buffer.
         let mut ring = PageRing::open(path, opts, watch_tx)?;
         ring.register(&mut runtime)?;
 
         // Create buffer pool to use with storage.
-        let buf_pool = BufPool::registered(opts.pool, &mut runtime)?;
+        let buf_pool = BufPool::registered(opts.into(), &mut runtime)?;
 
         // Create internal buffers to store async I/O actions.
-        let queue_depth = usize::from(opts.queue_depth);
+        let queue_depth = usize::try_from(opts.queue_depth).unwrap_or(usize::MAX);
         let io_queue = IoQueue::with_capacity(queue_depth);
         let (tx, rx) = flume::bounded(queue_depth);
 

@@ -3,27 +3,16 @@
 use crate::log::Log;
 
 /// Options for sparse index backing a page.
-///
-/// Sparser the index more number of bytes will be discarded during queries
-/// Denser the index, more memory is required for the index. Choose a value
-/// that works for your workload, 5% - 10% discard is probably okay.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct IndexOptions {
+pub(super) struct IndexOptions {
     /// Maximum number of entries to index.
-    pub capacity: usize,
+    pub(super) capacity: usize,
 
     /// Maximum amount of logs between index entries.
-    ///
-    /// It's an error for this value to be 0.
-    pub sparse_count: usize,
+    pub(super) sparse_count: usize,
 
     /// Maximum amount of bytes between index entries.
-    ///
-    /// Note that this configuration is a soft limit, i.e, can be violated.
-    /// This happens when size of a single log record exceeds this value.
-    ///
-    /// It's an error for this value to be 0.
-    pub sparse_bytes: usize,
+    pub(super) sparse_bytes: usize,
 }
 
 /// A sparse index to log record offsets on a page file.

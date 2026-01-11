@@ -10,18 +10,12 @@ use std::path::Path;
 
 /// Options for file backing a page.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct FileOptions {
+pub(super) struct FileOptions {
     /// Maximum size of a page file.
-    pub capacity: u64,
+    pub(super) capacity: u64,
 
     /// Equivalent to enabling O_DSYNC with file handle.
-    ///
-    /// If enabled (i.e true), writes won't complete unless updates bytes
-    /// and related metadata are guaranteed to be flushed to disk from
-    /// kernel metadata tables. Enable if durablity if critical for you.
-    /// There is a huge performance penalty associated with it, so not
-    /// enabled by default.
-    pub o_dsync: bool,
+    pub(super) o_dsync: bool,
 }
 
 /// An append only file backing a page.

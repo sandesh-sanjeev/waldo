@@ -32,7 +32,7 @@ impl PageRing {
             .map(|id| {
                 let file_name = format!("{id:0>10}.page");
                 let file_path = path.join(file_name);
-                Page::open(id, file_path, opts.page, tx.clone())
+                Page::open(id, file_path, opts.into(), tx.clone())
             })
             .collect::<io::Result<_>>()?;
 

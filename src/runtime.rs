@@ -3,15 +3,13 @@
 mod alloc;
 mod file;
 
-pub use alloc::PoolOptions;
-
 #[cfg(feature = "benchmark")]
-pub use alloc::{BufPool, Bytes, IoBuf, RawBytes};
+pub use alloc::{BufPool, Bytes, IoBuf, PoolOptions, RawBytes};
 #[cfg(feature = "benchmark")]
 pub use file::{IoFile, IoFileFd, IoFixedFd};
 
 #[cfg(not(feature = "benchmark"))]
-pub(crate) use alloc::{BufPool, IoBuf, RawBytes};
+pub(crate) use alloc::{BufPool, IoBuf, PoolOptions, RawBytes};
 #[cfg(not(feature = "benchmark"))]
 pub(crate) use file::{IoFile, IoFixedFd};
 

@@ -6,7 +6,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 use tokio::{fs::create_dir_all, time::MissedTickBehavior};
-use waldo::{FileOptions, IndexOptions, Log, Metadata, Options, PageOptions, PoolOptions, Waldo};
+use waldo::{Log, Metadata, Options, Waldo};
 
 /// Arguments for the I/O runtime benchmark.
 #[derive(Parser, Clone)]
@@ -26,7 +26,7 @@ struct Arguments {
 
     /// Maximum concurrency supported by storage.
     #[arg(long, default_value = "256")]
-    queue_depth: u16,
+    queue_depth: u32,
 
     /// Number of pre-allocated I/O buffers.
     #[arg(long, default_value = "256")]
@@ -61,11 +61,11 @@ struct Arguments {
     log_size: usize,
 
     /// Numbers of readers in benchmark.
-    #[arg(long, default_value = "30")]
+    #[arg(long, default_value = "1024")]
     readers: u32,
 
     /// Delay in milliseconds between appends to storage.
-    #[arg(long, default_value = "2")]
+    #[arg(long, default_value = "200")]
     delay: u64,
 }
 
@@ -74,23 +74,15 @@ impl From<&Arguments> for Options {
         Self {
             ring_size: value.ring_size,
             queue_depth: value.queue_depth,
-            pool: PoolOptions {
-                huge_buf: true,
-                pool_size: value.pool_size,
-                buf_capacity: 2 * 1024 * 1024,
-            },
-            page: PageOptions {
-                capacity: value.page_capacity,
-                index_opts: IndexOptions {
-                    capacity: value.page_index_capacity,
-                    sparse_count: value.index_sparse_count,
-                    sparse_bytes: value.index_sparse_bytes,
-                },
-                file_opts: FileOptions {
-                    o_dsync: value.o_dsync,
-                    capacity: value.page_file_capacity_gb * 1024 * 1024 * 1024,
-                },
-            },
+            huge_buf: true,
+            pool_size: value.pool_size,
+            buf_capacity: 2 * 1024 * 1024,
+            page_capacity: value.page_capacity,
+            index_capacity: value.page_index_capacity,
+            index_sparse_bytes: value.index_sparse_bytes,
+            index_sparse_count: value.index_sparse_count,
+            file_o_dsync: value.o_dsync,
+            file_capacity: value.page_file_capacity_gb * 1024 * 1024 * 1024,
         }
     }
 }
@@ -112,7 +104,7 @@ async fn main() -> anyhow::Result<()> {
     let log_data = vec![5; args.log_size];
 
     // Maximum number of log records that can be stored in allocated buffers.
-    let batch_size = opts.pool.buf_capacity / log_size;
+    let batch_size = opts.buf_capacity / log_size;
 
     // Create directory to store benchmark files.
     create_dir_all(&args.path).await?;
@@ -140,7 +132,7 @@ async fn main() -> anyhow::Result<()> {
 
     // Print benchmark parameters.
     let readers = args.readers;
-    let pool_size = opts.pool.pool_size;
+    let pool_size = opts.pool_size;
     let queue_depth = opts.queue_depth;
     let write_size = (log_size as f64 * count as f64) / (1024.0 * 1024.0 * 1024.0);
     println!("Bench | BufPoolSize: {pool_size} | QueueDepth: {queue_depth} | Readers: {readers} | Delay: {delay:?}");

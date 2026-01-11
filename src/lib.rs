@@ -14,14 +14,8 @@
 //!
 //! ## Getting Started
 //!
-//! Open [`Waldo`] with path to home directory and open [`Options`].
-//!
-//! You can tailor Waldo to your throughput, latency, concurrency and memory usage goals:
-//!
-//! * [`PoolOptions`] - Defines amount to memory to allocate.
-//! * [`PageOptions`] - Defines disk and memory footprint of individual pages.
-//! * [`Options::queue_depth`] - Defines concurrency (readers + writers) allowed.
-//! * [`Options::ring_size`] - Defines total number of pages.
+//! Open [`Waldo`] with path to home directory on disk. [`Options`] used to open Waldo allows
+//! one  to tailor Waldo to their throughput, latency, concurrency and memory usage goals.
 //!
 //! ```rust,ignore
 //! // Open storage with specific set of options.
@@ -78,13 +72,11 @@ pub mod runtime;
 #[cfg(not(feature = "benchmark"))]
 mod runtime;
 
-pub use crate::page::{FileOptions, IndexOptions, PageOptions};
-pub use crate::runtime::PoolOptions;
 pub use log::{Error as LogError, Log, LogIter};
 
 use crate::action::{Action, FateError};
-use crate::page::{Page, PageMetadata};
-use crate::runtime::{BufPool, IoBuf};
+use crate::page::{Page, PageMetadata, PageOptions};
+use crate::runtime::{BufPool, IoBuf, PoolOptions};
 use crate::worker::Worker;
 use std::cell::Cell;
 use std::ops::{AddAssign, Deref};
@@ -177,22 +169,6 @@ impl<T> From<flume::SendError<T>> for AppendError {
     fn from(_value: flume::SendError<T>) -> Self {
         AppendError::Closed
     }
-}
-
-/// Options to customize the behavior of storage.
-#[derive(Debug, Copy, Clone, PartialEq, Eq)]
-pub struct Options {
-    /// Maximum number of pages storage.
-    pub ring_size: u32,
-
-    /// Maximum concurrency allowed in storage.
-    pub queue_depth: u16,
-
-    /// Options for the buffer pool.
-    pub pool: PoolOptions,
-
-    /// Options for the sparse index.
-    pub page: PageOptions,
 }
 
 /// Storage engine for persistent storage of sequential log records.
@@ -498,7 +474,7 @@ impl<'a> Iterator for StreamLogIter<'a> {
 ///
 /// Durability guarantees depend on the options used open storage. Specifically, if
 /// you want guarantee that bytes are durably flushed to disk when [`Sink::flush`]
-/// successfully completes, enable [`FileOptions::o_dsync`]. It's a great default to
+/// successfully completes, enable [`Options::file_o_dsync`]. It's a great default to
 /// start off with.
 ///
 /// ## Isolation
@@ -632,5 +608,77 @@ impl AddAssign<PageMetadata> for Metadata {
         self.index_size += rhs.index_size;
         self.prev_seq_no = std::cmp::max(self.prev_seq_no, rhs.prev_seq_no);
         self.after_seq_no = std::cmp::min(self.after_seq_no, rhs.after_seq_no);
+    }
+}
+
+/// Options to customize the behavior of Waldo.
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+pub struct Options {
+    /// Maximum number of pages in storage.
+    pub ring_size: u32,
+
+    /// Maximum number of concurrent I/O submissions.
+    ///
+    /// Note that there can 2X this number of pending I/O submissions.
+    pub queue_depth: u32,
+
+    /// Maximum number of allocated I/O buffers.
+    pub pool_size: u16,
+
+    /// true to allocate I/O buffers with huge page support, false otherwise.
+    pub huge_buf: bool,
+
+    /// Size of allocated I/O buffers in the buffer pool.
+    ///
+    /// Note that if `huge_buf` is true, buffer capacity should be multiples
+    /// of system default huge page size, which is usually 2MB.
+    pub buf_capacity: usize,
+
+    /// Maximum number of log records in a single page.
+    pub page_capacity: u64,
+
+    /// Maximum number of index entries in a page.
+    pub index_capacity: usize,
+
+    /// Maximum number of bytes between indexed entries.
+    ///
+    /// Note that this configuration is a soft limit, i.e, can be violated.
+    /// This happens when size of a single log record exceeds this value.
+    pub index_sparse_bytes: usize,
+
+    /// Maximum number of logs between indexed entries.
+    pub index_sparse_count: usize,
+
+    /// true to enable `O_DSYNC` for log appends, false otherwise.
+    ///
+    /// If true, append operations only complete when log bytes and associated file
+    /// metadata is sync'd to disk, essentially making sure logs are durably stored
+    /// on disk.
+    pub file_o_dsync: bool,
+
+    /// Maximum size of the file backing a file.
+    pub file_capacity: u64,
+}
+
+impl From<Options> for PoolOptions {
+    fn from(value: Options) -> Self {
+        Self {
+            pool_size: value.pool_size,
+            buf_capacity: value.buf_capacity,
+            huge_buf: value.huge_buf,
+        }
+    }
+}
+
+impl From<Options> for PageOptions {
+    fn from(value: Options) -> Self {
+        Self {
+            capacity: value.page_capacity,
+            index_capacity: value.index_capacity,
+            index_sparse_bytes: value.index_sparse_bytes,
+            index_sparse_count: value.index_sparse_count,
+            file_o_dsync: value.file_o_dsync,
+            file_capacity: value.file_capacity,
+        }
     }
 }
