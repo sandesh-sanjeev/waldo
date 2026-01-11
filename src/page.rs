@@ -126,6 +126,7 @@ impl Page {
     pub(crate) fn metadata(&self) -> Option<PageMetadata> {
         let state = self.state.as_ref()?;
         let file_state = self.file.state();
+        let pending_io = self.file.pending();
         let index_state = self.index.state();
         Some(PageMetadata {
             count: state.count,
@@ -134,6 +135,10 @@ impl Page {
             after_seq_no: state.after_seq_no,
             file_size: file_state.offset,
             index_size: (index_state.len * PageIndex::ENTRY_SIZE) as _,
+            resets: if pending_io.reset { 1 } else { 0 },
+            appends: if pending_io.append { 1 } else { 0 },
+            queries: pending_io.query.into(),
+            fsyncs: if pending_io.fsync { 1 } else { 0 },
         })
     }
 
@@ -509,6 +514,10 @@ pub(crate) struct PageMetadata {
     pub(crate) after_seq_no: u64,
     pub(crate) file_size: u64,
     pub(crate) index_size: u64,
+    pub(crate) resets: u64,
+    pub(crate) appends: u64,
+    pub(crate) queries: u64,
+    pub(crate) fsyncs: u64,
 }
 
 /// State of a storage page.

@@ -144,6 +144,10 @@ impl PageRing {
             index_count: state.index_count,
             disk_size: state.file_size,
             index_size: state.index_size,
+            pending_resets: state.resets,
+            pending_appends: state.appends,
+            pending_fsyncs: state.fsyncs,
+            pending_queries: state.queries,
         };
 
         let mut prev = self.next;

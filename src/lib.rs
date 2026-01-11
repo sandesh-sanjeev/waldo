@@ -579,6 +579,13 @@ impl Sink {
 }
 
 /// Metadata of a Waldo instance.
+///
+/// Provides a rich summary of the current state of Waldo:
+///
+/// * Range of log records.
+/// * Number of logs and index entries.
+/// * Disk and memory footprint.
+/// * Pending I/O operations.
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
 pub struct Metadata {
     /// Storage contains logs after this sequence number.
@@ -598,6 +605,18 @@ pub struct Metadata {
 
     /// Total memory allocated for index.
     pub index_size: u64,
+
+    /// Total number of page resets in progress.
+    pub pending_resets: u64,
+
+    /// Total number of page appends in progress.
+    pub pending_appends: u64,
+
+    /// Total number of page queries in progress.
+    pub pending_queries: u64,
+
+    /// Total number of page fsyncs in progress.
+    pub pending_fsyncs: u64,
 }
 
 impl AddAssign<PageMetadata> for Metadata {
@@ -606,6 +625,10 @@ impl AddAssign<PageMetadata> for Metadata {
         self.index_count += rhs.index_count;
         self.disk_size += rhs.file_size;
         self.index_size += rhs.index_size;
+        self.pending_resets += rhs.resets;
+        self.pending_appends += rhs.appends;
+        self.pending_queries += rhs.queries;
+        self.pending_fsyncs += rhs.fsyncs;
         self.prev_seq_no = std::cmp::max(self.prev_seq_no, rhs.prev_seq_no);
         self.after_seq_no = std::cmp::min(self.after_seq_no, rhs.after_seq_no);
     }

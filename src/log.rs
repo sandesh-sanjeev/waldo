@@ -22,7 +22,7 @@ impl Log<'_> {
     /// TODO: Add checks for buffer size and bytes between sparse index.
     pub const SIZE_LIMIT: usize = 1024 * 1024;
 
-    /// Padding bytes adding at the end of serialized log.
+    /// Padding bytes added at the end of serialized log.
     /// This allows log header to stay at 8 byte aligned addresses.
     const PADDING: [u8; 7] = [0, 0, 0, 0, 0, 0, 0];
 
@@ -138,7 +138,7 @@ impl Log<'_> {
 
         // Fetch payload associated with the log record.
         let data_size = header.data_size as usize;
-        let data = unsafe { rest.get_unchecked(..data_size) };
+        let data = rest.get(..data_size)?;
 
         // Return fully deserialized log record.
         Some(Log {
