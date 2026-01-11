@@ -132,8 +132,9 @@ An example result with Waldo on a Linux VM (4 cores, 8 GB RAM) running on my M1 
 records queried and upto 1 GB/s worth of log records appended. Number of readers that can be supported is inversely 
 proportional to rate with which logs are appended.
 
+Here we are going to be appending at relatively low rate of about 10 MB/s with 2500 concurrent read streams.
+
 ```bash
-# An example relatively low append rate and massive fanout.
 $ cargo run --release --bin storage --features benchmark -- \
 --ring-size 4 \
 --queue-depth 256 \
@@ -144,15 +145,36 @@ $ cargo run --release --bin storage --features benchmark -- \
 --index-sparse-count 100 \
 --index-sparse-bytes 131070 \
 --log-size 1000 \
---readers 3000 \
+--readers 2500 \
 --count 1000000 \
 --delay 200 \
 --o-dsync
 
-State   | Pending:    0 | Disk: 3,692,768/3.52 GiB | Index: 36,559/571.23 KiB
-Writer  | [00:01:36] [10,485/10.24 MiB][###################################################] 1000000/1000000
-Readers | [00:01:36] [26,212,500/25.00 GiB][#########################################] 2500000000/2500000000
-cargo run --release --bin storage --features benchmark -- --ring-size 4  256   71.80s user 196.15s system 286% cpu 1:33.53 total
+State   | Pending:    0 | Disk: 3,699,108/3.53 GiB | Index: 36,622/572.22 KiB
+Writer  | [00:01:36] [10,485/10.24 MiB] [#######################################################] [00:00:00]
+Readers | [00:01:36] [26,212,500/25.00 GiB] [###################################################] [00:00:00]
+```
+
+Here we are going to be appending as fast as possible with a single read stream.
+
+```bash
+cargo run --release --bin storage --features benchmark -- \
+--ring-size 4 \
+--queue-depth 256 \
+--pool-size 256 \
+--page-capacity 1000000 \
+--page-file-capacity-gb 1 \
+--page-index-capacity 10000 \
+--index-sparse-count 100 \
+--index-sparse-bytes 131070 \
+--log-size 1000 \
+--readers 1 \
+--count 10000000 \
+--o-dsync
+
+State   | Pending:    1 | Disk: 3,975,912/3.79 GiB | Index: 39,362/615.03 KiB
+Writer  | [00:00:13] [832,509/813.00 MiB] [#####################################################] [00:00:00]
+Readers | [00:00:13] [832,457/812.95 MiB] [#####################################################] [00:00:00]
 ```
 
 ### Run benchmarks with profiler

@@ -272,14 +272,18 @@ impl Reporter {
 
         let writer = pb.add(ProgressBar::new(count));
         writer.set_style(
-            ProgressStyle::with_template("Writer  | [{elapsed_precise}] [{msg}][{wide_bar:.cyan/blue}] {pos}/{len}")?
-                .progress_chars("#>-"),
+            ProgressStyle::with_template(
+                "Writer  | [{elapsed_precise}] [{msg}] [{wide_bar:.cyan/blue}] [{eta_precise}]",
+            )?
+            .progress_chars("#>-"),
         );
 
         let readers = pb.add(ProgressBar::new(count * readers as u64));
         readers.set_style(
-            ProgressStyle::with_template("Readers | [{elapsed_precise}] [{msg}][{wide_bar:.cyan/blue}] {pos}/{len}")?
-                .progress_chars("#>-"),
+            ProgressStyle::with_template(
+                "Readers | [{elapsed_precise}] [{msg}] [{wide_bar:.cyan/blue}] [{eta_precise}]",
+            )?
+            .progress_chars("#>-"),
         );
 
         let mut writer_prev = 0;
