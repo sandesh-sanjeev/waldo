@@ -429,9 +429,9 @@ impl Page {
                     self.index.apply(&log, offset);
                 }
 
-                // Broadcast log append to all listeners.
+                // Broadcast latest sequence number in storage.
                 if let Err(e) = self.tx.send(Some(state.prev_seq_no)) {
-                    eprintln!("Error broadcasting append: {e}");
+                    eprintln!("Error broadcasting previous sequence number: {e}");
                 }
 
                 // Return result of the action.

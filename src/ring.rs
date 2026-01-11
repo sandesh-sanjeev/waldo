@@ -95,6 +95,13 @@ impl PageRing {
             }
         }
 
+        // Finally publish the latest seq_no to any watchers.
+        if let Some(metadata) = pages[next].metadata()
+            && let Err(e) = tx.send(Some(metadata.prev_seq_no))
+        {
+            eprintln!("Error broadcasting previous sequence number: {e}");
+        }
+
         Ok(Self { next, pages })
     }
 
