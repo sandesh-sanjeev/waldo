@@ -43,6 +43,7 @@ tokio = { version = "1.48", optional = true, features = [
 
 [dev-dependencies]
 anyhow = "1.0"
+tempdir = "0.3"
 proptest = "1.9"
 
 [profile.bench]

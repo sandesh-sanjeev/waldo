@@ -242,25 +242,71 @@ impl Header {
     }
 }
 
+/// Strategy to generate arbitrary log records for prop tests.
+#[cfg(test)]
+pub(crate) mod strategy {
+    use crate::Log;
+    use proptest::collection::hash_set;
+    use proptest::collection::vec;
+    use proptest::prelude::*;
+
+    // Limit the size of an individual log record, so no unbounded test inputs.
+    pub(crate) const DATA_LIMIT: usize = 64 * 1024; // 64 KB
+
+    /// Strategy to generate an individual log record.
+    pub(crate) fn arbitrary_log() -> impl Strategy<Value = Log<'static>> {
+        (1..u64::MAX)
+            .prop_flat_map(|seq_no| (Just(seq_no), 0..seq_no, vec(any::<u8>(), 0..DATA_LIMIT)))
+            .prop_map(|(seq_no, prev_seq_no, data)| Log::new_owned(seq_no, prev_seq_no, data))
+    }
+
+    /// Strategy to generate an arbitrary list of log records.
+    ///
+    /// # Arguments
+    ///
+    /// * `limit` - Maximum number of log record to generate.
+    pub(crate) fn arbitrary_logs(limit: usize) -> impl Strategy<Value = Vec<Log<'static>>> {
+        (0..limit)
+            .prop_map(|count| {
+                (
+                    hash_set(any::<u64>(), count + 1),
+                    vec(vec(any::<u8>(), 0..DATA_LIMIT), count),
+                )
+            })
+            .prop_flat_map(|(seq_no_strategy, data_strategy)| {
+                (seq_no_strategy, data_strategy).prop_map(|(seq_nos, data)| {
+                    let mut seq_nos: Vec<_> = seq_nos.into_iter().collect();
+
+                    seq_nos.sort();
+                    let mut logs = Vec::with_capacity(data.len());
+                    for (seq_no_pair, data) in seq_nos.windows(2).zip(data.into_iter()) {
+                        let seq_no = seq_no_pair[0];
+                        let prev_seq_no = seq_no_pair[1];
+                        logs.push(Log::new_owned(seq_no, prev_seq_no, data));
+                    }
+
+                    logs
+                })
+            })
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    use super::strategy::*;
     use super::*;
     use crate::runtime::{BufPool, PoolOptions};
     use anyhow::Result;
     use assert2::let_assert;
-    use proptest::collection::vec;
     use proptest::prelude::*;
     use proptest::prop_assert_eq;
-
-    // Limit the size of an individual log record, so no unbounded test inputs.
-    const DATA_LIMIT: usize = 64 * 1024; // 64 KB
 
     // We'll have enough capacity for at least 10 full log records.
     const BUF_CAPACITY: usize = (Header::SIZE + DATA_LIMIT) * 10;
 
     proptest::proptest! {
         #[test]
-        fn header_round_trip(header in arb_header()) {
+        fn header_round_trip(header in arbitrary_header()) {
             let_assert!(Ok(pool) = buffer_pool(1));
 
             // Copy serialized bytes to a buffer.
@@ -273,12 +319,15 @@ mod tests {
         }
 
         #[test]
-        fn log_round_trip(log in arb_log()) {
+        fn log_round_trip(log in arbitrary_log()) {
             let_assert!(Ok(pool) = buffer_pool(1));
 
             // Copy serialized bytes to a buffer.
             let mut buf = pool.take();
-            log.write(&mut buf);
+            prop_assert!(log.write(&mut buf));
+
+            // Make sure size is accurate.
+            prop_assert_eq!(buf.len(), log.size());
 
             // Deserialize bytes into a reference to header.
             let deserialized = Log::read(&buf);
@@ -286,7 +335,17 @@ mod tests {
         }
 
         #[test]
-        fn log_borrowed_owned_equivalence(log in arb_log()) {
+        fn hash_mismatch_validation_error(mut log in arbitrary_log()) {
+            prop_assert!(log.validate_data().is_ok());
+
+            // Mess around with data hash.
+            // This simulates corruption, should result in error.
+            log.data_hash = log.data_hash.wrapping_sub(1);
+            let_assert!(Err(Error::Corruption(_, _, _)) = log.validate_data());
+        }
+
+        #[test]
+        fn log_borrowed_owned_equivalence(log in arbitrary_log()) {
             let_assert!(Ok(pool) = buffer_pool(2));
 
             // Create a borrowed copy of the log record.
@@ -298,20 +357,40 @@ mod tests {
             let mut buf = pool.take();
             let mut buf_borrow = pool.take();
 
-            log.write(&mut buf);
-            borrow.write(&mut buf_borrow);
+            prop_assert!(log.write(&mut buf));
+            prop_assert!(borrow.write(&mut buf_borrow));
             prop_assert_eq!(&buf[..], &buf_borrow[..]);
         }
     }
 
-    fn arb_header() -> impl Strategy<Value = Header> {
-        arb_log().prop_map(|log| Header::from(&log))
+    proptest::proptest! {
+        #![proptest_config(ProptestConfig::with_cases(32))]
+
+        #[test]
+        fn buf_iter_returns_parsed_logs(logs in arbitrary_logs(25)) {
+            let_assert!(Ok(pool) = buffer_pool(1));
+
+            // Append as many logs as possible.
+            let mut count = 0;
+            let mut buf = pool.take();
+            for log in &logs {
+                if !log.write(&mut buf) {
+                    break;
+                }
+
+                count += 1;
+            }
+
+            // Make sure those logs can be iterated.
+            let appended = logs.split_at(count).0;
+            for (expected, log) in appended.iter().zip(buf.into_iter()) {
+                prop_assert_eq!(expected, &log);
+            }
+        }
     }
 
-    fn arb_log() -> impl Strategy<Value = Log<'static>> {
-        (1..u64::MAX)
-            .prop_flat_map(|seq_no| (Just(seq_no), 0..seq_no, vec(any::<u8>(), 0..DATA_LIMIT)))
-            .prop_map(|(seq_no, prev_seq_no, data)| Log::new_owned(seq_no, prev_seq_no, data))
+    fn arbitrary_header() -> impl Strategy<Value = Header> {
+        arbitrary_log().prop_map(|log| Header::from(&log))
     }
 
     fn buffer_pool(pool_size: u16) -> Result<BufPool> {

@@ -251,7 +251,7 @@ impl Waldo {
         Sink {
             tx: self.tx.clone(),
             buf: Some(self.buf_pool.take_async().await),
-            prev: *self.rx.borrow(),
+            prev: self.prev_seq_no(),
         }
     }
 
@@ -262,7 +262,7 @@ impl Waldo {
         Some(Sink {
             tx: self.tx.clone(),
             buf: Some(self.buf_pool.try_take()?),
-            prev: *self.rx.borrow(),
+            prev: self.prev_seq_no(),
         })
     }
 
