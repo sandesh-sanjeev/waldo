@@ -20,7 +20,13 @@ jobs:
         uses: actions-rust-lang/setup-rust-toolchain@v1
         with:
           toolchain: stable
-          components: clippy, rustfmt
+          components: clippy, rustfmt, llvm-tools-preview
+            
+      - name: Install cargo-nextest
+        uses: taiki-e/install-action@nextest
+
+      - name: Install cargo-llvm-cov
+        uses: taiki-e/install-action@cargo-llvm-cov
 
       - name: Check Rust version
         run: cargo --version
@@ -37,8 +43,14 @@ jobs:
       - name: Build crate
         run: cargo build
       
-      - name: Test crate
-        run: cargo test
+      - name: Test crate with coverage
+        run: cargo llvm-cov nextest --lcov --output-path lcov.info
+
+      - name: Upload to coverage to Coveralls
+        uses: coverallsapp/github-action@v2
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          path-to-lcov: lcov.info
 
   docs:
     name: Docs

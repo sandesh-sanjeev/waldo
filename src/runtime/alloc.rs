@@ -64,7 +64,6 @@ impl BufPool {
     /// # Arguments
     ///
     /// * `opts` - Options to use when creating buffer pool.
-    #[allow(dead_code)]
     pub fn unregistered(opts: PoolOptions) -> io::Result<Self> {
         // Allocate all memory for buffer pool.
         let pool_size = usize::from(opts.pool_size);

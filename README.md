@@ -16,12 +16,16 @@ Waldo today.
 
 [![Build Status][build-img]][build-url]
 [![Documentation][doc-img]][doc-url]
+[![Coverage][coverage-img]][coverage-url]
 
 [build-img]: https://github.com/sandesh-sanjeev/waldo/actions/workflows/ci.yml/badge.svg?branch=master
 [build-url]: https://github.com/sandesh-sanjeev/waldo/actions/workflows/ci.yml
 
 [doc-img]: https://img.shields.io/badge/crate-doc-green?style=flat
 [doc-url]: https://sandesh-sanjeev.github.io/waldo/waldo/index.html
+
+[coverage-img]: https://coveralls.io/repos/github/sandesh-sanjeev/waldo/badge.svg?branch=master
+[coverage-url]: https://coveralls.io/github/sandesh-sanjeev/waldo?branch=master
 
 ## Design
 
@@ -113,6 +117,35 @@ distributions this can be done via sysctl, for example `sudo sysctl -w vm.nr_hug
 Waldo registers all file descriptors and buffers used with kernel. This provides better performance by allowing
 kernel to hold on to long term shared references. Unfortunately this counts against users memlock limits. 
 Memlock limits for the user must be increased appropriately, for example via `/etc/security/limits.conf` update.
+
+## Testing
+
+As of now, we primarily use a combination of property based tests and Miri for testing. To execute these tests simply
+run tests using your method of choice, such as `cargo test`. In the future, we plan on correctness proof using tools
+such as Kani and Verus, stay tunned.
+
+Note that we use `nextest` to execute tests.
+
+```bash
+$ cargo install cargo-nextest
+$ cargo nextest run
+```
+
+### Coverage
+
+We use `cargo-llvm-cov` with nextest runner to gather code coverage reports. Pro tip, use coverage gutters
+vscode extension to view line coverage in vscode.
+
+```bash
+$ rustup component add llvm-tools-preview
+$ cargo install cargo-llvm-cov
+
+# To generate an HTML report
+$ cargo llvm-cov nextest --open
+
+# To generate lcov
+$ cargo llvm-cov nextest --lcov --output-path lcov.info
+```
 
 ## Benchmarks
 

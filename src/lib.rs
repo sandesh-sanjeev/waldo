@@ -59,6 +59,9 @@
 //!
 //! It's that simple! Run benchmarks and find the ideal configuration for your workload.
 
+// All code should be used, at least in tests.
+#![cfg_attr(not(test), allow(dead_code))]
+
 mod action;
 mod log;
 mod page;

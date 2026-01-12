@@ -3,3 +3,9 @@
 
 # Do not check in lock files.
 Cargo.lock
+
+# Do not check in coverage artifacts.
+lcov.info
+
+# Do not check in benchmark files.
+/bench

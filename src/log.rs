@@ -58,6 +58,11 @@ impl Log<'_> {
         }
     }
 
+    /// Borrow an immutable copy of this log.
+    pub fn borrow(&self) -> Log<'_> {
+        Log::new_borrowed(self.seq_no, self.prev_seq_no, &self.data)
+    }
+
     /// Registered hash of the log record.
     pub fn data_hash(&self) -> u32 {
         self.data_hash
@@ -234,5 +239,86 @@ impl Header {
 
     fn from_bytes(bytes: &[u8]) -> &Header {
         bytemuck::from_bytes(bytes)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::runtime::{BufPool, PoolOptions};
+    use anyhow::Result;
+    use assert2::let_assert;
+    use proptest::collection::vec;
+    use proptest::prelude::*;
+    use proptest::prop_assert_eq;
+
+    // Limit the size of an individual log record, so no unbounded test inputs.
+    const DATA_LIMIT: usize = 64 * 1024; // 64 KB
+
+    // We'll have enough capacity for at least 10 full log records.
+    const BUF_CAPACITY: usize = (Header::SIZE + DATA_LIMIT) * 10;
+
+    proptest::proptest! {
+        #[test]
+        fn header_round_trip(header in arb_header()) {
+            let_assert!(Ok(pool) = buffer_pool(1));
+
+            // Copy serialized bytes to a buffer.
+            let mut buf = pool.take();
+            buf.extend_from_slice(header.bytes_of());
+
+            // Deserialize bytes into a reference to header.
+            let deserialized = Header::from_bytes(&buf);
+            prop_assert_eq!(deserialized, &header);
+        }
+
+        #[test]
+        fn log_round_trip(log in arb_log()) {
+            let_assert!(Ok(pool) = buffer_pool(1));
+
+            // Copy serialized bytes to a buffer.
+            let mut buf = pool.take();
+            log.write(&mut buf);
+
+            // Deserialize bytes into a reference to header.
+            let deserialized = Log::read(&buf);
+            prop_assert_eq!(deserialized, Some(log));
+        }
+
+        #[test]
+        fn log_borrowed_owned_equivalence(log in arb_log()) {
+            let_assert!(Ok(pool) = buffer_pool(2));
+
+            // Create a borrowed copy of the log record.
+            // It should be identical to owned copy in every way.
+            let borrow = log.borrow();
+            prop_assert_eq!(&borrow, &log);
+
+            // Make sure serialized bytes match too.
+            let mut buf = pool.take();
+            let mut buf_borrow = pool.take();
+
+            log.write(&mut buf);
+            borrow.write(&mut buf_borrow);
+            prop_assert_eq!(&buf[..], &buf_borrow[..]);
+        }
+    }
+
+    fn arb_header() -> impl Strategy<Value = Header> {
+        arb_log().prop_map(|log| Header::from(&log))
+    }
+
+    fn arb_log() -> impl Strategy<Value = Log<'static>> {
+        (1..u64::MAX)
+            .prop_flat_map(|seq_no| (Just(seq_no), 0..seq_no, vec(any::<u8>(), 0..DATA_LIMIT)))
+            .prop_map(|(seq_no, prev_seq_no, data)| Log::new_owned(seq_no, prev_seq_no, data))
+    }
+
+    fn buffer_pool(pool_size: u16) -> Result<BufPool> {
+        Ok(BufPool::unregistered(PoolOptions {
+            pool_size,
+            buf_capacity: BUF_CAPACITY,
+            huge_buf: false,
+        })?)
     }
 }
