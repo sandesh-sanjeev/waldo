@@ -9,3 +9,7 @@ lcov.info
 
 # Do not check in benchmark files.
 /bench
+
+# Do not check in profiler files
+perf.data
+test.perf

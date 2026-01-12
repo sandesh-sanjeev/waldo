@@ -8,17 +8,17 @@ use std::io;
 type BufResult<T, E> = (IoBuf, Result<T, E>);
 
 /// Type alias for sender of action result that have shared buffer(s).
-pub(crate) type BufSender<T, E> = FateSender<BufResult<T, E>>;
+pub(super) type BufSender<T, E> = FateSender<BufResult<T, E>>;
 
 /// Type alias for receiver of action result that have shared buffer(s).
-pub(crate) type BufReceiver<T, E> = FateReceiver<BufResult<T, E>>;
+pub(super) type BufReceiver<T, E> = FateReceiver<BufResult<T, E>>;
 
 /// An async I/O action initiated from a page.
 #[derive(Debug)]
-pub(crate) struct AsyncIo {
-    pub(crate) id: u32,
-    pub(crate) ctx: ActionCtx,
-    pub(crate) action: IoAction,
+pub(super) struct AsyncIo {
+    pub(super) id: u32,
+    pub(super) ctx: ActionCtx,
+    pub(super) action: IoAction,
 }
 
 impl AsyncIo {
@@ -29,14 +29,14 @@ impl AsyncIo {
     /// * `id` - Identity of the page creating the action.
     /// * `ctx` - Context associated with the action.
     /// * `action` - I/O action to asynchronously perform.
-    pub(crate) fn new(id: u32, ctx: ActionCtx, action: IoAction) -> Self {
+    pub(super) fn new(id: u32, ctx: ActionCtx, action: IoAction) -> Self {
         Self { id, ctx, action }
     }
 }
 
 /// Different types of user initiated actions against storage.
 #[derive(Debug)]
-pub(crate) enum Action {
+pub(super) enum Action {
     /// Action to query from storage.
     Query(Query),
 
@@ -54,7 +54,7 @@ impl Action {
     ///
     /// * `after_seq_no` - Sequence number to query logs after.
     /// * `buf` - Buffer to append log bytes read from storage.
-    pub(crate) fn query(after_seq_no: u64, buf: IoBuf) -> (Self, BufReceiver<(), QueryError>) {
+    pub(super) fn query(after_seq_no: u64, buf: IoBuf) -> (Self, BufReceiver<(), QueryError>) {
         let (tx, rx) = AsyncFate::channel();
         (Action::Query(Query::new(buf, after_seq_no, tx)), rx)
     }
@@ -64,13 +64,13 @@ impl Action {
     /// # Arguments
     ///
     /// * `buf` - Buffer of logs to append to storage.
-    pub(crate) fn append(buf: IoBuf) -> (Self, BufReceiver<(), AppendError>) {
+    pub(super) fn append(buf: IoBuf) -> (Self, BufReceiver<(), AppendError>) {
         let (tx, rx) = AsyncFate::channel();
         (Action::Append(Append::new(buf, tx)), rx)
     }
 
     /// Create an action to get latest state.
-    pub(crate) fn metadata() -> (Self, FateReceiver<Option<Metadata>>) {
+    pub(super) fn metadata() -> (Self, FateReceiver<Option<Metadata>>) {
         let (tx, rx) = AsyncFate::channel();
         (Action::Metadata(GetMetadata::new(tx)), rx)
     }
@@ -78,9 +78,9 @@ impl Action {
 
 /// A request to get latest metadata from storage.
 #[derive(Debug)]
-pub(crate) struct GetMetadata {
+pub(super) struct GetMetadata {
     /// Sender to send action result asynchronously.
-    pub(crate) tx: FateSender<Option<Metadata>>,
+    pub(super) tx: FateSender<Option<Metadata>>,
 }
 
 impl GetMetadata {
@@ -89,22 +89,22 @@ impl GetMetadata {
     /// # Arguments
     ///
     /// * `tx` - Sender to send fate of an action.
-    pub(crate) fn new(tx: FateSender<Option<Metadata>>) -> Self {
+    pub(super) fn new(tx: FateSender<Option<Metadata>>) -> Self {
         Self { tx }
     }
 }
 
 /// A request to query for some bytes from page.
 #[derive(Debug)]
-pub(crate) struct Query {
+pub(super) struct Query {
     /// Buffer shared with storage.
-    pub(crate) buf: IoBuf,
+    pub(super) buf: IoBuf,
 
     /// Query for logs after this sequence number.
-    pub(crate) after_seq_no: u64,
+    pub(super) after_seq_no: u64,
 
     /// Sender to send action result asynchronously.
-    pub(crate) tx: BufSender<(), QueryError>,
+    pub(super) tx: BufSender<(), QueryError>,
 }
 
 impl Query {
@@ -115,19 +115,19 @@ impl Query {
     /// * `buf` - Buffer to populate with log record.
     /// * `after_seq_no` - Logs will be queried after this sequence number.
     /// * `tx` - Sender to send fate of an action.
-    pub(crate) fn new(buf: IoBuf, after_seq_no: u64, tx: BufSender<(), QueryError>) -> Self {
+    pub(super) fn new(buf: IoBuf, after_seq_no: u64, tx: BufSender<(), QueryError>) -> Self {
         Self { buf, after_seq_no, tx }
     }
 }
 
 /// A request to append some bytes into page.
 #[derive(Debug)]
-pub(crate) struct Append {
+pub(super) struct Append {
     /// Buffer shared with storage.
-    pub(crate) buf: IoBuf,
+    pub(super) buf: IoBuf,
 
     /// Sender to send action result asynchronously.
-    pub(crate) tx: BufSender<(), AppendError>,
+    pub(super) tx: BufSender<(), AppendError>,
 }
 
 impl Append {
@@ -137,14 +137,14 @@ impl Append {
     ///
     /// * `buf` - A buffer of logs to append into storage.
     /// * `tx` - Sender to send fate of an action.
-    pub(crate) fn new(buf: IoBuf, tx: BufSender<(), AppendError>) -> Self {
+    pub(super) fn new(buf: IoBuf, tx: BufSender<(), AppendError>) -> Self {
         Self { buf, tx }
     }
 }
 
 /// Context associated with a pending storage action.
 #[derive(Debug)]
-pub(crate) enum ActionCtx {
+pub(super) enum ActionCtx {
     /// Context associated with a query action.
     Query(BufSender<(), QueryError>),
 
@@ -164,7 +164,7 @@ impl ActionCtx {
     /// # Arguments
     ///
     /// * `tx` - Sender for result of the action.
-    pub(crate) fn query(tx: BufSender<(), QueryError>) -> ActionCtx {
+    pub(super) fn query(tx: BufSender<(), QueryError>) -> ActionCtx {
         ActionCtx::Query(tx)
     }
 
@@ -173,7 +173,7 @@ impl ActionCtx {
     /// # Arguments
     ///
     /// * `tx` - Sender for result of the action.
-    pub(crate) fn append(tx: BufSender<(), AppendError>) -> ActionCtx {
+    pub(super) fn append(tx: BufSender<(), AppendError>) -> ActionCtx {
         ActionCtx::Append(tx)
     }
 }
@@ -181,7 +181,7 @@ impl ActionCtx {
 /// Error when fate of a storage action is lost.
 #[derive(Debug, thiserror::Error)]
 #[error("Fate of async operation was lost")]
-pub(crate) struct FateError;
+pub(super) struct FateError;
 
 impl From<FateError> for io::Error {
     fn from(_value: FateError) -> Self {
@@ -191,11 +191,11 @@ impl From<FateError> for io::Error {
 
 /// A oneshot channel to notify fate of a storage action.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct AsyncFate;
+pub(super) struct AsyncFate;
 
 impl AsyncFate {
     /// A new channel to send results of a storage action.
-    pub(crate) fn channel<T>() -> (FateSender<T>, FateReceiver<T>) {
+    pub(super) fn channel<T>() -> (FateSender<T>, FateReceiver<T>) {
         let (tx, rx) = oneshot::channel();
         (FateSender(tx), FateReceiver(rx))
     }
@@ -203,7 +203,7 @@ impl AsyncFate {
 
 /// Sender to send fate of a storage action.
 #[derive(Debug)]
-pub(crate) struct FateSender<T>(oneshot::Sender<T>);
+pub(super) struct FateSender<T>(oneshot::Sender<T>);
 
 impl<T> FateSender<T> {
     /// Send fate of an async operation.
@@ -211,7 +211,7 @@ impl<T> FateSender<T> {
     /// # Arguments
     ///
     /// * `value` - Result of the storage action.
-    pub(crate) fn send(self, value: T) -> bool {
+    pub(super) fn send(self, value: T) -> bool {
         self.0.send(value).is_ok()
     }
 }
@@ -223,7 +223,7 @@ impl<T, E> FateSender<BufResult<T, E>> {
     ///
     /// * `buf` - Buffer shared storage.
     /// * `value` - Result of the storage action.
-    pub(crate) fn send_buf(self, buf: IoBuf, value: Result<T, E>) {
+    pub(super) fn send_buf(self, buf: IoBuf, value: Result<T, E>) {
         if let Err(message) = self.0.send((buf, value)) {
             let (buf, _) = message.into_inner();
             drop(buf); // Explicitly return to pool, just cause.
@@ -238,7 +238,7 @@ impl<T, E> FateSender<BufResult<T, E>> {
     ///
     /// * `buf` - Buffer shared storage.
     /// * `value` - Result of the storage action.
-    pub(crate) fn send_clear_buf(self, mut buf: IoBuf, value: Result<T, E>) {
+    pub(super) fn send_clear_buf(self, mut buf: IoBuf, value: Result<T, E>) {
         buf.clear();
         self.send_buf(buf, value);
     }
@@ -246,11 +246,11 @@ impl<T, E> FateSender<BufResult<T, E>> {
 
 /// Receiver for fate of a storage action.
 #[derive(Debug)]
-pub(crate) struct FateReceiver<T>(oneshot::Receiver<T>);
+pub(super) struct FateReceiver<T>(oneshot::Receiver<T>);
 
 impl<T> FateReceiver<T> {
     /// Receive fate of an async operation asynchronously.
-    pub(crate) async fn recv_async(self) -> Result<T, FateError> {
+    pub(super) async fn recv_async(self) -> Result<T, FateError> {
         self.0.await.map_err(|_| FateError)
     }
 }

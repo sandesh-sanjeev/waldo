@@ -9,7 +9,7 @@ use std::time::Duration;
 use tokio::task::JoinSet;
 use tokio::time::Interval;
 use tokio::{fs::create_dir_all, time::MissedTickBehavior};
-use waldo::{Log, Metadata, Options, Sink, Stream, Waldo};
+use waldo::{Cursor, Log, Metadata, Options, Sink, Stream, Waldo};
 
 /// Arguments for the I/O runtime benchmark.
 #[derive(Parser, Clone)]
@@ -133,7 +133,7 @@ async fn main() -> anyhow::Result<()> {
     // Spawn readers.
     for _ in 0..args.readers {
         let prev = storage.prev_seq_no().unwrap_or(0);
-        let stream = storage.stream_after(prev);
+        let stream = storage.stream(Cursor::After(prev));
         let readers = Reader::new(stream, b_opts, counter.clone());
         workers.spawn(readers.run());
     }

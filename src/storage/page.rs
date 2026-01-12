@@ -3,13 +3,13 @@
 mod file;
 mod index;
 
-use crate::action::{Action, ActionCtx, Append, AsyncIo, Query};
+use super::action::{Action, ActionCtx, Append, AsyncIo, Query};
+use super::page::file::{FileOptions, PageFile};
+use super::page::index::{IndexOptions, PageIndex};
+use super::queue::IoQueue;
+use super::{AppendError, QueryError, WatchTx};
 use crate::log::LogIter;
-use crate::page::file::{FileOptions, PageFile};
-use crate::page::index::{IndexOptions, PageIndex};
-use crate::queue::IoQueue;
 use crate::runtime::{IoAction, IoFixedFd};
-use crate::{AppendError, QueryError, WatchTx};
 use assert2::let_assert;
 use std::{io, os::fd::RawFd, path::Path};
 
@@ -24,7 +24,7 @@ use std::{io, os::fd::RawFd, path::Path};
 /// A page has a pre-determined maximum size. When the page runs out of capacity,
 /// it must be reset or rotated away to make space for new log records.
 #[derive(Debug)]
-pub(crate) struct Page {
+pub(super) struct Page {
     id: u32,
     capacity: u64,
     file: PageFile,
@@ -44,7 +44,7 @@ impl Page {
     /// * `id` - Unique identity of the page.
     /// * `path` - Path to the home directory.
     /// * `opts` - Options for the page.
-    pub(crate) fn open<P: AsRef<Path>>(id: u32, path: P, opts: PageOptions, tx: WatchTx) -> io::Result<Self> {
+    pub(super) fn open<P: AsRef<Path>>(id: u32, path: P, opts: PageOptions, tx: WatchTx) -> io::Result<Self> {
         let mut file = PageFile::open(path, opts.into())?;
         let mut index = PageIndex::new(opts.into());
 
@@ -109,7 +109,7 @@ impl Page {
     }
 
     /// Raw file descriptor to the underlying file.
-    pub(crate) fn raw_fd(&self) -> RawFd {
+    pub(super) fn raw_fd(&self) -> RawFd {
         self.file.raw_fd()
     }
 
@@ -118,12 +118,12 @@ impl Page {
     /// # Arguments
     ///
     /// * `file` - File registered in io-uring runtime.
-    pub(crate) fn set_io_file(&mut self, file: IoFixedFd) {
+    pub(super) fn set_io_file(&mut self, file: IoFixedFd) {
         self.file.set_io_file(file);
     }
 
     /// Returns metadata of the page, if page is initialized.
-    pub(crate) fn metadata(&self) -> Option<PageMetadata> {
+    pub(super) fn metadata(&self) -> Option<PageMetadata> {
         let state = self.state.as_ref()?;
         let file_state = self.file.state();
         let pending_io = self.file.pending();
@@ -143,7 +143,7 @@ impl Page {
     }
 
     /// Returns true if the page is already initialized, false otherwise.
-    pub(crate) fn is_initialized(&self) -> bool {
+    pub(super) fn is_initialized(&self) -> bool {
         self.state.is_some()
     }
 
@@ -152,7 +152,7 @@ impl Page {
     /// # Arguments
     ///
     /// * `after_seq_no` - Sequence number of the immediately previous log.
-    pub(crate) fn initialize(&mut self, after_seq_no: u64) {
+    pub(super) fn initialize(&mut self, after_seq_no: u64) {
         // Make sure page is not already initialized.
         let_assert!(None = &self.state);
 
@@ -174,7 +174,7 @@ impl Page {
     ///
     /// * `append` - Append action against the page.
     /// * `queue` - I/O queue to append I/O actions.
-    pub(crate) fn append(&mut self, append: Append, queue: &mut IoQueue) -> bool {
+    pub(super) fn append(&mut self, append: Append, queue: &mut IoQueue) -> bool {
         let Append { buf, tx } = append;
 
         // Something is wrong if an action is routed to an uninitialized page.
@@ -269,7 +269,7 @@ impl Page {
     ///
     /// * `query` - Query action against the page.
     /// * `queue` - I/O queue to append I/O actions.
-    pub(crate) fn query(&mut self, query: Query, queue: &mut IoQueue) {
+    pub(super) fn query(&mut self, query: Query, queue: &mut IoQueue) {
         let Query {
             after_seq_no,
             mut buf,
@@ -341,7 +341,7 @@ impl Page {
     /// # Arguments
     ///
     /// * `queue` - Queue to append I/O actions.
-    pub(crate) fn reset(&mut self, queue: &mut IoQueue) {
+    pub(super) fn reset(&mut self, queue: &mut IoQueue) {
         // No need to reset a page that is already empty.
         let Some(mut state) = self.state.as_ref().copied() else {
             return;
@@ -382,7 +382,7 @@ impl Page {
     /// * `action` - I/O action completed.
     /// * `ctx` - Context associated with the action.
     /// * `queue` - Queue to append I/O actions.
-    pub(crate) fn apply(&mut self, result: u32, mut action: IoAction, ctx: ActionCtx, queue: &mut IoQueue) {
+    pub(super) fn apply(&mut self, result: u32, mut action: IoAction, ctx: ActionCtx, queue: &mut IoQueue) {
         // Read latest state of the page.
         let_assert!(Some(state) = self.state.as_mut());
 
@@ -453,7 +453,7 @@ impl Page {
     /// * `action` - I/O action that errored out.
     /// * `ctx` - Context associated with the action.
     /// * `queue` - Queue to append I/O actions.
-    pub(crate) fn abort(&mut self, error: io::Error, mut action: IoAction, ctx: ActionCtx, _queue: &mut IoQueue) {
+    pub(super) fn abort(&mut self, error: io::Error, mut action: IoAction, ctx: ActionCtx, _queue: &mut IoQueue) {
         // Read latest state of the page.
         let_assert!(Some(state) = self.state.as_mut());
 
@@ -486,7 +486,7 @@ impl Page {
     /// Reset page.
     ///
     /// Note that this method executes blocking I/O synchronously.
-    pub(crate) fn clear(&mut self) -> io::Result<()> {
+    pub(super) fn clear(&mut self) -> io::Result<()> {
         // If the page is not currently cleared, nothing else to do.
         if self.state.is_some() {
             return Ok(());
@@ -500,24 +500,24 @@ impl Page {
     }
 
     /// Initiate graceful shutdown of this page.
-    pub(crate) fn close(self) -> io::Result<()> {
+    pub(super) fn close(self) -> io::Result<()> {
         self.file.close()
     }
 }
 
 /// Metadata associated with a page.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct PageMetadata {
-    pub(crate) count: u64,
-    pub(crate) index_count: u64,
-    pub(crate) prev_seq_no: u64,
-    pub(crate) after_seq_no: u64,
-    pub(crate) file_size: u64,
-    pub(crate) index_size: u64,
-    pub(crate) resets: u64,
-    pub(crate) appends: u64,
-    pub(crate) queries: u64,
-    pub(crate) fsyncs: u64,
+pub(super) struct PageMetadata {
+    pub(super) count: u64,
+    pub(super) index_count: u64,
+    pub(super) prev_seq_no: u64,
+    pub(super) after_seq_no: u64,
+    pub(super) file_size: u64,
+    pub(super) index_size: u64,
+    pub(super) resets: u64,
+    pub(super) appends: u64,
+    pub(super) queries: u64,
+    pub(super) fsyncs: u64,
 }
 
 /// State of a storage page.
@@ -542,24 +542,24 @@ impl PageState {
 
 /// Options for a page.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct PageOptions {
+pub(super) struct PageOptions {
     /// Maximum number of log records in a page.
-    pub(crate) capacity: u64,
+    pub(super) capacity: u64,
 
     /// Maximum number of index entries in a page.
-    pub(crate) index_capacity: usize,
+    pub(super) index_capacity: usize,
 
     /// Maximum number of bytes between indexed entries.
-    pub(crate) index_sparse_bytes: usize,
+    pub(super) index_sparse_bytes: usize,
 
     /// Maximum number of logs between indexed entries.
-    pub(crate) index_sparse_count: usize,
+    pub(super) index_sparse_count: usize,
 
     /// true to enable `O_DSYNC` for log appends, false otherwise.
-    pub(crate) file_o_dsync: bool,
+    pub(super) file_o_dsync: bool,
 
     /// Maximum size of the file backing a file.
-    pub(crate) file_capacity: u64,
+    pub(super) file_capacity: u64,
 }
 
 impl From<PageOptions> for FileOptions {

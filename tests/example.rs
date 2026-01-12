@@ -1,16 +1,17 @@
-//! Integration tests for Waldo, also serves as an example for usage.
+//! Integration tests for Waldo that serves as an example for usage.
+
 use anyhow::Result;
 use tokio::task::LocalSet;
-use waldo::{Log, Options, Waldo};
+use waldo::{Cursor, Log, Options, Waldo};
 
 #[tokio::test]
-async fn example() -> Result<()> {
+async fn getting_started() -> Result<()> {
     // Open waldo in a given path.
     let opts = waldo_options();
     let temp_dir = tempdir::TempDir::new("waldo")?;
 
     // Number of logs to append and query from storage.
-    let count = 100_000;
+    let count = 500_000;
 
     // Just to open and close a bunch of times.
     let mut prev = 0;
@@ -65,14 +66,14 @@ async fn appender(storage: Waldo, count: usize) -> Result<()> {
 async fn reader(storage: Waldo, after: u64, count: usize) -> Result<()> {
     let mut prev = after;
     let mut counter = 0;
-    let mut stream = storage.stream_after(after);
+    let mut stream = storage.stream(Cursor::After(prev));
 
     // Wait for a range of records to be available.
     // Make sure logs contain expected contents.
     while counter < count {
         let logs = stream.next().await?;
         for log in logs.into_iter() {
-            log.validate_data()?;
+            log.validate_data()?; // Optional
             assert_eq!(log, Log::new_borrowed(prev + 1, prev, b"data5121"));
 
             counter += 1;

@@ -1,9 +1,9 @@
 //! A ring buffer of storage pages.
 
-use crate::action::{Append, AsyncIo, GetMetadata, Query};
-use crate::queue::IoQueue;
+use super::action::{Append, AsyncIo, GetMetadata, Query};
+use super::queue::IoQueue;
+use super::{Metadata, Options, Page, QueryError, WatchTx};
 use crate::runtime::IoRuntime;
-use crate::{Metadata, Options, Page, QueryError, WatchTx};
 use assert2::let_assert;
 use rayon::iter::{IntoParallelIterator, ParallelIterator};
 use std::{io, path::Path};
@@ -12,9 +12,9 @@ use std::{io, path::Path};
 ///
 /// It is responsible for routing storage actions to the right
 /// page that can execute and complete the action.
-pub(crate) struct PageRing {
-    pub(crate) next: usize,
-    pub(crate) pages: Vec<Page>,
+pub(super) struct PageRing {
+    pub(super) next: usize,
+    pub(super) pages: Vec<Page>,
 }
 
 impl PageRing {
@@ -25,7 +25,7 @@ impl PageRing {
     /// * `path` - Path to the home directory of storage instance.
     /// * `opts` - Options to open storage.
     /// * `tx` - Sender of progress updates.
-    pub(crate) fn open(path: &Path, opts: Options, tx: WatchTx) -> io::Result<Self> {
+    pub(super) fn open(path: &Path, opts: Options, tx: WatchTx) -> io::Result<Self> {
         // Initialize all the pages in parallel.
         let mut pages: Vec<_> = (0..opts.ring_size)
             .into_par_iter()
@@ -110,7 +110,7 @@ impl PageRing {
     /// # Arguments
     ///
     /// * `runtime` - Runtime to register ring buffer files.
-    pub(crate) fn register<A>(&mut self, runtime: &mut IoRuntime<A>) -> io::Result<()> {
+    pub(super) fn register<A>(&mut self, runtime: &mut IoRuntime<A>) -> io::Result<()> {
         let files: Vec<_> = self.pages.iter().map(Page::raw_fd).collect();
         let files = runtime.register_files(&files)?;
         for (file, page) in files.into_iter().zip(self.pages.iter_mut()) {
@@ -125,7 +125,7 @@ impl PageRing {
     /// # Arguments
     ///
     /// * `get_metadata` - Request to get storage metadata.
-    pub(crate) fn metadata(&mut self, get_metadata: GetMetadata) {
+    pub(super) fn metadata(&mut self, get_metadata: GetMetadata) {
         let GetMetadata { tx } = get_metadata;
 
         // Return early if storage has not been initialized.
@@ -180,7 +180,7 @@ impl PageRing {
     ///
     /// * `append` - Request to append logs.
     /// * `queue` - Queue to issue I/O actions.
-    pub(crate) fn append(&mut self, append: Append, queue: &mut IoQueue) {
+    pub(super) fn append(&mut self, append: Append, queue: &mut IoQueue) {
         // Latest page is the page where all the writes happen.
         let page = &mut self.pages[self.next];
 
@@ -227,7 +227,7 @@ impl PageRing {
     ///
     /// * `append` - Request to query logs.
     /// * `queue` - Queue to issue I/O actions.
-    pub(crate) fn query(&mut self, query: Query, queue: &mut IoQueue) {
+    pub(super) fn query(&mut self, query: Query, queue: &mut IoQueue) {
         let Query { buf, after_seq_no, tx } = query;
 
         // Check if storage has not been fully initialized.
@@ -278,7 +278,7 @@ impl PageRing {
     /// * `result` - Result from kernel.
     /// * `action` - Completed async I/O action.
     /// * `queue` - Queue to issue I/O actions.
-    pub(crate) fn apply(&mut self, result: u32, action: AsyncIo, queue: &mut IoQueue) {
+    pub(super) fn apply(&mut self, result: u32, action: AsyncIo, queue: &mut IoQueue) {
         // Find the page that must complete the I/O request.
         let page = self
             .pages
@@ -296,7 +296,7 @@ impl PageRing {
     /// * `error` - Error result from kernel.
     /// * `action` - Completed async I/O action.
     /// * `queue` - Queue to issue I/O actions.
-    pub(crate) fn abort(&mut self, error: io::Error, action: AsyncIo, queue: &mut IoQueue) {
+    pub(super) fn abort(&mut self, error: io::Error, action: AsyncIo, queue: &mut IoQueue) {
         // Find the page that must complete the I/O request.
         let page = self
             .pages
@@ -308,7 +308,7 @@ impl PageRing {
     }
 
     /// Gracefully close all the the ring buffer pages.
-    pub(crate) fn close(self) -> io::Result<()> {
+    pub(super) fn close(self) -> io::Result<()> {
         self.pages
             .into_par_iter()
             .map(Page::close)
