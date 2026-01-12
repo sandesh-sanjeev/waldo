@@ -238,16 +238,16 @@ impl Page {
             return true;
         }
 
-        // Return early if there is no complete log in the buffer.
-        if prev_seq_no == state.prev_seq_no {
-            tx.send_buf(buf, Ok(()));
-            return true;
-        }
-
         // Re-queue the action and indicate that page does not have enough capacity.
         if is_overflow {
             queue.reprocess(Action::Append(Append::new(buf, tx)));
             return false;
+        }
+
+        // Return early if there is no complete log in the buffer.
+        if prev_seq_no == state.prev_seq_no {
+            tx.send_buf(buf, Ok(()));
+            return true;
         }
 
         // Enqueue I/O action for execution asynchronously.

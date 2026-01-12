@@ -83,7 +83,7 @@ use crate::runtime::{BufPool, IoBuf, PoolOptions};
 use crate::worker::Worker;
 use std::cell::Cell;
 use std::ops::{AddAssign, Deref};
-use std::{io, path::Path, sync::Arc};
+use std::{path::Path, sync::Arc};
 use tokio::sync::watch;
 
 type ActionTx = flume::Sender<Action>;
@@ -91,6 +91,18 @@ type ActionRx = flume::Receiver<Action>;
 
 type WatchTx = watch::Sender<Option<u64>>;
 type WatchRx = watch::Receiver<Option<u64>>;
+
+/// Different types of errors when opening or closing Waldo.
+#[derive(Debug, thiserror::Error)]
+pub enum Error {
+    /// Error when I/O syscalls results in error.
+    #[error(transparent)]
+    Io(#[from] std::io::Error),
+
+    /// Error when an unsupported option is provided.
+    #[error("Option not supported: {0}")]
+    Option(String),
+}
 
 /// Different types of errors when querying for logs from storage.
 #[derive(Debug, thiserror::Error)]
@@ -213,7 +225,41 @@ impl Waldo {
     ///
     /// * `path` - Path to the directory on disk.
     /// * `opts` - Options used to create storage.
-    pub async fn open<P: AsRef<Path>>(path: P, opts: Options) -> io::Result<Self> {
+    pub async fn open<P: AsRef<Path>>(path: P, opts: Options) -> Result<Self, Error> {
+        // Otherwise we can get into a situation where a batch cannot be appended unless
+        // split into two or more parts. This makes sure a single batch can also be appended
+        // into an empty file.
+        if opts.file_capacity < opts.buf_capacity as u64 {
+            return Err(Error::Option(format!(
+                "Buffer capacity {} > File capacity {}",
+                opts.buf_capacity, opts.file_capacity
+            )));
+        }
+
+        // Otherwise we can get into a situation where a valid log can never be written into buffer.
+        if opts.buf_capacity < Log::SIZE_LIMIT {
+            return Err(Error::Option(format!(
+                "Buffer capacity {} < Log size limit {}",
+                opts.buf_capacity,
+                Log::SIZE_LIMIT
+            )));
+        }
+
+        // To make sure a query does not need more than one lookup to fetch at least one log record.
+        if opts.index_sparse_bytes > (Log::SIZE_LIMIT / 2) {
+            return Err(Error::Option(format!(
+                "Index is too sparse {} < (Log size limit / 2) {}",
+                opts.index_sparse_bytes,
+                Log::SIZE_LIMIT / 2
+            )));
+        }
+
+        // Index is required because we never read more than once per batch.
+        if opts.index_capacity == 0 || opts.index_sparse_bytes == 0 || opts.index_sparse_count == 0 {
+            return Err(Error::Option(String::from("Page index cannot be empty")));
+        }
+
+        // Spawn the background worker and initialize storage.
         let (buf_pool, tx, watch_rx, worker) = Worker::spawn(path.as_ref(), opts).await?;
         Ok(Self {
             tx,

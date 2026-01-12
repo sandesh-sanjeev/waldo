@@ -19,8 +19,12 @@ where
 
 impl Log<'_> {
     /// Maximum size of a log record of 1 MB.
-    /// TODO: Add checks for buffer size and bytes between sparse index.
+    #[cfg(not(test))]
     pub const SIZE_LIMIT: usize = 1024 * 1024;
+
+    /// Maximum size of a log record for tests.
+    #[cfg(test)]
+    pub const SIZE_LIMIT: usize = 16 * 1024;
 
     /// Padding bytes added at the end of serialized log.
     /// This allows log header to stay at 8 byte aligned addresses.
