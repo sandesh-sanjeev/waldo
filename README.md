@@ -67,10 +67,6 @@ actions, page rotations, etc. User defined options dictate the amount of memory 
 currently is heap allocations during construction of oneshot channels. They are relatively infrequent and barely show up 
 on profiler, I haven't been motivated enough to optimize it away.
 
-Finally Waldo provides a streaming style API. The two halves of the stream are `sink` and `stream`. A Sink is a
-buffered log writer to append new logs to storage. A Stream is well, a stream that starts delivering log records
-using a provided starting seed sequence number.
-
 ## Caching
 
 Waldo does no caching, it is entirely the responsibility of the OS and file system caches. Waldo makes no assumptions

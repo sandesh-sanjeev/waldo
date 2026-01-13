@@ -44,34 +44,44 @@ async fn getting_started() -> Result<()> {
 }
 
 /// An appender to push new log records.
-async fn appender(storage: Waldo, count: usize) -> Result<()> {
-    let mut sink = storage.sink();
-    let mut prev = sink.prev_seq_no().unwrap_or(0);
+async fn appender(mut storage: Waldo, count: usize) -> Result<()> {
+    let mut logs = Vec::with_capacity(1000);
+    let mut prev = storage.prev_seq_no().unwrap_or(0);
 
     // Write a bunch of records into storage.
-    for _ in 0..count {
-        let log = Log::new_borrowed(prev + 1, prev, b"data5121");
+    let mut remaining = count;
+    while remaining > 0 {
+        // Next batch of records to append.
+        // There must be no gaps in between.
+        logs.clear();
+        let batch_size = std::cmp::min(remaining, logs.capacity());
+        for _ in 0..batch_size {
+            logs.push(Log::new_borrowed(prev + 1, prev, b"data5121"));
+            prev += 1;
+        }
 
-        // Push log records into storage.
-        sink.push(log.borrow()).await?;
-        prev = log.seq_no();
+        // Append next set of records.
+        storage.append(&logs).await?;
+        remaining -= batch_size;
     }
 
-    // Flush any accumulated logs to storage once done with writes.
-    sink.flush().await?;
-    Ok(())
+    // Close storage and return.
+    Ok(storage.close().await)
 }
 
 /// A reader that streams some number of log records.
-async fn reader(storage: Waldo, after: u64, count: usize) -> Result<()> {
+async fn reader(mut storage: Waldo, after: u64, count: usize) -> Result<()> {
     let mut prev = after;
     let mut counter = 0;
-    let mut stream = storage.stream(Cursor::After(prev));
 
     // Wait for a range of records to be available.
     // Make sure logs contain expected contents.
     while counter < count {
-        let logs = stream.next().await?;
+        // (Optional) Wait for storage if have new records.
+        storage.watch_for(prev).await?;
+
+        // Process the next batch of records.
+        let logs = storage.query(Cursor::After(prev)).await?;
         for log in logs.into_iter() {
             log.validate_data()?; // Optional
             assert_eq!(log, Log::new_borrowed(prev + 1, prev, b"data5121"));
@@ -81,7 +91,8 @@ async fn reader(storage: Waldo, after: u64, count: usize) -> Result<()> {
         }
     }
 
-    Ok(())
+    // Close storage and return.
+    Ok(storage.close().await)
 }
 
 fn waldo_options() -> Options {

@@ -9,7 +9,7 @@ use std::time::Duration;
 use tokio::task::JoinSet;
 use tokio::time::Interval;
 use tokio::{fs::create_dir_all, time::MissedTickBehavior};
-use waldo::{Cursor, Log, Metadata, Options, Sink, Stream, Waldo};
+use waldo::{Cursor, Log, Metadata, Options, Waldo};
 
 /// Arguments for the I/O runtime benchmark.
 #[derive(Parser, Clone)]
@@ -126,15 +126,12 @@ async fn main() -> anyhow::Result<()> {
     let mut workers = JoinSet::new();
 
     // Spawn writer.
-    let sink = storage.sink();
-    let writer = Writer::new(sink, b_opts, counter.clone());
+    let writer = Writer::new(storage.clone(), b_opts, counter.clone());
     workers.spawn(writer.run());
 
     // Spawn readers.
     for _ in 0..args.readers {
-        let prev = storage.prev_seq_no().unwrap_or(0);
-        let stream = storage.stream(Cursor::After(prev));
-        let readers = Reader::new(stream, b_opts, counter.clone());
+        let readers = Reader::new(storage.clone(), b_opts, counter.clone());
         workers.spawn(readers.run());
     }
 
@@ -167,7 +164,7 @@ struct BenchOptions {
 
 /// A writer that appends new log record into storage.
 struct Writer {
-    sink: Sink,
+    waldo: Waldo,
     data: Vec<u8>,
     opts: BenchOptions,
     counter: Arc<Counters>,
@@ -175,7 +172,7 @@ struct Writer {
 }
 
 impl Writer {
-    fn new(sink: Sink, opts: BenchOptions, counter: Arc<Counters>) -> Self {
+    fn new(waldo: Waldo, opts: BenchOptions, counter: Arc<Counters>) -> Self {
         let data = vec![69; opts.log_size];
         let delay = opts.delay.map(|duration| {
             let mut interval = tokio::time::interval(duration);
@@ -185,7 +182,7 @@ impl Writer {
 
         Self {
             opts,
-            sink,
+            waldo,
             delay,
             data,
             counter,
@@ -197,28 +194,33 @@ impl Writer {
 
         // Run the writer until complete.
         let mut appended = 0;
-        let mut prev_seq_no = self.sink.prev_seq_no().unwrap_or(0);
+        let mut logs = Vec::with_capacity(self.opts.batch_size);
+        let mut prev_seq_no = self.waldo.prev_seq_no().unwrap_or(0);
         while appended < self.opts.count {
             // Self throttle if required.
             if let Some(interval) = &mut self.delay {
                 interval.tick().await;
             };
 
-            // Append the next batch of log records.
+            // Prepare next batch of records to append.
+            logs.clear();
             for _ in 0..self.opts.batch_size {
                 let seq_no = prev_seq_no + 1;
                 let log = Log::new_borrowed(seq_no, prev_seq_no, &self.data);
-                self.sink.push(log).await?;
+                logs.push(log);
                 prev_seq_no = seq_no;
             }
 
-            // Make sure buffers logs are flushed to storage.
-            self.sink.flush().await?;
+            // Append the next batch of records.
+            self.waldo.append(&logs).await?;
 
             // Update for the next iteration.
             appended += self.opts.batch_size as u64;
             self.counter.add_count(self.opts.batch_size as _, Role::Writer);
         }
+
+        // Close storage shared with writer.
+        self.waldo.close().await;
 
         // Tell the reporter that this worker is complete.
         Ok(self.counter.complete())
@@ -227,14 +229,14 @@ impl Writer {
 
 /// A reader that streams new log record from storage.
 struct Reader {
-    stream: Stream,
+    waldo: Waldo,
     opts: BenchOptions,
     counter: Arc<Counters>,
 }
 
 impl Reader {
-    fn new(stream: Stream, opts: BenchOptions, counter: Arc<Counters>) -> Self {
-        Self { stream, opts, counter }
+    fn new(waldo: Waldo, opts: BenchOptions, counter: Arc<Counters>) -> Self {
+        Self { waldo, opts, counter }
     }
 
     async fn run(mut self) -> Result<()> {
@@ -242,13 +244,18 @@ impl Reader {
 
         // Run the reader until complete.
         let mut observed = 0;
+        let mut prev = self.waldo.prev_seq_no().unwrap_or(0);
         while observed < self.opts.count {
+            // Wait for storage to has new records.
+            self.waldo.watch_for(prev).await?;
+
             // Get next set of log records.
-            let logs = self.stream.next().await?;
+            let logs = self.waldo.query(Cursor::After(prev)).await?;
             let count = logs.into_iter().count() as u64;
 
             // Consume the next set of log records.
             observed += count;
+            prev += count;
             self.counter.add_count(count, Role::Reader);
         }
 

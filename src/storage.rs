@@ -32,6 +32,16 @@ pub enum Error {
     /// Error when an unsupported option is provided.
     #[error("Option not supported: {0}")]
     Option(String),
+
+    /// Error when Waldo storage has been closed.
+    #[error("Underlying Waldo storage instance closed")]
+    Closed,
+}
+
+impl From<watch::error::RecvError> for Error {
+    fn from(_value: watch::error::RecvError) -> Self {
+        Error::Closed
+    }
 }
 
 /// Different types of errors when querying for logs from storage.
@@ -60,12 +70,6 @@ pub enum QueryError {
 
 impl From<AsyncError> for QueryError {
     fn from(_value: AsyncError) -> Self {
-        QueryError::Closed
-    }
-}
-
-impl From<watch::error::RecvError> for QueryError {
-    fn from(_value: watch::error::RecvError) -> Self {
         QueryError::Closed
     }
 }

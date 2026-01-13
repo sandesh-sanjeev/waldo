@@ -1,26 +1,14 @@
 //! Front end to the storage engine.
 
-use crate::sink::Sink;
+use crate::log::LogIter;
+use crate::runtime::IoBuf;
 use crate::storage::Storage;
 use crate::storage::{Error, Metadata, Options};
-use crate::stream::Stream;
+use crate::{AppendError, Log, QueryError};
+use std::ops::Deref;
 use std::path::Path;
 
 /// Storage engine for persistent storage of sequential log records.
-///
-/// Waldo exposes a `stream` interface with two parts, a sink and a stream.
-///
-/// ## [`Sink`]
-///
-/// A sink is an interface to push new logs to storage. Under the hood it is a
-/// buffered writer that flushes buffered logs to storage when buffer is full.
-/// Optionally one can flush without waiting for the buffer to fill up.
-///
-/// ## [`Stream`]
-///
-/// A stream is an interface to discovered new logs appended to storage. One creates
-/// a stream subscription with a starting sequence number. This stream can be used
-/// indefinitely to repeatedly discover new logs.
 ///
 /// ## Warning
 ///
@@ -62,30 +50,146 @@ impl Waldo {
         *self.0.watcher().borrow()
     }
 
-    /// Create a new sink to publish log records to storage.
-    ///
-    /// Use [`Sink::push`] to append new log records into the Sink. When internal
-    /// buffers fill up, accumulated logs are flushed to disk. Use [`Sink::flush`]
-    /// to ensure any accumulated logs are flushed to storage.
-    ///
-    /// Note that there might be data loss if a sink is dropped without a flush.
-    /// Even though we can easily support blocking flush during drop, there is no
-    /// way to return results.
-    pub fn sink(&self) -> Sink {
-        Sink::new(self.0.clone())
-    }
-
-    /// Create a new log stream subscription.
-    ///
-    /// Note that this is a cold stream, i.e, it is a passive future that makes
-    /// progress when you await for more logs similar to regular futures. Use
-    /// [`Stream::next`] or [`Stream::try_next`] to discover new logs.
+    /// Wait for more log records from storage.
     ///
     /// # Arguments
     ///
-    /// * `cursor` - Cursor to start streaming log records.
-    pub fn stream(&self, cursor: Cursor) -> Stream {
-        Stream::new(self.cursor_seq_no(cursor), self.0.clone())
+    /// * `after` - Method completes when storage has logs after this sequence number.
+    pub async fn watch_for(&mut self, after: u64) -> Result<(), Error> {
+        loop {
+            // See if there are newer log records available.
+            if let Some(storage_prev) = *self.0.watcher_mut().borrow_and_update()
+                && storage_prev > after
+            {
+                return Ok(());
+            };
+
+            // Otherwise wait for new logs to get appended.
+            self.0.watcher_mut().changed().await?;
+        }
+    }
+
+    /// Append an ordered sequence of log records into storage.
+    ///
+    /// ## Atomicity
+    ///
+    /// Atomicity is only guaranteed for a single log record. Now (and probably never)
+    /// will we provide atomicity guarantees for an entire batch. While this is doable,
+    /// it's more code and more importantly, I have no need for it.
+    ///
+    /// ## Durability
+    ///
+    /// Durability guarantees depend on the options used open storage. Specifically, if
+    /// you want guarantee that bytes are durably flushed to disk when append successfully
+    /// completes, enable [`Options::file_o_dsync`]. It's a great default to start off with.
+    ///
+    /// ## Isolation
+    ///
+    /// append is executed with sequential consistency, i.e, all appends, even across threads,
+    /// always operate against latest state of storage. If storage processes two concurrent
+    /// appends, one of them will be rejected with conflict.
+    ///
+    /// ## Cancel safety
+    ///
+    /// If append is cancelled between an append, any number of logs might be durably appended
+    /// into storage. However, they are guaranteed to be appended in order and without gaps.
+    pub async fn append(&mut self, logs: &[Log<'_>]) -> Result<(), AppendError> {
+        // Return early if there is nothing else to do.
+        if logs.is_empty() {
+            return Ok(());
+        }
+
+        // Perform all validations upfront.
+        let mut prev = *self.0.watcher().borrow();
+        for log in logs {
+            // Sequence validation.
+            if let Some(prev) = prev
+                && prev != log.prev_seq_no()
+            {
+                return Err(AppendError::Sequence(log.seq_no(), log.prev_seq_no(), prev));
+            }
+
+            // Limit checks.
+            if log.size() >= Log::SIZE_LIMIT {
+                return Err(AppendError::ExceedsLimit(log.seq_no(), log.size()));
+            }
+
+            // For next iteration.
+            prev = Some(log.seq_no());
+        }
+
+        // Push the logs in batches.
+        let mut logs = logs;
+        let mut buf = self.0.buf_pool().take_async().await;
+        while !logs.is_empty() {
+            // To clear state from previous iteration.
+            buf.clear();
+
+            // Fully saturate the borrowed buffer.
+            let mut end = 0;
+            for log in logs.iter() {
+                // No space in the buffer for the log record.
+                // Flush accumulated logs and then process remaining.
+                if !log.write(&mut buf) {
+                    break;
+                }
+
+                end += 1;
+            }
+
+            // Push accumulated logs to storage.
+            let result = self.0.append(buf).run_async().await?;
+
+            // Process results from storage.
+            buf = result.0;
+            result.1?;
+
+            // Update state for next iteration.
+            logs = logs.split_at(end).1;
+        }
+        Ok(())
+    }
+
+    /// Query log records from storage.
+    ///
+    /// If requested logs exist in storage, they are returned as a contiguous
+    /// chunk of sequential log records in ascending order of sequence numbers.
+    ///
+    /// You cannot specify limits, this method will query for as many log records
+    /// as efficiently possible. You can discard logs you don't want, it's free.
+    ///
+    /// ## Isolation
+    ///
+    /// Only logs that have been successfully committed against storage are visible
+    /// to queries against storage. However note that they might not be durably stored
+    /// on disk.
+    pub async fn query(&mut self, cursor: Cursor) -> Result<QueryLogs, QueryError> {
+        // Return early if storage is not initialized.
+        let Some(storage_prev) = *self.0.watcher().borrow() else {
+            return Ok(QueryLogs::Empty);
+        };
+
+        // Return early if storage doesn't have next set of logs yet.
+        let after_seq_no = self.cursor_seq_no(cursor);
+        if storage_prev <= after_seq_no {
+            return Ok(QueryLogs::Empty);
+        }
+
+        // Query requested range of log records from storage.
+        let buf = self.0.buf_pool().take_async().await;
+        let (buf, result) = self.0.query(after_seq_no, buf).run_async().await?;
+        result?;
+
+        // Figure out offset to the starting seq_no.
+        // For performance reasons storage might return a few extra logs
+        // at the beginning of the buffer. We have to skip past those.
+        let offset = buf
+            .into_iter()
+            .take_while(|log| log.seq_no() <= after_seq_no)
+            .map(|log| log.size())
+            .sum();
+
+        Ok(QueryLogs::Io(buf, offset))
     }
 
     /// Initiate graceful shutdown of storage.
@@ -122,4 +226,31 @@ pub enum Cursor {
 
     /// Start streaming from (inclusive) the provided sequence number.
     From(u64),
+}
+
+/// A chunk of contiguous log records queried from storage.
+#[derive(Debug)]
+pub enum QueryLogs {
+    Empty,
+    Io(IoBuf, usize),
+}
+
+impl<'a> IntoIterator for &'a QueryLogs {
+    type IntoIter = LogIter<'a>;
+    type Item = Log<'a>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        LogIter(self)
+    }
+}
+
+impl Deref for QueryLogs {
+    type Target = [u8];
+
+    fn deref(&self) -> &Self::Target {
+        match self {
+            Self::Empty => &[],
+            Self::Io(buf, offset) => unsafe { buf.get_unchecked(*offset..) },
+        }
+    }
 }
