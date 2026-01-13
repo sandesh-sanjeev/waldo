@@ -44,7 +44,7 @@ async fn getting_started() -> Result<()> {
 }
 
 /// An appender to push new log records.
-async fn appender(mut storage: Waldo, count: usize) -> Result<()> {
+async fn appender(storage: Waldo, count: usize) -> Result<()> {
     let mut logs = Vec::with_capacity(1000);
     let mut prev = storage.prev_seq_no().unwrap_or(0);
 
@@ -78,7 +78,7 @@ async fn reader(mut storage: Waldo, after: u64, count: usize) -> Result<()> {
     // Make sure logs contain expected contents.
     while counter < count {
         // (Optional) Wait for storage if have new records.
-        storage.watch_for(prev).await?;
+        storage.watch_for_after(prev).await?;
 
         // Process the next batch of records.
         let logs = storage.query(Cursor::After(prev)).await?;

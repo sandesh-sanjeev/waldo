@@ -247,7 +247,7 @@ impl Reader {
         let mut prev = self.waldo.prev_seq_no().unwrap_or(0);
         while observed < self.opts.count {
             // Wait for storage to has new records.
-            self.waldo.watch_for(prev).await?;
+            self.waldo.watch_for_after(prev).await?;
 
             // Get next set of log records.
             let logs = self.waldo.query(Cursor::After(prev)).await?;

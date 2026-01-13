@@ -10,14 +10,19 @@ use std::path::Path;
 
 /// Storage engine for persistent storage of sequential log records.
 ///
+/// ## Clones
+///
+/// Waldo can be cloned and shared across thread boundaries without any synchronization. However
+/// note that concurrent appends is not supported. While appends can be initiated from multiple
+/// threads/tasks, if storage processes them in parallel, one will be rejected.
+///
 /// ## Warning
 ///
-/// Waldo attempts to perform graceful shutdown when dropped. Unfortunately there
-/// is no support for drop in async. If [`Waldo::close`] is not explicitly invoked
-/// and awaited to completion, Waldo will initiate graceful shutdown during drop
-/// which will block the async runtime. This is typically not a big deal, especially
-/// in multi-threaded runtimes. However it is recommended to asynchronously invoke close
-/// when possible.
+/// Waldo attempts to perform graceful shutdown when dropped. Unfortunately there is no support
+/// for drop in async. If [`Waldo::close`] is not explicitly invoked and awaited to completion,
+/// Waldo will initiate graceful shutdown during drop which will block the async runtime. This
+/// is typically not a big deal, especially in multi-threaded runtimes. However it is recommended
+/// to asynchronously invoke close when possible.
 #[derive(Debug, Clone)]
 pub struct Waldo(Storage);
 
@@ -52,10 +57,14 @@ impl Waldo {
 
     /// Wait for more log records from storage.
     ///
+    /// Repeatedly polling storage in an attempt to discover new log records is not efficient.
+    /// In some cases, for example if you were to build a streaming interface, it's better to
+    /// just wait for new logs to be available in storage.
+    ///
     /// # Arguments
     ///
     /// * `after` - Method completes when storage has logs after this sequence number.
-    pub async fn watch_for(&mut self, after: u64) -> Result<(), Error> {
+    pub async fn watch_for_after(&mut self, after: u64) -> Result<(), Error> {
         loop {
             // See if there are newer log records available.
             if let Some(storage_prev) = *self.0.watcher_mut().borrow_and_update()
@@ -93,7 +102,7 @@ impl Waldo {
     ///
     /// If append is cancelled between an append, any number of logs might be durably appended
     /// into storage. However, they are guaranteed to be appended in order and without gaps.
-    pub async fn append(&mut self, logs: &[Log<'_>]) -> Result<(), AppendError> {
+    pub async fn append(&self, logs: &[Log<'_>]) -> Result<(), AppendError> {
         // Return early if there is nothing else to do.
         if logs.is_empty() {
             return Ok(());
@@ -166,13 +175,13 @@ impl Waldo {
     pub async fn query(&mut self, cursor: Cursor) -> Result<QueryLogs, QueryError> {
         // Return early if storage is not initialized.
         let Some(storage_prev) = *self.0.watcher().borrow() else {
-            return Ok(QueryLogs::Empty);
+            return Ok(QueryLogs(QueryBuf::Empty));
         };
 
         // Return early if storage doesn't have next set of logs yet.
         let after_seq_no = self.cursor_seq_no(cursor);
         if storage_prev <= after_seq_no {
-            return Ok(QueryLogs::Empty);
+            return Ok(QueryLogs(QueryBuf::Empty));
         }
 
         // Query requested range of log records from storage.
@@ -189,7 +198,7 @@ impl Waldo {
             .map(|log| log.size())
             .sum();
 
-        Ok(QueryLogs::Io(buf, offset))
+        Ok(QueryLogs(QueryBuf::Io(buf, offset)))
     }
 
     /// Initiate graceful shutdown of storage.
@@ -230,21 +239,25 @@ pub enum Cursor {
 
 /// A chunk of contiguous log records queried from storage.
 #[derive(Debug)]
-pub enum QueryLogs {
-    Empty,
-    Io(IoBuf, usize),
-}
+pub struct QueryLogs(QueryBuf);
 
 impl<'a> IntoIterator for &'a QueryLogs {
     type IntoIter = LogIter<'a>;
     type Item = Log<'a>;
 
     fn into_iter(self) -> Self::IntoIter {
-        LogIter(self)
+        LogIter(&self.0)
     }
 }
 
-impl Deref for QueryLogs {
+/// Different types of buffers returned from a query.
+#[derive(Debug)]
+enum QueryBuf {
+    Empty,
+    Io(IoBuf, usize),
+}
+
+impl Deref for QueryBuf {
     type Target = [u8];
 
     fn deref(&self) -> &Self::Target {
