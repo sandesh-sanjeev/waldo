@@ -126,7 +126,7 @@ async fn main() -> anyhow::Result<()> {
     let mut workers = JoinSet::new();
 
     // Spawn writer.
-    let sink = storage.sink().await;
+    let sink = storage.sink();
     let writer = Writer::new(sink, b_opts, counter.clone());
     workers.spawn(writer.run());
 

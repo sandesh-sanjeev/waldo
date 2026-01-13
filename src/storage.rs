@@ -199,15 +199,6 @@ impl Waldo {
         })
     }
 
-    /// Sequence number of the last log record in storage.
-    ///
-    /// Note that this is just an efficient way to know progress made in storage.
-    /// Use [`Waldo::metadata`] for more detailed info about current state. Both
-    /// methods return None when storage is not initialized.
-    pub fn prev_seq_no(&self) -> Option<u64> {
-        *self.rx.borrow()
-    }
-
     /// Latest metadata for storage, if storage is initialized.
     ///
     /// Note this gets a rich summary of the current state. It's great for initialization,
@@ -219,27 +210,31 @@ impl Waldo {
         rx.recv_async().await.ok()?
     }
 
-    /// Create a new sink to publish log records to storage.
+    /// Sequence number of the last log record in storage.
     ///
-    /// Note that this method waits for a free buffer in buffer pool before
-    /// completing. Use [`Waldo::try_sink`] for a non-blocking variant.
-    pub async fn sink(&self) -> Sink {
-        Sink {
-            tx: self.tx.clone(),
-            buf: Some(self.buf_pool.take_async().await),
-            prev: self.prev_seq_no(),
-        }
+    /// Note that this is just an efficient way to know progress made in storage.
+    /// Use [`Waldo::metadata`] for more detailed info about current state. Both
+    /// methods return None when storage is not initialized.
+    pub fn prev_seq_no(&self) -> Option<u64> {
+        *self.rx.borrow()
     }
 
     /// Create a new sink to publish log records to storage.
     ///
-    /// Returns none if one couldn't be created because a free buffer wasn't available.
-    pub fn try_sink(&self) -> Option<Sink> {
-        Some(Sink {
+    /// Use [`Sink::push`] to append new log records into the Sink. When internal
+    /// buffers fill up, accumulated logs are flushed to disk. Use [`Sink::flush`]
+    /// to ensure any accumulated logs are flushed to storage.
+    ///
+    /// Note that there might be data loss if a sink is dropped without a flush.
+    /// Even though we can easily support blocking flush during drop, there is no
+    /// way to return results.
+    pub fn sink(&self) -> Sink {
+        Sink {
+            buf: None,
             tx: self.tx.clone(),
-            buf: Some(self.buf_pool.try_take()?),
             prev: self.prev_seq_no(),
-        })
+            pool: self.buf_pool.clone(),
+        }
     }
 
     /// Create a new log stream subscription.
@@ -256,12 +251,7 @@ impl Waldo {
             tx: self.tx.clone(),
             rx: self.rx.clone(),
             pool: self.buf_pool.clone(),
-            prev: match cursor {
-                Cursor::Trim => Cell::new(0),
-                Cursor::After(seq_no) => Cell::new(seq_no),
-                Cursor::From(seq_no) => Cell::new(seq_no.saturating_sub(1)),
-                Cursor::Tip => Cell::new(self.prev_seq_no().unwrap_or(0)),
-            },
+            prev: Cell::new(self.cursor_seq_no(cursor)),
         }
     }
 
@@ -280,6 +270,15 @@ impl Waldo {
         // If we have the last reference to worker, we'll close the worker now.
         if let Ok(worker) = Arc::try_unwrap(self._worker) {
             worker.close().await;
+        }
+    }
+
+    fn cursor_seq_no(&self, cursor: Cursor) -> u64 {
+        match cursor {
+            Cursor::Trim => 0,
+            Cursor::After(seq_no) => seq_no,
+            Cursor::From(seq_no) => seq_no.saturating_sub(1),
+            Cursor::Tip => self.prev_seq_no().unwrap_or(0),
         }
     }
 }
@@ -501,6 +500,7 @@ pub struct Sink {
     prev: Option<u64>,
     buf: Option<IoBuf>,
     tx: ActionTx,
+    pool: BufPool,
 }
 
 impl Sink {
@@ -531,13 +531,13 @@ impl Sink {
         }
 
         // Attempt to simply buffer the log record.
-        if !log.write(self.buf_ref()?) {
+        if !log.write(self.buf_ref().await) {
             // Underlying buffer doesn't have enough space.
             // We flush accumulated logs to disk, reclaiming space.
             self.flush().await?;
 
             // Now we must have enough space for the log record.
-            if !log.write(self.buf_ref()?) {
+            if !log.write(self.buf_ref().await) {
                 return Err(AppendError::Fault("Buffer too small for log"));
             }
         }
@@ -551,30 +551,38 @@ impl Sink {
     /// Note that this method is no-op if there were no logs to flush to storage.
     /// Also, this is NOT equivalent to `fsync`, there is no guarantee that logs
     /// are durably stored on disk.
+    ///
+    /// Also, a flush effectively releases borrowed resources. Be sure to flush when
+    /// you are done with your logical unit of work, such as when you're done appending
+    /// an batch of log records.
     pub async fn flush(&mut self) -> Result<(), AppendError> {
         // Return early if there is nothing to flush.
-        let buf = self.buf_ref()?;
+        let Some(buf) = self.buf.take() else {
+            return Ok(());
+        };
+
+        // Return early if there is nothing to append into storage.
         if buf.is_empty() {
             return Ok(());
         }
 
         // Wait for a slot in the queue and submit append action.
-        let (append, rx) = Action::append(self.take_buf()?);
+        let (append, rx) = Action::append(buf);
         self.tx.send_async(append).await?;
 
         // Consume results from storage.
-        let (mut buf, result) = rx.recv_async().await?;
-        buf.clear();
-        self.buf.replace(buf);
+        let (_, result) = rx.recv_async().await?;
         result
     }
 
-    fn take_buf(&mut self) -> Result<IoBuf, AppendError> {
-        self.buf.take().ok_or(AppendError::Fault("Connection lost"))
-    }
+    async fn buf_ref(&mut self) -> &mut IoBuf {
+        // We don't always hold on to buffer, it's wasteful.
+        // So, we don't have buffer, we borrow one from pool.
+        if self.buf.is_none() {
+            self.buf = Some(self.pool.take_async().await);
+        }
 
-    fn buf_ref(&mut self) -> Result<&mut IoBuf, AppendError> {
-        self.buf.as_mut().ok_or(AppendError::Fault("Connection lost"))
+        self.buf.as_mut().expect("Buffer should be set")
     }
 }
 

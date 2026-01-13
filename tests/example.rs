@@ -45,7 +45,7 @@ async fn getting_started() -> Result<()> {
 
 /// An appender to push new log records.
 async fn appender(storage: Waldo, count: usize) -> Result<()> {
-    let mut sink = storage.sink().await;
+    let mut sink = storage.sink();
     let mut prev = sink.prev_seq_no().unwrap_or(0);
 
     // Write a bunch of records into storage.
