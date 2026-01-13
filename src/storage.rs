@@ -11,8 +11,8 @@ use self::page::{Page, PageMetadata, PageOptions};
 use self::worker::Worker;
 use crate::Log;
 use crate::runtime::{BufPool, IoBuf, PoolOptions};
-use std::cell::Cell;
-use std::ops::{AddAssign, Deref};
+use crate::storage::action::FateReceiver;
+use std::ops::AddAssign;
 use std::{path::Path, sync::Arc};
 use tokio::sync::watch;
 
@@ -58,14 +58,8 @@ pub enum QueryError {
     Sequence(u64, u64, u64),
 }
 
-impl From<FateError> for QueryError {
-    fn from(_value: FateError) -> Self {
-        QueryError::Closed
-    }
-}
-
-impl<T> From<flume::SendError<T>> for QueryError {
-    fn from(_value: flume::SendError<T>) -> Self {
+impl From<AsyncError> for QueryError {
+    fn from(_value: AsyncError) -> Self {
         QueryError::Closed
     }
 }
@@ -104,58 +98,74 @@ pub enum AppendError {
     ExceedsLimit(u64, usize),
 }
 
-impl From<FateError> for AppendError {
+impl From<AsyncError> for AppendError {
+    fn from(_value: AsyncError) -> Self {
+        AppendError::Closed
+    }
+}
+
+/// Error when an async action couldn't be issued.
+#[derive(Debug, thiserror::Error, Clone, Copy, PartialEq, Eq)]
+#[error("Async action couldn't be issued because closing")]
+pub(crate) struct AsyncError;
+
+impl From<FateError> for AsyncError {
     fn from(_value: FateError) -> Self {
-        AppendError::Closed
+        AsyncError
     }
 }
 
-impl<T> From<flume::SendError<T>> for AppendError {
+impl<T> From<flume::SendError<T>> for AsyncError {
     fn from(_value: flume::SendError<T>) -> Self {
-        AppendError::Closed
+        AsyncError
     }
 }
 
-/// Storage engine for persistent storage of sequential log records.
+/// An action initiated against storage.
 ///
-/// Waldo exposes a `stream` interface with two parts, a sink and a stream.
+/// Note that this action is not yet executed. It either needs to be executed synchronously
+/// with [`Self::run`], or [`Self::run_async`] to execute the action asynchronously.
+pub(crate) struct AsyncAction<'a, T> {
+    action: Action,
+    tx: &'a ActionTx,
+    rx: FateReceiver<T>,
+}
+
+impl<T> AsyncAction<'_, T> {
+    /// Run the asynchronous action synchronously, i.e, blocking the caller.
+    #[allow(dead_code)]
+    pub(crate) fn run(self) -> Result<T, AsyncError> {
+        self.tx.send(self.action)?;
+        Ok(self.rx.recv()?)
+    }
+
+    /// Run the asynchronous action asynchronously, i.e, does not block runtime.
+    pub(crate) async fn run_async(self) -> Result<T, AsyncError> {
+        self.tx.send_async(self.action).await?;
+        Ok(self.rx.recv_async().await?)
+    }
+}
+
+/// Storage engine that backs Waldo.
 ///
-/// ## [`Sink`]
-///
-/// A sink is an interface to push new logs to storage. Under the hood it is a
-/// buffered writer that flushes buffered logs to storage when buffer is full.
-/// Optionally one can flush without waiting for the buffer to fill up.
-///
-/// ## [`Stream`]
-///
-/// A stream is an interface to discovered new logs appended to storage. One creates
-/// a stream subscription with a starting sequence number. This stream can be used
-/// indefinitely to repeatedly discover new logs.
-///
-/// ## Warning
-///
-/// Waldo attempts to perform graceful shutdown when dropped. Unfortunately there
-/// is no support for drop in async. If [`Waldo::close`] is not explicitly invoked
-/// and awaited to completion, Waldo will initiate graceful shutdown during drop
-/// which will block the async runtime. This is typically not a big deal, especially
-/// in multi-threaded runtimes. However it is recommended to asynchronously invoke close
-/// when possible.
+/// It is just a thin wrapper around storage worker along with a set of channels
+/// to communicate with the worker and coordination across threads, tasks and worker.
 #[derive(Debug, Clone)]
-pub struct Waldo {
+pub(crate) struct Storage {
     rx: WatchRx,
     tx: ActionTx,
     buf_pool: BufPool,
     _worker: Arc<Worker>,
 }
 
-impl Waldo {
-    /// Open an instance of storage at the given path.
+impl Storage {
+    /// Open storage in the given home directory.
     ///
     /// # Arguments
     ///
-    /// * `path` - Path to the directory on disk.
-    /// * `opts` - Options used to create storage.
-    pub async fn open<P: AsRef<Path>>(path: P, opts: Options) -> Result<Self, Error> {
+    /// * `path` - Path to home directory of the storage instance.
+    /// * `opts` - Options to open storage.
+    pub(crate) async fn open<P: AsRef<Path>>(path: P, opts: Options) -> Result<Self, Error> {
         // Otherwise we can get into a situation where a batch cannot be appended unless
         // split into two or more parts. This makes sure a single batch can also be appended
         // into an empty file.
@@ -199,69 +209,62 @@ impl Waldo {
         })
     }
 
-    /// Latest metadata for storage, if storage is initialized.
-    ///
-    /// Note this gets a rich summary of the current state. It's great for initialization,
-    /// periodic scans for telemetry, etc. Use [`Waldo::prev_seq_no`] if all you want is
-    /// sequence number of the last appended log.
-    pub async fn metadata(&self) -> Option<Metadata> {
+    /// Reference to buffer pool tracked by storage.
+    pub(crate) fn buf_pool(&self) -> &BufPool {
+        &self.buf_pool
+    }
+
+    /// Reference to the watcher tracking appends in storage.
+    pub(crate) fn watcher(&self) -> &WatchRx {
+        &self.rx
+    }
+
+    /// Mutable reference to the watcher tracking appends in storage.
+    pub(crate) fn watcher_mut(&mut self) -> &mut WatchRx {
+        &mut self.rx
+    }
+
+    /// Create an action to fetch storage metadata.
+    pub(crate) fn metadata(&self) -> AsyncAction<'_, Option<Metadata>> {
         let (action, rx) = Action::metadata();
-        self.tx.send_async(action).await.ok()?;
-        rx.recv_async().await.ok()?
-    }
-
-    /// Sequence number of the last log record in storage.
-    ///
-    /// Note that this is just an efficient way to know progress made in storage.
-    /// Use [`Waldo::metadata`] for more detailed info about current state. Both
-    /// methods return None when storage is not initialized.
-    pub fn prev_seq_no(&self) -> Option<u64> {
-        *self.rx.borrow()
-    }
-
-    /// Create a new sink to publish log records to storage.
-    ///
-    /// Use [`Sink::push`] to append new log records into the Sink. When internal
-    /// buffers fill up, accumulated logs are flushed to disk. Use [`Sink::flush`]
-    /// to ensure any accumulated logs are flushed to storage.
-    ///
-    /// Note that there might be data loss if a sink is dropped without a flush.
-    /// Even though we can easily support blocking flush during drop, there is no
-    /// way to return results.
-    pub fn sink(&self) -> Sink {
-        Sink {
-            buf: None,
-            tx: self.tx.clone(),
-            prev: self.prev_seq_no(),
-            pool: self.buf_pool.clone(),
+        AsyncAction {
+            rx,
+            action,
+            tx: &self.tx,
         }
     }
 
-    /// Create a new log stream subscription.
-    ///
-    /// Note that this is a cold stream, i.e, it is a passive future that makes
-    /// progress when you await for more logs similar to regular futures. Use
-    /// [`Stream::next`] or [`Stream::try_next`] to discover new logs.
+    /// Create an action to append a buffer of logs into storage.
     ///
     /// # Arguments
     ///
-    /// * `cursor` - Cursor to start streaming log records.
-    pub fn stream(&self, cursor: Cursor) -> Stream {
-        Stream {
-            tx: self.tx.clone(),
-            rx: self.rx.clone(),
-            pool: self.buf_pool.clone(),
-            prev: Cell::new(self.cursor_seq_no(cursor)),
+    /// * `buf` - Source buffer with serialized log records.
+    pub(crate) fn append(&self, buf: IoBuf) -> AsyncAction<'_, (IoBuf, Result<(), AppendError>)> {
+        let (action, rx) = Action::append(buf);
+        AsyncAction {
+            rx,
+            action,
+            tx: &self.tx,
+        }
+    }
+
+    /// Create an action to query log from storage.
+    ///
+    /// # Arguments
+    ///
+    /// * `after_seq_no` - Query for logs after this sequence number.
+    /// * `buf` - Destination buffer to fill with log records.
+    pub(crate) fn query(&self, after_seq_no: u64, buf: IoBuf) -> AsyncAction<'_, (IoBuf, Result<(), QueryError>)> {
+        let (action, rx) = Action::query(after_seq_no, buf);
+        AsyncAction {
+            rx,
+            action,
+            tx: &self.tx,
         }
     }
 
     /// Initiate graceful shutdown of storage.
-    ///
-    /// If there are no other references to Waldo and this method completes
-    /// successfully, you can be guaranteed that all logs appended to storage
-    /// have been durably stored on disk (unless they were trimmed away to reclaim
-    /// space for new logs).
-    pub async fn close(self) {
+    pub(crate) async fn close(self) {
         // Drop rid of any shared reference.
         drop(self.tx);
         drop(self.rx);
@@ -271,318 +274,6 @@ impl Waldo {
         if let Ok(worker) = Arc::try_unwrap(self._worker) {
             worker.close().await;
         }
-    }
-
-    fn cursor_seq_no(&self, cursor: Cursor) -> u64 {
-        match cursor {
-            Cursor::Trim => 0,
-            Cursor::After(seq_no) => seq_no,
-            Cursor::From(seq_no) => seq_no.saturating_sub(1),
-            Cursor::Tip => self.prev_seq_no().unwrap_or(0),
-        }
-    }
-}
-
-/// Different logical positions for stream subscriptions.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Cursor {
-    /// Start streaming from the oldest log record.
-    Tip,
-
-    /// Start streaming from after newest log record.
-    Trim,
-
-    /// Start streaming after (exclusive) the provided sequence number.
-    After(u64),
-
-    /// Start streaming from (inclusive) the provided sequence number.
-    From(u64),
-}
-
-/// A stream subscription to discover new log records.
-///
-/// If requested logs exist in storage, they are returned as a contiguous
-/// chunk of sequential log records in ascending order of sequence numbers.
-///
-/// You cannot specify limits, this method will query for as many log records
-/// as efficiently possible. You can discard logs you don't want, it's free.
-///
-/// ## Isolation
-///
-/// Only logs that have been successfully committed against storage are visible
-/// to queries against storage. However note that they might not be durably stored
-/// on disk.
-#[derive(Debug)]
-pub struct Stream {
-    pool: BufPool,
-    prev: Cell<u64>,
-    tx: ActionTx,
-    rx: WatchRx,
-}
-
-impl Stream {
-    /// Sequence number of the previous log record observed in stream.
-    pub fn prev_seq_no(&self) -> u64 {
-        self.prev.get()
-    }
-
-    /// Fetch next set of log records from storage.
-    ///
-    /// Note that if the stream is caught up to the tip of storage, this method
-    /// waits for more logs to be available in storage before completing. This
-    /// makes interaction with storage very efficient, repeated polling is not
-    /// necessary. Use [`Stream::try_next`] if you want results without waiting
-    /// for more logs.
-    pub async fn next(&mut self) -> Result<StreamLogs<'_>, QueryError> {
-        loop {
-            // See if there are newer log records available.
-            if let Some(storage_prev) = *self.rx.borrow_and_update()
-                && storage_prev > self.prev.get()
-            {
-                break;
-            };
-
-            // Otherwise wait for new logs to get appended.
-            self.rx.changed().await?;
-        }
-
-        // Attempt to fetch the next set of logs.
-        self.try_next().await
-    }
-
-    /// Fetch next set of log records from storage.
-    ///
-    /// Note that this method returns empty logs when there are no new logs available
-    /// in storage. Use [`Stream::next`] if you want to wait for more logs to be available.
-    pub async fn try_next(&mut self) -> Result<StreamLogs<'_>, QueryError> {
-        // Return early if storage is not initialized.
-        let Some(storage_prev) = *self.rx.borrow_and_update() else {
-            return Ok(StreamLogs {
-                prev: &self.prev,
-                buf: StreamBuf::Empty,
-            });
-        };
-
-        // Return early if storage doesn't have next set of logs yet.
-        let after_seq_no = self.prev.get();
-        if storage_prev <= after_seq_no {
-            return Ok(StreamLogs {
-                prev: &self.prev,
-                buf: StreamBuf::Empty,
-            });
-        }
-
-        // Borrow buffer from pool for this query.
-        // We'll return it back to pool once logs are consumed.
-        let buf = self.pool.take_async().await;
-
-        // Submit action to append bytes into storage.
-        let (query, rx) = Action::query(after_seq_no, buf);
-        self.tx.send_async(query).await?;
-
-        // Await and return result from storage.
-        let (buf, result) = rx.recv_async().await?;
-        result?;
-
-        // Figure out offset to the starting seq_no.
-        // For performance reasons storage might return a few extra logs
-        // at the beginning of the buffer. We have to skip past those.
-        let offset = buf
-            .into_iter()
-            .take_while(|log| log.seq_no() <= after_seq_no)
-            .map(|log| log.size())
-            .sum();
-
-        Ok(StreamLogs {
-            buf: StreamBuf::Io(buf, offset),
-            prev: &self.prev,
-        })
-    }
-}
-
-/// Buffer of bytes from a log stream.
-#[derive(Debug)]
-enum StreamBuf {
-    Empty,
-    Io(IoBuf, usize),
-}
-
-impl Deref for StreamBuf {
-    type Target = [u8];
-
-    fn deref(&self) -> &Self::Target {
-        match self {
-            Self::Empty => &[],
-            Self::Io(buf, offset) => unsafe { buf.get_unchecked(*offset..) },
-        }
-    }
-}
-
-/// A chunk of contiguous log records discovered in stream.
-#[derive(Debug)]
-pub struct StreamLogs<'a> {
-    buf: StreamBuf,
-    prev: &'a Cell<u64>,
-}
-
-impl<'a> IntoIterator for &'a StreamLogs<'a> {
-    type IntoIter = StreamLogIter<'a>;
-    type Item = Log<'a>;
-
-    fn into_iter(self) -> Self::IntoIter {
-        StreamLogIter {
-            prev: self.prev,
-            bytes: &self.buf,
-        }
-    }
-}
-
-/// An iterator to iterate through stream log records.
-#[derive(Debug)]
-pub struct StreamLogIter<'a> {
-    bytes: &'a [u8],
-    prev: &'a Cell<u64>,
-}
-
-impl<'a> Iterator for StreamLogIter<'a> {
-    type Item = Log<'a>;
-
-    fn next(&mut self) -> Option<Self::Item> {
-        // Attempt to deserialize the next set of bytes into log.
-        let log = Log::read(self.bytes)?;
-
-        // Safety: We just read enough bytes for the parsed log record.
-        // Compiler/LLVM is not smart enough to know this and remove bounds check.
-        self.bytes = unsafe { self.bytes.get_unchecked(log.size()..) };
-
-        // Update sequence number in the stream and return.
-        self.prev.set(log.seq_no());
-        Some(log)
-    }
-}
-
-/// A sink is buffered log writer.
-///
-/// ## Atomicity
-///
-/// Atomicity is only guaranteed for a single log record. Now (and probably never)
-/// will we provide atomicity guarantees for an entire batch. While this is doable,
-/// it's more code and more importantly, I have no need for it.
-///
-/// ## Durability
-///
-/// Durability guarantees depend on the options used open storage. Specifically, if
-/// you want guarantee that bytes are durably flushed to disk when [`Sink::flush`]
-/// successfully completes, enable [`Options::file_o_dsync`]. It's a great default to
-/// start off with.
-///
-/// ## Isolation
-///
-/// [`Sink::push`] is executed with sequential consistency, i.e, all appends, even
-/// across threads, always operate against latest state of storage. If storage processes
-/// two concurrent appends, one of them will be rejected with conflict.
-///
-/// ## Flush
-///
-/// A sink writes to storage only when backing buffer is full, which could take arbitrary
-/// time or never. Use [`Sink::flush`] to make sure all accumulated logs have been dispatched
-/// to storage. Importantly, if the sink is dropped without a flush, any accumulated logs
-/// will be lost.
-///
-/// ## Cancel safety
-///
-/// If [`Sink::push`] is cancelled between an append, any number of logs might be durably
-/// appended into storage. Use [`Waldo::metadata`] for detailed info about current state
-/// of storage, or [`Waldo::prev_seq_no`] to just know sequence number of the last append
-/// log record.
-#[derive(Debug)]
-pub struct Sink {
-    prev: Option<u64>,
-    buf: Option<IoBuf>,
-    tx: ActionTx,
-    pool: BufPool,
-}
-
-impl Sink {
-    /// Sequence number of the last log record pushed to sink.
-    pub fn prev_seq_no(&self) -> Option<u64> {
-        self.prev
-    }
-
-    /// Push a new log record into storage.
-    ///
-    /// Note that this is a buffered writer (for efficiency reasons). To make sure
-    /// accumulated records are sent to storage, invoke [`Sink::flush`].
-    ///
-    /// # Arguments
-    ///
-    /// * `log` - Log record to append into storage.
-    pub async fn push(&mut self, log: Log<'_>) -> Result<(), AppendError> {
-        // Sequence validation.
-        if let Some(prev) = self.prev
-            && prev != log.prev_seq_no()
-        {
-            return Err(AppendError::Sequence(log.seq_no(), log.prev_seq_no(), prev));
-        }
-
-        // Limit checks.
-        if log.size() >= Log::SIZE_LIMIT {
-            return Err(AppendError::ExceedsLimit(log.seq_no(), log.size()));
-        }
-
-        // Attempt to simply buffer the log record.
-        if !log.write(self.buf_ref().await) {
-            // Underlying buffer doesn't have enough space.
-            // We flush accumulated logs to disk, reclaiming space.
-            self.flush().await?;
-
-            // Now we must have enough space for the log record.
-            if !log.write(self.buf_ref().await) {
-                return Err(AppendError::Fault("Buffer too small for log"));
-            }
-        }
-
-        self.prev = Some(log.seq_no());
-        Ok(())
-    }
-
-    /// Flush accumulated log records to storage.
-    ///
-    /// Note that this method is no-op if there were no logs to flush to storage.
-    /// Also, this is NOT equivalent to `fsync`, there is no guarantee that logs
-    /// are durably stored on disk.
-    ///
-    /// Also, a flush effectively releases borrowed resources. Be sure to flush when
-    /// you are done with your logical unit of work, such as when you're done appending
-    /// an batch of log records.
-    pub async fn flush(&mut self) -> Result<(), AppendError> {
-        // Return early if there is nothing to flush.
-        let Some(buf) = self.buf.take() else {
-            return Ok(());
-        };
-
-        // Return early if there is nothing to append into storage.
-        if buf.is_empty() {
-            return Ok(());
-        }
-
-        // Wait for a slot in the queue and submit append action.
-        let (append, rx) = Action::append(buf);
-        self.tx.send_async(append).await?;
-
-        // Consume results from storage.
-        let (_, result) = rx.recv_async().await?;
-        result
-    }
-
-    async fn buf_ref(&mut self) -> &mut IoBuf {
-        // We don't always hold on to buffer, it's wasteful.
-        // So, we don't have buffer, we borrow one from pool.
-        if self.buf.is_none() {
-            self.buf = Some(self.pool.take_async().await);
-        }
-
-        self.buf.as_mut().expect("Buffer should be set")
     }
 }
 

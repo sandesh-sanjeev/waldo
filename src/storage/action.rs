@@ -253,4 +253,9 @@ impl<T> FateReceiver<T> {
     pub(super) async fn recv_async(self) -> Result<T, FateError> {
         self.0.await.map_err(|_| FateError)
     }
+
+    /// Receive fate of an async operation synchronously.
+    pub(super) fn recv(self) -> Result<T, FateError> {
+        self.0.recv().map_err(|_| FateError)
+    }
 }

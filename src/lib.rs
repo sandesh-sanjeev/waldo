@@ -63,7 +63,10 @@
 #![cfg_attr(not(test), allow(dead_code))]
 
 mod log;
+mod sink;
 mod storage;
+mod stream;
+mod waldo;
 
 #[cfg(not(feature = "benchmark"))]
 mod runtime;
@@ -72,5 +75,7 @@ mod runtime;
 pub mod runtime;
 
 pub use log::{Error as LogError, Log};
-pub use storage::{AppendError, Error, Metadata, Options, QueryError, Waldo};
-pub use storage::{Cursor, Sink, Stream, StreamLogIter, StreamLogs};
+pub use sink::Sink;
+pub use storage::{AppendError, Error, Metadata, Options, QueryError};
+pub use stream::{Stream, StreamLogIter, StreamLogs};
+pub use waldo::{Cursor, Waldo};

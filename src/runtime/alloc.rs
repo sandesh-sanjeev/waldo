@@ -86,7 +86,6 @@ impl BufPool {
     ///
     /// Note that this operation blocks till memory is available in the pool.
     /// For a non-blocking variant use [`BufPool::try_take`] or [`BufPool::take_async`] for async.
-    #[allow(dead_code)]
     pub fn take(&self) -> IoBuf {
         match self.rx.recv() {
             Ok(bytes) => Bytes::new(bytes, &self.tx).into(),
