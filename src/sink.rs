@@ -16,7 +16,7 @@ use crate::storage::{AppendError, Storage};
 ///
 /// Durability guarantees depend on the options used open storage. Specifically, if
 /// you want guarantee that bytes are durably flushed to disk when [`Sink::flush`]
-/// successfully completes, enable [`Options::file_o_dsync`]. It's a great default to
+/// successfully completes, enable `Options::file_o_dsync`. It's a great default to
 /// start off with.
 ///
 /// ## Isolation
@@ -35,9 +35,7 @@ use crate::storage::{AppendError, Storage};
 /// ## Cancel safety
 ///
 /// If [`Sink::push`] is cancelled between an append, any number of logs might be durably
-/// appended into storage. Use [`Waldo::metadata`] for detailed info about current state
-/// of storage, or [`Waldo::prev_seq_no`] to just know sequence number of the last append
-/// log record.
+/// appended into storage.
 #[derive(Debug)]
 pub struct Sink {
     prev: Option<u64>,

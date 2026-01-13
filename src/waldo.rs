@@ -53,13 +53,6 @@ impl Waldo {
         self.0.metadata().run_async().await.ok()?
     }
 
-    /// Latest metadata for storage, if storage is initialized.
-    ///
-    /// This is a blocking variant of [`Waldo::metadata`].
-    pub fn b_metadata(&self) -> Option<Metadata> {
-        self.0.metadata().run().ok()?
-    }
-
     /// Sequence number of the last log record in storage.
     ///
     /// Note that this is just an efficient way to know progress made in storage.

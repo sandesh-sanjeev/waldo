@@ -14,45 +14,52 @@
 //!
 //! ## Getting Started
 //!
-//! Open [`Waldo`] with path to home directory on disk. [`Options`] used to open Waldo allows
-//! one  to tailor Waldo to their throughput, latency, concurrency and memory usage goals.
+//! 1. Construct [`Options`] to configure disk, memory and concurrency requirements.
+//! 2. Open [`Waldo`] with path to home directory on disk and open options.
+//! 3. Use a [`Sink`] to push new log records into storage.
+//! 4. Use a [`Stream`] to discover new log records from storage.
 //!
-//! ```rust,ignore
-//! // Open storage with specific set of options.
-//! let opts: Options = ..;
-//! let storage = Waldo::open("test", opts).await?;
-//! ```
+//! ```rust
+//! use waldo::{Options, Waldo, Log, Cursor};
+//! # #[tokio::main]
+//! # async fn main() -> anyhow::Result<()> {
 //!
-//! ### Sink
+//! // Step 1: Construct options for waldo.
+//! let options = Options {
+//!     ring_size: 4,
+//!     queue_depth: 4,
+//!     pool_size: 4,
+//!     huge_buf: false,
+//!     buf_capacity: 2 * 1024 * 1024,
+//!     page_capacity: 100_000,
+//!     index_capacity: 1000,
+//!     index_sparse_bytes: 16 * 1024,
+//!     index_sparse_count: 100,
+//!     file_o_dsync: true,
+//!     file_capacity: 4 * 1024 * 1024,
+//! };
 //!
-//! Use a [`Sink`] to push new log records into storage.
+//! // Step 2: Open waldo with path to home directory on disk.
+//! let temp_dir = tempdir::TempDir::new("waldo")?;
+//! let waldo = Waldo::open(temp_dir.path(), options).await?;
 //!
-//! ```rust,ignore
-//! // Create a new sink into storage.
-//! let mut sink = storage.sink().await;
-//!
-//! // Push a new log record(s) into storage.
-//! sink.push(Log::new_borrowed(1, 0, "first log")).await?;
-//! sink.push(Log::new_borrowed(2, 1, "second log")).await?;
-//!
-//! // Flush once you're done.
+//! // Step 3: Create a Sink to append log records.
+//! let mut sink = waldo.sink();
+//! sink.push(Log::new_borrowed(1, 0, b"1")).await?;
+//! sink.push(Log::new_borrowed(2, 1, b"2")).await?;
 //! sink.flush().await?;
-//! ```
 //!
-//! ### Stream
+//! // Step 4: Create a stream to query log records.
+//! let mut stream = waldo.stream(Cursor::After(0));
+//! let next_logs = stream.next().await?;
 //!
-//! Use a [`Stream`] to discover new log records from storage.
-//!
-//! ```rust,ignore
-//! // Create a new stream from storage.
-//! let mut stream = storage.stream_after(0);
-//!
-//! // Wait for new batch of log records.
-//! while let Ok(logs) = stream.next().await {
-//!     for log in &logs {
-//!         println!("{log:?}");
-//!     }
-//! }
+//! // Iterate through the iterator like normal iterators.
+//! let mut logs = next_logs.into_iter();
+//! assert_eq!(Some(Log::new_borrowed(1, 0, b"1")), logs.next());
+//! assert_eq!(Some(Log::new_borrowed(2, 1, b"2")), logs.next());
+//! assert_eq!(None, logs.next());
+//! #    Ok(())
+//! # }
 //! ```
 //!
 //! ## Next steps

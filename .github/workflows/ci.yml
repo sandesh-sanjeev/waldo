@@ -76,7 +76,10 @@ jobs:
       - name: Setup pages
         id: pages
         uses: actions/configure-pages@v5
-        
+
+      - name: Test docs
+        run: cargo test --doc
+
       - name: Clean docs directory
         run: cargo clean --doc
 
