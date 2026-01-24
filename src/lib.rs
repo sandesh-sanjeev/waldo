@@ -46,7 +46,7 @@
 //! // Step 4: Create a stream to query log records.
 //! let query_logs = waldo.query(Cursor::After(0), true).await?;
 //! let query_logs: Vec<_> = query_logs.into_iter().collect();
-//! assert_eq!(logs, query_logs);
+//! assert_eq!(&logs, &query_logs[..]);
 //! #    Ok(())
 //! # }
 //! ```
