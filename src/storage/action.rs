@@ -250,12 +250,7 @@ pub(super) struct FateReceiver<T>(oneshot::Receiver<T>);
 
 impl<T> FateReceiver<T> {
     /// Receive fate of an async operation asynchronously.
-    pub(super) async fn recv_async(self) -> Result<T, FateError> {
+    pub(super) async fn recv(self) -> Result<T, FateError> {
         self.0.await.map_err(|_| FateError)
-    }
-
-    /// Receive fate of an async operation synchronously.
-    pub(super) fn recv(self) -> Result<T, FateError> {
-        self.0.recv().map_err(|_| FateError)
     }
 }

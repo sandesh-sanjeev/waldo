@@ -64,7 +64,7 @@ impl Worker {
         };
 
         // Wait for initialization of background worker is complete.
-        let (pool, tx) = fate_rx.recv_async().await??;
+        let (pool, tx) = fate_rx.recv().await??;
         let worker = Worker {
             closing,
             notify,

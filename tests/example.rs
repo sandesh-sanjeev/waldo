@@ -77,11 +77,9 @@ async fn reader(mut storage: Waldo, after: u64, count: usize) -> Result<()> {
     // Wait for a range of records to be available.
     // Make sure logs contain expected contents.
     while counter < count {
-        // (Optional) Wait for storage if have new records.
-        storage.watch_for_after(prev).await?;
-
         // Process the next batch of records.
-        let logs = storage.query(Cursor::After(prev)).await?;
+        // true for a query to efficiently wait for more logs to be available.
+        let logs = storage.query(Cursor::After(prev), true).await?;
         for log in logs.into_iter() {
             log.validate_data()?; // Optional
             assert_eq!(log, Log::new_borrowed(prev + 1, prev, b"data5121"));

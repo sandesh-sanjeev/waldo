@@ -43,7 +43,7 @@ impl Waldo {
     /// periodic scans for telemetry, etc. Use [`Waldo::prev_seq_no`] if all you want is
     /// sequence number of the last appended log.
     pub async fn metadata(&self) -> Option<Metadata> {
-        self.0.metadata().run_async().await.ok()?
+        self.0.metadata().run().await.ok()?
     }
 
     /// Sequence number of the last log record in storage.
@@ -53,29 +53,6 @@ impl Waldo {
     /// methods return None when storage is not initialized.
     pub fn prev_seq_no(&self) -> Option<u64> {
         *self.0.watcher().borrow()
-    }
-
-    /// Wait for more log records from storage.
-    ///
-    /// Repeatedly polling storage in an attempt to discover new log records is not efficient.
-    /// In some cases, for example if you were to build a streaming interface, it's better to
-    /// just wait for new logs to be available in storage.
-    ///
-    /// # Arguments
-    ///
-    /// * `after` - Method completes when storage has logs after this sequence number.
-    pub async fn watch_for_after(&mut self, after: u64) -> Result<(), Error> {
-        loop {
-            // See if there are newer log records available.
-            if let Some(storage_prev) = *self.0.watcher_mut().borrow_and_update()
-                && storage_prev > after
-            {
-                return Ok(());
-            };
-
-            // Otherwise wait for new logs to get appended.
-            self.0.watcher_mut().changed().await?;
-        }
     }
 
     /// Append an ordered sequence of log records into storage.
@@ -88,7 +65,7 @@ impl Waldo {
     ///
     /// ## Durability
     ///
-    /// Durability guarantees depend on the options used open storage. Specifically, if
+    /// Durability guarantees depend on the options used to open storage. Specifically, if
     /// you want guarantee that bytes are durably flushed to disk when append successfully
     /// completes, enable [`Options::file_o_dsync`]. It's a great default to start off with.
     ///
@@ -109,7 +86,7 @@ impl Waldo {
         }
 
         // Perform all validations upfront.
-        let mut prev = *self.0.watcher().borrow();
+        let mut prev = self.prev_seq_no();
         for log in logs {
             // Sequence validation.
             if let Some(prev) = prev
@@ -147,7 +124,7 @@ impl Waldo {
             }
 
             // Push accumulated logs to storage.
-            let result = self.0.append(buf).run_async().await?;
+            let result = self.0.append(buf).run().await?;
 
             // Process results from storage.
             buf = result.0;
@@ -172,9 +149,31 @@ impl Waldo {
     /// Only logs that have been successfully committed against storage are visible
     /// to queries against storage. However note that they might not be durably stored
     /// on disk.
-    pub async fn query(&mut self, cursor: Cursor) -> Result<QueryLogs, QueryError> {
+    ///
+    /// # Arguments
+    ///
+    /// * `cursor` - Starting position for the query.
+    /// * `waiting` - true to efficiently wait for more logs to be available.
+    pub async fn query(&mut self, cursor: Cursor, waiting: bool) -> Result<QueryLogs, QueryError> {
+        let after_seq_no = self.cursor_seq_no(cursor);
+        let mut storage_prev;
+        loop {
+            // Check if storage might have requested records.
+            // If definitely doesn't if storage has sequence number <= requested.
+            storage_prev = *self.0.watcher_mut().borrow_and_update();
+            let has_logs = storage_prev.map(|prev| prev > after_seq_no).unwrap_or(false);
+
+            // Check if we have to wait for logs to be available.
+            if !waiting || has_logs {
+                break;
+            }
+
+            // If we have reached this point, have to wait for more logs to be available.
+            self.0.watcher_mut().changed().await?;
+        }
+
         // Return early if storage is not initialized.
-        let Some(storage_prev) = *self.0.watcher().borrow() else {
+        let Some(storage_prev) = storage_prev else {
             return Ok(QueryLogs(QueryBuf::Empty));
         };
 
@@ -186,7 +185,7 @@ impl Waldo {
 
         // Query requested range of log records from storage.
         let buf = self.0.buf_pool().take_async().await;
-        let (buf, result) = self.0.query(after_seq_no, buf).run_async().await?;
+        let (buf, result) = self.0.query(after_seq_no, buf).run().await?;
         result?;
 
         // Figure out offset to the starting seq_no.

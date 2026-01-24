@@ -94,9 +94,8 @@ These are non-goals and will probably never be supported.
 
 ## Future Work
 
-Waldo does most of what I want it to do already. The only other planned feature addition is the ability to assign
-priority to different streams. Otherwise only expect bug fixes, scheduling improvements and better test coverage, 
-just polishing around the edges.
+Waldo does most of what I want it to do already. Only expect bug fixes, scheduling improvements and better test 
+coverage, just polishing around the edges.
 
 ## Gotchas
 

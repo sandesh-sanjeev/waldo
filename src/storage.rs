@@ -32,16 +32,6 @@ pub enum Error {
     /// Error when an unsupported option is provided.
     #[error("Option not supported: {0}")]
     Option(String),
-
-    /// Error when Waldo storage has been closed.
-    #[error("Underlying Waldo storage instance closed")]
-    Closed,
-}
-
-impl From<watch::error::RecvError> for Error {
-    fn from(_value: watch::error::RecvError) -> Self {
-        Error::Closed
-    }
 }
 
 /// Different types of errors when querying for logs from storage.
@@ -70,6 +60,12 @@ pub enum QueryError {
 
 impl From<AsyncError> for QueryError {
     fn from(_value: AsyncError) -> Self {
+        QueryError::Closed
+    }
+}
+
+impl From<watch::error::RecvError> for QueryError {
+    fn from(_value: watch::error::RecvError) -> Self {
         QueryError::Closed
     }
 }
@@ -136,17 +132,10 @@ pub(crate) struct AsyncAction<'a, T> {
 }
 
 impl<T> AsyncAction<'_, T> {
-    /// Run the asynchronous action synchronously, i.e, blocking the caller.
-    #[allow(dead_code)]
-    pub(crate) fn run(self) -> Result<T, AsyncError> {
-        self.tx.send(self.action)?;
-        Ok(self.rx.recv()?)
-    }
-
     /// Run the asynchronous action asynchronously, i.e, does not block runtime.
-    pub(crate) async fn run_async(self) -> Result<T, AsyncError> {
+    pub(crate) async fn run(self) -> Result<T, AsyncError> {
         self.tx.send_async(self.action).await?;
-        Ok(self.rx.recv_async().await?)
+        Ok(self.rx.recv().await?)
     }
 }
 

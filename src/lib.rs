@@ -40,11 +40,11 @@
 //! // Step 3: Create a Sink to append log records.
 //! let log_1 = Log::new_borrowed(1, 0, b"1");
 //! let log_2 = Log::new_borrowed(2, 1, b"2");
-//! let logs = vec![log_1, log_2];
+//! let logs = [log_1, log_2];
 //! waldo.append(&logs).await?;
 //!
 //! // Step 4: Create a stream to query log records.
-//! let query_logs = waldo.query(Cursor::After(0)).await?;
+//! let query_logs = waldo.query(Cursor::After(0), true).await?;
 //! let query_logs: Vec<_> = query_logs.into_iter().collect();
 //! assert_eq!(logs, query_logs);
 //! #    Ok(())

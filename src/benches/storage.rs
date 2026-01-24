@@ -246,11 +246,8 @@ impl Reader {
         let mut observed = 0;
         let mut prev = self.waldo.prev_seq_no().unwrap_or(0);
         while observed < self.opts.count {
-            // Wait for storage to has new records.
-            self.waldo.watch_for_after(prev).await?;
-
             // Get next set of log records.
-            let logs = self.waldo.query(Cursor::After(prev)).await?;
+            let logs = self.waldo.query(Cursor::After(prev), true).await?;
             let count = logs.into_iter().count() as u64;
 
             // Consume the next set of log records.
@@ -258,6 +255,9 @@ impl Reader {
             prev += count;
             self.counter.add_count(count, Role::Reader);
         }
+
+        // Close storage shared with reader.
+        self.waldo.close().await;
 
         // Tell the reporter that this worker is complete.
         Ok(self.counter.complete())
