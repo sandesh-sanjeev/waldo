@@ -138,7 +138,7 @@ async fn main() -> anyhow::Result<()> {
     // Reporter prints to console that is blocking I/O.
     // So spawn a new thread to execute the async task.
     workers.spawn_blocking(move || {
-        let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build()?;
+        let runtime = tokio::runtime::Handle::current();
         runtime.block_on(async {
             let reporter = Reporter { storage, counter };
             reporter.run(count, readers, log_size).await
@@ -282,7 +282,7 @@ impl Reporter {
             ProgressStyle::with_template(
                 "Writer  | [{elapsed_precise}] [{msg}] [{wide_bar:.cyan/blue}] [{eta_precise}]",
             )?
-            .progress_chars("#>-"),
+            .progress_chars("##-"),
         );
 
         let readers = pb.add(ProgressBar::new(count * readers as u64));
@@ -290,7 +290,7 @@ impl Reporter {
             ProgressStyle::with_template(
                 "Readers | [{elapsed_precise}] [{msg}] [{wide_bar:.cyan/blue}] [{eta_precise}]",
             )?
-            .progress_chars("#>-"),
+            .progress_chars("##-"),
         );
 
         let mut writer_prev = 0;
@@ -306,14 +306,10 @@ impl Reporter {
                 index_count,
                 disk_size,
                 index_size,
-                pending_appends: appends,
-                pending_queries: queries,
-                pending_fsyncs: fsyns,
-                pending_resets: resets,
                 ..
             } = metadata;
 
-            let pending_io = appends + queries + fsyns + resets;
+            let pending_io = metadata.pending_io();
             let disks = HumanBytes(disk_size);
             let indexs = HumanBytes(index_size);
             let logs = HumanCount(log_count);

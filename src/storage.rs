@@ -311,6 +311,13 @@ pub struct Metadata {
     pub pending_fsyncs: u64,
 }
 
+impl Metadata {
+    /// Sum of all pending I/O operations in storage.
+    pub fn pending_io(&self) -> u64 {
+        self.pending_resets + self.pending_appends + self.pending_queries + self.pending_fsyncs
+    }
+}
+
 impl AddAssign<PageMetadata> for Metadata {
     fn add_assign(&mut self, rhs: PageMetadata) {
         self.log_count += rhs.count;

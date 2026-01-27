@@ -156,21 +156,17 @@ impl Waldo {
     /// * `waiting` - true to efficiently wait for more logs to be available.
     pub async fn query(&mut self, cursor: Cursor, waiting: bool) -> Result<QueryLogs, QueryError> {
         let after_seq_no = self.cursor_seq_no(cursor);
-        let mut storage_prev;
-        loop {
-            // Check if storage might have requested records.
-            // If definitely doesn't if storage has sequence number <= requested.
-            storage_prev = *self.0.watcher_mut().borrow_and_update();
-            let has_logs = storage_prev.map(|prev| prev > after_seq_no).unwrap_or(false);
-
-            // Check if we have to wait for logs to be available.
-            if !waiting || has_logs {
-                break;
-            }
-
-            // If we have reached this point, have to wait for more logs to be available.
-            self.0.watcher_mut().changed().await?;
-        }
+        let storage_prev = *self
+            .0
+            .watcher_mut()
+            .wait_for(|prev| {
+                !waiting // Fast fail if not a waiting query.
+                    || match prev {
+                        None => false,
+                        Some(prev) => *prev > after_seq_no,
+                    }
+            })
+            .await?;
 
         // Return early if storage is not initialized.
         let Some(storage_prev) = storage_prev else {
